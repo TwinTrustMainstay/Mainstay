@@ -4,7 +4,8 @@ use soroban_sdk::{contract, contractimpl, contracttype, contracterror, panic_wit
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum ContractError {
-    NoMaintenanceHistory = 1,
+    NoMaintenanceHistory  = 1,
+    UnauthorizedEngineer  = 2,
 }
 
 #[contracttype]
@@ -17,6 +18,8 @@ pub struct MaintenanceRecord {
     pub timestamp: u64,
 }
 
+const ENG_REGISTRY: Symbol = symbol_short!("ENG_REG");
+
 fn history_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("HIST"), asset_id)
 }
@@ -25,11 +28,25 @@ fn score_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("SCORE"), asset_id)
 }
 
+// Minimal client interface for cross-contract call to EngineerRegistry
+mod engineer_registry {
+    use soroban_sdk::{contractclient, Address, Env};
+    #[contractclient(name = "EngineerRegistryClient")]
+    pub trait EngineerRegistry {
+        fn verify_engineer(env: Env, engineer: Address) -> bool;
+    }
+}
+
 #[contract]
 pub struct Lifecycle;
 
 #[contractimpl]
 impl Lifecycle {
+    /// Must be called once after deployment to bind the engineer registry.
+    pub fn initialize(env: Env, engineer_registry: Address) {
+        env.storage().instance().set(&ENG_REGISTRY, &engineer_registry);
+    }
+
     pub fn submit_maintenance(
         env: Env,
         asset_id: u64,
@@ -38,6 +55,15 @@ impl Lifecycle {
         engineer: Address,
     ) {
         engineer.require_auth();
+
+        // Cross-check engineer credential
+        let registry_id: Address = env.storage().instance().get(&ENG_REGISTRY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::UnauthorizedEngineer));
+        let registry = engineer_registry::EngineerRegistryClient::new(&env, &registry_id);
+        if !registry.verify_engineer(&engineer) {
+            panic_with_error!(&env, ContractError::UnauthorizedEngineer);
+        }
+
         let record = MaintenanceRecord {
             asset_id,
             task_type,
@@ -54,7 +80,6 @@ impl Lifecycle {
         history.push_back(record);
         env.storage().persistent().set(&history_key(asset_id), &history);
 
-        // increment score (capped at 100)
         let score: u32 = env
             .storage()
             .persistent()
@@ -95,16 +120,34 @@ impl Lifecycle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{symbol_short, testutils::Address as _, Env, String};
+    use soroban_sdk::{symbol_short, testutils::Address as _, BytesN, Env, String};
+    use crate::engineer_registry::EngineerRegistryClient;
+    use engineer_registry_contract::EngineerRegistry;
+
+    mod engineer_registry_contract {
+        soroban_sdk::contractimport!(
+            file = "../../target/wasm32-unknown-unknown/release/engineer_registry.wasm"
+        );
+    }
+
+    fn setup(env: &Env) -> (LifecycleClient, EngineerRegistryClient) {
+        let eng_reg_id = env.register(EngineerRegistry, ());
+        let lifecycle_id = env.register(Lifecycle, ());
+        let lifecycle = LifecycleClient::new(env, &lifecycle_id);
+        lifecycle.initialize(&eng_reg_id);
+        (lifecycle, EngineerRegistryClient::new(env, &eng_reg_id))
+    }
 
     #[test]
     fn test_submit_and_score() {
         let env = Env::default();
         env.mock_all_auths();
-        let contract_id = env.register(Lifecycle, ());
-        let client = LifecycleClient::new(&env, &contract_id);
+        let (client, eng_client) = setup(&env);
 
         let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        eng_client.register_engineer(&engineer, &hash, &issuer);
 
         for _ in 0..10 {
             client.submit_maintenance(
@@ -118,6 +161,27 @@ mod tests {
         assert_eq!(client.get_collateral_score(&1u64), 50);
         assert!(client.is_collateral_eligible(&1u64));
         assert_eq!(client.get_maintenance_history(&1u64).len(), 10);
+    }
+
+    #[test]
+    fn test_unregistered_engineer_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup(&env);
+
+        let unregistered = Address::generate(&env);
+        let result = client.try_submit_maintenance(
+            &1u64,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "Should fail"),
+            &unregistered,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedEngineer as u32
+            )))
+        );
     }
 
     #[test]
