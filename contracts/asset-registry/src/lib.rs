@@ -1,7 +1,7 @@
 #![no_std]
 use soroban_sdk::{
     contract, contractimpl, contracttype, contracterror, panic_with_error,
-    symbol_short, Address, Bytes, BytesN, Env, String, Symbol,
+    symbol_short, xdr::ToXdr, Address, Bytes, BytesN, Env, String, Symbol,
 };
 
 #[contracterror]
@@ -56,7 +56,7 @@ impl AssetRegistry {
         owner.require_auth();
 
         // Deduplication: reject if this owner already registered identical metadata.
-        let meta_bytes = Bytes::from(metadata.to_xdr(&env));
+        let meta_bytes = Bytes::from(metadata.clone().to_xdr(&env));
         let meta_hash: BytesN<32> = env.crypto().sha256(&meta_bytes).into();
         let dk = dedup_key(&owner, &meta_hash);
         if env.storage().persistent().has(&dk) {
@@ -66,7 +66,7 @@ impl AssetRegistry {
         let id: u64 = env.storage().instance().get(&ASSET_COUNT).unwrap_or(0) + 1;
         let asset = Asset {
             asset_id: id,
-            asset_type,
+            asset_type: asset_type.clone(),
             metadata,
             owner: owner.clone(),
             registered_at: env.ledger().timestamp(),
