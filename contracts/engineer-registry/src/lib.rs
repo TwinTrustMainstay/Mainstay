@@ -1,5 +1,12 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, contracterror, panic_with_error, symbol_short, Address, BytesN, Env, Symbol};
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ContractError {
+    CredentialAlreadyRevoked = 1,
+}
 
 #[contracttype]
 #[derive(Clone)]
@@ -27,7 +34,10 @@ impl EngineerRegistry {
         issuer: Address,
     ) {
         issuer.require_auth();
-        assert!(credential_hash != BytesN::from_array(&env, &[0u8; 32]), "credential hash cannot be zero");
+        assert!(
+            credential_hash != BytesN::from_array(&env, &[0u8; 32]),
+            "credential hash cannot be zero"
+        );
         let record = Engineer {
             address: engineer.clone(),
             credential_hash,
@@ -35,10 +45,9 @@ impl EngineerRegistry {
             active: true,
             issued_at: env.ledger().timestamp(),
         };
-        env.storage().persistent().set(&engineer_key(&engineer), &record);
-        
-        // Extend TTL for persistent storage entries to prevent data loss
-        env.storage().persistent().extend_ttl(&engineer_key(&engineer), 518400, 518400); // 30 days
+        env.storage()
+            .persistent()
+            .set(&engineer_key(&engineer), &record);
     }
 
     pub fn verify_engineer(env: Env, engineer: Address) -> bool {
@@ -59,10 +68,9 @@ impl EngineerRegistry {
         assert!(record.issuer == issuer, "not the issuer");
         assert!(record.active, "credential already revoked");
         record.active = false;
-        env.storage().persistent().set(&engineer_key(&engineer), &record);
-        
-        // Extend TTL for persistent storage entries to prevent data loss
-        env.storage().persistent().extend_ttl(&engineer_key(&engineer), 518400, 518400); // 30 days
+        env.storage()
+            .persistent()
+            .set(&engineer_key(&engineer), &record);
     }
 
     pub fn get_engineer(env: Env, engineer: Address) -> Engineer {

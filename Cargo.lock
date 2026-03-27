@@ -791,6 +791,7 @@ name = "lifecycle"
 version = "0.1.0"
 dependencies = [
  "asset-registry",
+ "engineer-registry",
  "soroban-sdk",
 ]
 
