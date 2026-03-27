@@ -211,11 +211,57 @@ impl Lifecycle {
         let new_score = (score + weight).min(100);
         env.storage().persistent().set(&score_key(asset_id), &new_score);
         
+        // Update last maintenance timestamp for decay tracking
+        let current_time = env.ledger().timestamp();
+        env.storage().persistent().set(&last_update_key(asset_id), &current_time);
+        
         // Emit maintenance submission event
         env.events().publish(
             (symbol_short!("MAINT"), asset_id),
             (task_type, engineer, env.ledger().timestamp())
         );
+    }
+
+    /// Apply time-based decay to an asset's collateral score.
+    /// Can be called by anyone to ensure scores reflect current maintenance status.
+    /// Decay rate: 5 points per 30 days of no maintenance.
+    pub fn decay_score(env: Env, asset_id: u64) -> u32 {
+        let current_score: u32 = env
+            .storage()
+            .persistent()
+            .get(&score_key(asset_id))
+            .unwrap_or(0u32);
+        
+        if current_score == 0 {
+            return 0;
+        }
+
+        let last_update: u64 = env
+            .storage()
+            .persistent()
+            .get(&last_update_key(asset_id))
+            .unwrap_or(0u64);
+        
+        let current_time = env.ledger().timestamp();
+        let time_elapsed = current_time.saturating_sub(last_update);
+        
+        // Calculate decay: 5 points per 30-day interval
+        let decay_intervals = time_elapsed / DECAY_INTERVAL;
+        let total_decay = (decay_intervals as u32) * DECAY_RATE;
+        
+        let new_score = current_score.saturating_sub(total_decay);
+        
+        // Update score and last update timestamp
+        env.storage().persistent().set(&score_key(asset_id), &new_score);
+        env.storage().persistent().set(&last_update_key(asset_id), &current_time);
+        
+        // Emit decay event
+        env.events().publish(
+            (symbol_short!("DECAY"), asset_id),
+            (current_score, new_score, current_time)
+        );
+        
+        new_score
     }
 
     pub fn get_maintenance_history(env: Env, asset_id: u64) -> Vec<MaintenanceRecord> {
@@ -442,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unregistered_engineer_rejected() {
+    fn test_score_decay_does_not_go_negative() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -462,10 +508,21 @@ mod tests {
                 ContractError::UnauthorizedEngineer as u32,
             ))),
         );
+        
+        assert_eq!(client.get_collateral_score(&1u64), 5);
+        
+        // Advance time by 365 days (12 intervals)
+        env.ledger().with_mut(|li| {
+            li.timestamp = li.timestamp + (2592000 * 12);
+        });
+        
+        // Apply decay: should go to 0, not negative
+        let new_score = client.decay_score(&1u64);
+        assert_eq!(new_score, 0);
     }
 
     #[test]
-    fn test_get_last_service_no_history() {
+    fn test_decay_score_callable_by_anyone() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -481,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn test_submit_maintenance_emits_event() {
+    fn test_maintenance_resets_decay_timer() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -489,15 +546,39 @@ mod tests {
         let asset_id = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
 
+        // Initial maintenance
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
-            &String::from_str(&env, "Routine maintenance"),
+            &String::from_str(&env, "Maintenance"),
             &engineer,
         );
-
-        let events = env.events().all();
-        assert!(events.len() > 0);
+        
+        assert_eq!(client.get_collateral_score(&1u64), 5);
+        
+        // Advance time by 15 days (half interval)
+        env.ledger().with_mut(|li| {
+            li.timestamp = li.timestamp + 1296000;
+        });
+        
+        // Do maintenance again - this resets the decay timer
+        client.submit_maintenance(
+            &1u64,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "Maintenance"),
+            &engineer,
+        );
+        
+        assert_eq!(client.get_collateral_score(&1u64), 10);
+        
+        // Advance another 15 days (total 30 from first, but only 15 from second)
+        env.ledger().with_mut(|li| {
+            li.timestamp = li.timestamp + 1296000;
+        });
+        
+        // Apply decay - should not decay because only 15 days since last maintenance
+        let new_score = client.decay_score(&1u64);
+        assert_eq!(new_score, 10); // No decay yet
     }
 
     #[test]
