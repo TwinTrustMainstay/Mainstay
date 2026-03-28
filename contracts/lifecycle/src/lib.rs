@@ -407,6 +407,30 @@ impl Lifecycle {
             .unwrap_or(Vec::new(&env))
     }
 
+    /// Returns the last `n` ScoreEntry items from the score history.
+    /// If `n` is 0 or the history is empty, returns an empty vec.
+    /// If `n` exceeds the history length, returns all entries.
+    pub fn get_score_trend(env: Env, asset_id: u64, n: u32) -> Vec<ScoreEntry> {
+        if n == 0 {
+            return Vec::new(&env);
+        }
+        let history: Vec<ScoreEntry> = env
+            .storage()
+            .persistent()
+            .get(&score_history_key(asset_id))
+            .unwrap_or(Vec::new(&env));
+        let len = history.len();
+        if len == 0 {
+            return Vec::new(&env);
+        }
+        let start = if n >= len { 0u32 } else { len - n };
+        let mut result = Vec::new(&env);
+        for i in start..len {
+            result.push_back(history.get(i).unwrap());
+        }
+        result
+    }
+
     pub fn is_collateral_eligible(env: Env, asset_id: u64) -> bool {
         let threshold = 50u32;
         Self::get_collateral_score(env, asset_id) >= threshold
@@ -830,6 +854,86 @@ mod tests {
         // After 10 REBUILD tasks the score is already 100; subsequent entries stay at 100
         assert_eq!(history.get(10).unwrap().score, 100);
         assert_eq!(history.get(11).unwrap().score, 100);
+    }
+
+    #[test]
+    fn test_score_trend_returns_last_n() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        for _ in 0..5 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &String::from_str(&env, "entry"),
+                &engineer,
+            );
+        }
+
+        let full = client.get_score_history(&asset_id);
+        let trend = client.get_score_trend(&asset_id, &3);
+        assert_eq!(trend.len(), 3);
+        // Should be the last 3 entries
+        assert_eq!(trend.get(0).unwrap().score, full.get(2).unwrap().score);
+        assert_eq!(trend.get(1).unwrap().score, full.get(3).unwrap().score);
+        assert_eq!(trend.get(2).unwrap().score, full.get(4).unwrap().score);
+    }
+
+    #[test]
+    fn test_score_trend_n_exceeds_history_length() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "only one"),
+            &engineer,
+        );
+
+        // n=10 but only 1 entry exists — should return all 1
+        let trend = client.get_score_trend(&asset_id, &10);
+        assert_eq!(trend.len(), 1);
+    }
+
+    #[test]
+    fn test_score_trend_n_zero_returns_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "entry"),
+            &engineer,
+        );
+
+        let trend = client.get_score_trend(&asset_id, &0);
+        assert_eq!(trend.len(), 0);
+    }
+
+    #[test]
+    fn test_score_trend_empty_history() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+
+        let trend = client.get_score_trend(&asset_id, &5);
+        assert_eq!(trend.len(), 0);
     }
 
     #[test]
