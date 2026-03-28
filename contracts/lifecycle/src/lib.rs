@@ -513,7 +513,7 @@ mod tests {
         let hash = BytesN::from_array(env, &[1u8; 32]);
         registry_client.initialize_admin(&admin);
         registry_client.add_trusted_issuer(&admin, &issuer);
-        registry_client.register_engineer(&engineer, &hash, &issuer);
+        registry_client.register_engineer(&engineer, &hash, &issuer, &31_536_000);
         engineer
     }
 
@@ -1110,7 +1110,7 @@ mod tests {
         let admin = Address::generate(&env);
         engineer_registry.initialize_admin(&admin);
         engineer_registry.add_trusted_issuer(&admin, &issuer);
-        engineer_registry.register_engineer(&engineer, &BytesN::from_array(&env, &[2u8; 32]), &issuer);
+        engineer_registry.register_engineer(&engineer, &BytesN::from_array(&env, &[2u8; 32]), &issuer, &31_536_000);
         assert!(engineer_registry.verify_engineer(&engineer));
 
         // 3. Submit 10 maintenance records (ENGINE = 10pts each, capped at 100)
