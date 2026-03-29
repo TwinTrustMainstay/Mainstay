@@ -36,6 +36,10 @@ fn issuer_engineers_key(issuer: &Address) -> (Symbol, Address) {
     (symbol_short!("ISS_ENGS"), issuer.clone())
 }
 
+fn issuer_list_key() -> Symbol {
+    symbol_short!("ISS_LIST")
+}
+
 #[contract]
 pub struct EngineerRegistry;
 
@@ -130,6 +134,13 @@ impl EngineerRegistry {
         env.storage().instance().has(&trusted_key(&issuer))
     }
 
+    pub fn get_trusted_issuers(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&issuer_list_key())
+            .unwrap_or(Vec::new(&env))
+    }
+
     pub fn add_trusted_issuer(env: Env, admin: Address, issuer: Address) {
         admin.require_auth();
         let stored_admin: Address = env.storage().instance().get(&admin_key()).expect("admin not initialized");
@@ -137,6 +148,11 @@ impl EngineerRegistry {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
         env.storage().instance().set(&trusted_key(&issuer), &());
+        let mut list: Vec<Address> = env.storage().instance().get(&issuer_list_key()).unwrap_or(Vec::new(&env));
+        if !list.contains(issuer.clone()) {
+            list.push_back(issuer.clone());
+        }
+        env.storage().instance().set(&issuer_list_key(), &list);
     }
 
     pub fn remove_trusted_issuer(env: Env, admin: Address, issuer: Address) {
@@ -146,6 +162,14 @@ impl EngineerRegistry {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
         env.storage().instance().remove(&trusted_key(&issuer));
+        let list: Vec<Address> = env.storage().instance().get(&issuer_list_key()).unwrap_or(Vec::new(&env));
+        let mut new_list: Vec<Address> = Vec::new(&env);
+        for addr in list.iter() {
+            if addr != issuer {
+                new_list.push_back(addr);
+            }
+        }
+        env.storage().instance().set(&issuer_list_key(), &new_list);
     }
 
     /// Returns all engineer addresses credentialed by the given issuer.
@@ -459,5 +483,137 @@ mod tests {
         let record = client.get_engineer(&engineer);
         assert_eq!(record.issued_at, issued_at);
         assert_eq!(record.expires_at, issued_at + validity_period);
+    }
+
+    // --- get_trusted_issuers tests ---
+
+    // 4.1: fresh contract returns empty list (Requirements: 2.2, 4.3)
+    #[test]
+    fn test_get_trusted_issuers_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup(&env);
+
+        let result = client.get_trusted_issuers();
+        assert_eq!(result.len(), 0);
+    }
+
+    // 4.2: add one issuer, verify list contains it (Requirements: 1.2, 2.3)
+    #[test]
+    fn test_get_trusted_issuers_single() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let issuer = Address::generate(&env);
+        client.add_trusted_issuer(&admin, &issuer);
+
+        let list = client.get_trusted_issuers();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list.get(0).unwrap(), issuer);
+    }
+
+    // 4.3: add same issuer twice, verify list length is 1 (Requirements: 1.3, 2.4)
+    #[test]
+    fn test_get_trusted_issuers_dedup() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let issuer = Address::generate(&env);
+        client.add_trusted_issuer(&admin, &issuer);
+        client.add_trusted_issuer(&admin, &issuer);
+
+        let list = client.get_trusted_issuers();
+        assert_eq!(list.len(), 1);
+    }
+
+    // 4.4: add then remove, verify list is empty (Requirements: 1.4, 2.3)
+    #[test]
+    fn test_get_trusted_issuers_after_remove() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let issuer = Address::generate(&env);
+        client.add_trusted_issuer(&admin, &issuer);
+        client.remove_trusted_issuer(&admin, &issuer);
+
+        let list = client.get_trusted_issuers();
+        assert_eq!(list.len(), 0);
+    }
+
+    // 4.5: remove an address never added, verify list unchanged (Requirements: 1.5)
+    #[test]
+    fn test_get_trusted_issuers_remove_absent_noop() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let issuer = Address::generate(&env);
+        let outsider = Address::generate(&env);
+        client.add_trusted_issuer(&admin, &issuer);
+
+        client.remove_trusted_issuer(&admin, &outsider);
+
+        let list = client.get_trusted_issuers();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list.get(0).unwrap(), issuer);
+    }
+
+    // 4.6: call get_trusted_issuers without mocking auth, verify no panic (Requirements: 4.3)
+    #[test]
+    fn test_get_trusted_issuers_no_auth_required() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let issuer = Address::generate(&env);
+        client.add_trusted_issuer(&admin, &issuer);
+
+        // Clear auths — get_trusted_issuers must not require any authorization
+        env.mock_auths(&[]);
+        let list = client.get_trusted_issuers();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list.get(0).unwrap(), issuer);
+    }
+
+    // 4.7: non-admin cannot add trusted issuer (Requirements: 4.1)
+    #[test]
+    fn test_non_admin_cannot_add_trusted_issuer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup(&env);
+
+        let outsider = Address::generate(&env);
+        let issuer = Address::generate(&env);
+
+        let result = client.try_add_trusted_issuer(&outsider, &issuer);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
+    }
+
+    // 4.8: non-admin cannot remove trusted issuer (Requirements: 4.2)
+    #[test]
+    fn test_non_admin_cannot_remove_trusted_issuer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let issuer = Address::generate(&env);
+        client.add_trusted_issuer(&admin, &issuer);
+
+        let outsider = Address::generate(&env);
+        let result = client.try_remove_trusted_issuer(&outsider, &issuer);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
     }
 }
