@@ -2,7 +2,7 @@
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    Bytes, BytesN, Env, String, Symbol,
+    BytesN, Env, String, Symbol,
 };
 
 #[contracterror]
@@ -29,7 +29,6 @@ const ASSET_COUNT: Symbol = symbol_short!("A_COUNT");
 
 const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
 
-
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -55,7 +54,7 @@ impl AssetRegistry {
         owner.require_auth();
 
         // Deduplication: reject if this owner already registered identical metadata.
-        let meta_bytes = Bytes::from(metadata.clone().to_xdr(&env));
+        let meta_bytes = metadata.clone().to_xdr(&env);
         let meta_hash: BytesN<32> = env.crypto().sha256(&meta_bytes).into();
         let dk = dedup_key(&owner, &meta_hash);
         if env.storage().persistent().has(&dk) {
@@ -71,7 +70,9 @@ impl AssetRegistry {
             registered_at: env.ledger().timestamp(),
         };
         env.storage().persistent().set(&asset_key(id), &asset);
-        env.storage().persistent().extend_ttl(&asset_key(id), 518400, 518400); // Extend TTL for persistent storage entries to prevent data loss
+        env.storage()
+            .persistent()
+            .extend_ttl(&asset_key(id), 518400, 518400); // Extend TTL for persistent storage entries to prevent data loss
         env.storage().instance().set(&ASSET_COUNT, &id);
         env.storage().persistent().set(&dk, &id);
 
@@ -106,29 +107,37 @@ impl AssetRegistry {
 
     /// Get the current admin address
     pub fn get_admin(env: Env) -> Address {
-        env.storage().instance().get(&ADMIN_KEY).expect("Admin not initialized")
+        env.storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .expect("Admin not initialized")
     }
 
     /// Admin-only: Deregister (remove) an asset
     pub fn deregister_asset(env: Env, asset_id: u64) {
         let admin = Self::get_admin(env.clone());
         admin.require_auth();
-        
-        let asset: Asset = env.storage().persistent()
+
+        let asset: Asset = env
+            .storage()
+            .persistent()
             .get(&asset_key(asset_id))
             .expect("Asset not found");
-        
+
         // Remove asset storage
         env.storage().persistent().remove(&asset_key(asset_id));
-        
+
         // Remove deduplication key
-        let dk = dedup_key(&asset.owner, &env.crypto().sha256(&Bytes::from(asset.metadata.to_xdr(&env))).into());
+        let dk = dedup_key(
+            &asset.owner,
+            &env.crypto().sha256(&asset.metadata.to_xdr(&env)).into(),
+        );
         env.storage().persistent().remove(&dk);
-        
+
         // Emit deregistration event
         env.events().publish(
             (symbol_short!("DEREG_AST"), asset_id),
-            (asset.asset_type.clone(), asset.owner.clone())
+            (asset.asset_type.clone(), asset.owner.clone()),
         );
     }
 
@@ -148,16 +157,15 @@ impl AssetRegistry {
         }
 
         // Remove old dedup key
-        let old_hash: BytesN<32> = env
-            .crypto()
-            .sha256(&Bytes::from(asset.metadata.to_xdr(&env)))
-            .into();
-        env.storage().persistent().remove(&dedup_key(&owner, &old_hash));
+        let old_hash: BytesN<32> = env.crypto().sha256(&asset.metadata.to_xdr(&env)).into();
+        env.storage()
+            .persistent()
+            .remove(&dedup_key(&owner, &old_hash));
 
         // Reject if new metadata is a duplicate for this owner
         let new_hash: BytesN<32> = env
             .crypto()
-            .sha256(&Bytes::from(new_metadata.clone().to_xdr(&env)))
+            .sha256(&new_metadata.clone().to_xdr(&env))
             .into();
         let new_dk = dedup_key(&owner, &new_hash);
         if env.storage().persistent().has(&new_dk) {
@@ -191,14 +199,20 @@ impl AssetRegistry {
         // Move dedup key to new owner
         let hash: BytesN<32> = env
             .crypto()
-            .sha256(&Bytes::from(asset.metadata.clone().to_xdr(&env)))
+            .sha256(&asset.metadata.clone().to_xdr(&env))
             .into();
-        env.storage().persistent().remove(&dedup_key(&current_owner, &hash));
-        env.storage().persistent().set(&dedup_key(&new_owner, &hash), &asset_id);
+        env.storage()
+            .persistent()
+            .remove(&dedup_key(&current_owner, &hash));
+        env.storage()
+            .persistent()
+            .set(&dedup_key(&new_owner, &hash), &asset_id);
 
         asset.owner = new_owner.clone();
         env.storage().persistent().set(&asset_key(asset_id), &asset);
-        env.storage().persistent().extend_ttl(&asset_key(asset_id), 518400, 518400);
+        env.storage()
+            .persistent()
+            .extend_ttl(&asset_key(asset_id), 518400, 518400);
 
         env.events().publish(
             (symbol_short!("TRANSFER"), asset_id),
@@ -226,19 +240,17 @@ impl AssetRegistry {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soroban_sdk::testutils::storage::Persistent;
     use soroban_sdk::{
         symbol_short,
         testutils::{Address as _, Events},
-        Bytes, Env, String,
+        Env, String,
     };
-    use soroban_sdk::testutils::storage::Persistent;
 
     use crate::AssetRegistryClient;
-
 
     #[test]
     fn test_register_and_get_asset() {
@@ -361,7 +373,7 @@ mod tests {
         let owner = Address::generate(&env);
         let asset_type = symbol_short!("GENSET");
         let metadata = String::from_str(&env, "Caterpillar 3516 Generator");
-        
+
         let id = client.register_asset(&asset_type, &metadata, &owner);
 
         // Verify TTL is set for asset storage entry
@@ -371,7 +383,7 @@ mod tests {
         assert!(asset_ttl > 0, "Asset TTL should be extended");
 
         // Verify TTL is set for deduplication key
-        let meta_bytes = Bytes::from(metadata.to_xdr(&env));
+        let meta_bytes = metadata.to_xdr(&env);
         let meta_hash: BytesN<32> = env.crypto().sha256(&meta_bytes).into();
         let dedup_ttl = env.as_contract(&contract_id, || {
             let dk = dedup_key(&owner, &meta_hash);
@@ -436,14 +448,13 @@ mod tests {
             &owner,
         );
 
-        client.update_asset_metadata(
-            &id,
-            &owner,
-            &String::from_str(&env, "Refurbished spec v2"),
-        );
+        client.update_asset_metadata(&id, &owner, &String::from_str(&env, "Refurbished spec v2"));
 
         let asset = client.get_asset(&id);
-        assert_eq!(asset.metadata, String::from_str(&env, "Refurbished spec v2"));
+        assert_eq!(
+            asset.metadata,
+            String::from_str(&env, "Refurbished spec v2")
+        );
     }
 
     #[test]
@@ -460,11 +471,7 @@ mod tests {
             &owner,
         );
 
-        client.update_asset_metadata(
-            &id,
-            &owner,
-            &String::from_str(&env, "Refurbished spec v2"),
-        );
+        client.update_asset_metadata(&id, &owner, &String::from_str(&env, "Refurbished spec v2"));
 
         // env.events().all() reflects only the most recent contract call
         assert_eq!(env.events().all().len(), 1);
@@ -506,11 +513,8 @@ mod tests {
         let client = AssetRegistryClient::new(&env, &contract_id);
 
         let owner = Address::generate(&env);
-        let result = client.try_update_asset_metadata(
-            &999u64,
-            &owner,
-            &String::from_str(&env, "New spec"),
-        );
+        let result =
+            client.try_update_asset_metadata(&999u64, &owner, &String::from_str(&env, "New spec"));
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -626,11 +630,8 @@ mod tests {
         );
 
         // Trying to update asset 1 to "Spec B" (already taken by same owner) should fail
-        let result = client.try_update_asset_metadata(
-            &id1,
-            &owner,
-            &String::from_str(&env, "Spec B"),
-        );
+        let result =
+            client.try_update_asset_metadata(&id1, &owner, &String::from_str(&env, "Spec B"));
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(

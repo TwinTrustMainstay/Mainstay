@@ -1,5 +1,8 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, contracterror, panic_with_error, symbol_short, Address, BytesN, Env, Symbol, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
+    BytesN, Env, Symbol, Vec,
+};
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -97,7 +100,9 @@ impl EngineerRegistry {
         env.storage()
             .persistent()
             .set(&engineer_key(&engineer), &record);
-        env.storage().persistent().extend_ttl(&engineer_key(&engineer), 518400, 518400);
+        env.storage()
+            .persistent()
+            .extend_ttl(&engineer_key(&engineer), 518400, 518400);
     }
 
     pub fn get_engineer(env: Env, engineer: Address) -> Engineer {
@@ -115,7 +120,9 @@ impl EngineerRegistry {
     }
 
     pub fn get_admin(env: Env) -> Address {
-        env.storage().instance().get(&admin_key())
+        env.storage()
+            .instance()
+            .get(&admin_key())
             .expect("admin not initialized")
     }
 
@@ -125,7 +132,11 @@ impl EngineerRegistry {
 
     pub fn add_trusted_issuer(env: Env, admin: Address, issuer: Address) {
         admin.require_auth();
-        let stored_admin: Address = env.storage().instance().get(&admin_key()).expect("admin not initialized");
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&admin_key())
+            .expect("admin not initialized");
         if stored_admin != admin {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
@@ -134,7 +145,11 @@ impl EngineerRegistry {
 
     pub fn remove_trusted_issuer(env: Env, admin: Address, issuer: Address) {
         admin.require_auth();
-        let stored_admin: Address = env.storage().instance().get(&admin_key()).expect("admin not initialized");
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&admin_key())
+            .expect("admin not initialized");
         if stored_admin != admin {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
@@ -172,7 +187,7 @@ impl EngineerRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, testutils::storage::Persistent, BytesN, Env};
+    use soroban_sdk::{testutils::storage::Persistent, testutils::Address as _, BytesN, Env};
 
     fn setup<'a>(env: &'a Env) -> (EngineerRegistryClient<'a>, Address) {
         let contract_id = env.register(EngineerRegistry, ());
@@ -265,7 +280,12 @@ mod tests {
         let new_wasm_hash = BytesN::from_array(&env, &[0xabu8; 32]);
         // In test env the WASM hash won't exist, so we just verify auth passes (no UnauthorizedAdmin error)
         let result = client.try_upgrade(&admin, &new_wasm_hash);
-        assert!(result != Err(Ok(soroban_sdk::Error::from_contract_error(ContractError::UnauthorizedAdmin as u32))));
+        assert!(
+            result
+                != Err(Ok(soroban_sdk::Error::from_contract_error(
+                    ContractError::UnauthorizedAdmin as u32
+                )))
+        );
     }
 
     #[test]
@@ -355,8 +375,14 @@ mod tests {
 
         assert_eq!(client.get_engineers_by_issuer(&issuer_a).len(), 1);
         assert_eq!(client.get_engineers_by_issuer(&issuer_b).len(), 1);
-        assert_eq!(client.get_engineers_by_issuer(&issuer_a).get(0).unwrap(), e1);
-        assert_eq!(client.get_engineers_by_issuer(&issuer_b).get(0).unwrap(), e2);
+        assert_eq!(
+            client.get_engineers_by_issuer(&issuer_a).get(0).unwrap(),
+            e1
+        );
+        assert_eq!(
+            client.get_engineers_by_issuer(&issuer_b).get(0).unwrap(),
+            e2
+        );
     }
 
     #[test]

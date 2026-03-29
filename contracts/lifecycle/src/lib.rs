@@ -172,8 +172,7 @@ impl Lifecycle {
             .instance()
             .get(&ASSET_REGISTRY)
             .expect("asset registry not set");
-        let asset_registry_client =
-            asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+        let asset_registry_client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
         asset_registry_client.get_asset(&asset_id);
 
         // Cross-check engineer credential
@@ -324,9 +323,13 @@ impl Lifecycle {
             });
         }
 
-        env.storage().persistent().set(&history_key(asset_id), &history);
+        env.storage()
+            .persistent()
+            .set(&history_key(asset_id), &history);
         env.storage().persistent().set(&score_key(asset_id), &score);
-        env.storage().persistent().set(&last_update_key(asset_id), &timestamp);
+        env.storage()
+            .persistent()
+            .set(&last_update_key(asset_id), &timestamp);
     }
 
     /// Apply time-based decay to an asset's collateral score.
@@ -669,7 +672,12 @@ mod tests {
 
         // In test env WASM won't exist; verify no UnauthorizedAdmin error is returned
         let result = client.try_upgrade(&admin, &new_wasm_hash);
-        assert!(result != Err(Ok(soroban_sdk::Error::from_contract_error(ContractError::UnauthorizedAdmin as u32))));
+        assert!(
+            result
+                != Err(Ok(soroban_sdk::Error::from_contract_error(
+                    ContractError::UnauthorizedAdmin as u32
+                )))
+        );
     }
 
     #[test]
@@ -767,9 +775,9 @@ mod tests {
         );
 
         let history = client.get_score_history(&asset_id);
-        assert_eq!(history.get(0).unwrap().score, 2);   // 0 + 2
-        assert_eq!(history.get(1).unwrap().score, 12);  // 2 + 10
-        assert_eq!(history.get(2).unwrap().score, 17);  // 12 + 5
+        assert_eq!(history.get(0).unwrap().score, 2); // 0 + 2
+        assert_eq!(history.get(1).unwrap().score, 12); // 2 + 10
+        assert_eq!(history.get(2).unwrap().score, 17); // 12 + 5
     }
 
     #[test]
@@ -789,7 +797,8 @@ mod tests {
             &engineer,
         );
 
-        env.ledger().with_mut(|li| li.timestamp = li.timestamp + 1000);
+        env.ledger()
+            .with_mut(|li| li.timestamp = li.timestamp + 1000);
         let t1 = env.ledger().timestamp();
         client.submit_maintenance(
             &asset_id,
@@ -1006,7 +1015,11 @@ mod tests {
         let admin = Address::generate(&env);
         engineer_registry.initialize_admin(&admin);
         engineer_registry.add_trusted_issuer(&admin, &issuer);
-        engineer_registry.register_engineer(&engineer, &BytesN::from_array(&env, &[2u8; 32]), &issuer);
+        engineer_registry.register_engineer(
+            &engineer,
+            &BytesN::from_array(&env, &[2u8; 32]),
+            &issuer,
+        );
         assert!(engineer_registry.verify_engineer(&engineer));
 
         // 3. Submit 10 maintenance records (ENGINE = 10pts each, capped at 100)
