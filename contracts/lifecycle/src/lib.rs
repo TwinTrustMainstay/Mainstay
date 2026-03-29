@@ -106,6 +106,12 @@ fn get_task_weight(_env: &Env, task_type: &Symbol) -> u32 {
     3
 }
 
+fn validate_task_type(env: &Env, task_type: &Symbol) {
+    if task_type == &symbol_short!("") {
+        panic_with_error!(env, ContractError::InvalidTaskType);
+    }
+}
+
 // Minimal client interface for cross-contract call to EngineerRegistry
 mod engineer_registry {
     use soroban_sdk::{contractclient, Address, Env};
@@ -310,6 +316,8 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::UnauthorizedEngineer);
         }
 
+        validate_task_type(&env, &task_type);
+
         let config: Config = env
             .storage()
             .instance()
@@ -438,6 +446,10 @@ impl Lifecycle {
             .persistent()
             .get(&history_key(asset_id))
             .unwrap_or(Vec::new(&env));
+
+        for record in records.iter() {
+            validate_task_type(&env, &record.task_type);
+        }
 
         let config: Config = env
             .storage()
@@ -1029,6 +1041,30 @@ mod tests {
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::HistoryCapReached as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_submit_maintenance_rejects_empty_task_type() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        let result = client.try_submit_maintenance(
+            &asset_id,
+            &symbol_short!("") ,
+            &String::from_str(&env, "Empty task type"),
+            &engineer,
+        );
+
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidTaskType as u32,
             ))),
         );
     }
