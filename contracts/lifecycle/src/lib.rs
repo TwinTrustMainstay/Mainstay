@@ -856,6 +856,34 @@ mod tests {
     }
 
     #[test]
+    fn test_decay_score_clamps_at_zero_after_long_elapsed_time() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &String::from_str(&env, "Single major service"),
+            &engineer,
+        );
+        assert_eq!(client.get_collateral_score(&asset_id), 10);
+
+        const SECONDS_PER_DAY: u64 = 86_400;
+        const DAYS_PER_YEAR: u64 = 365;
+        env.ledger().with_mut(|li| {
+            li.timestamp = li.timestamp + DAYS_PER_YEAR * SECONDS_PER_DAY;
+        });
+
+        let decayed = client.decay_score(&asset_id);
+        assert_eq!(decayed, 0);
+        assert_eq!(client.get_collateral_score(&asset_id), 0);
+    }
+
+    #[test]
     fn test_submit_maintenance_emits_event() {
         let env = Env::default();
         env.mock_all_auths();
