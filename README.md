@@ -46,8 +46,24 @@ This makes Mainstay:
 
 ### Test
 
+From the repository root, run the full workspace test suite (same as CI):
+
 ```bash
 ./scripts/test.sh
+```
+
+Optional arguments are forwarded to `cargo test`, for example:
+
+```bash
+./scripts/test.sh -p lifecycle
+./scripts/test.sh -p lifecycle my_test_name -- --nocapture
+```
+
+On Windows (PowerShell):
+
+```powershell
+.\scripts\test.ps1
+.\scripts\test.ps1 -p lifecycle
 ```
 
 ### Setup Environment
@@ -144,12 +160,48 @@ Comprehensive test suite covering:
 ✅ Life-cycle contract state transitions  
 ✅ Collateral score calculation  
 ✅ Error handling and edge cases  
+✅ TTL extension verification  
 
 Run tests:
 
 ```bash
 cargo test
 ```
+
+## ⏱️ TTL (Time-To-Live) Strategy
+
+Soroban persistent storage entries have a limited Time-To-Live (TTL) and will expire if not extended. To prevent silent data loss, all three contracts automatically extend the TTL of persistent storage entries after every write operation.
+
+### TTL Configuration
+
+- **Extension Threshold**: 518,400 ledgers (~30 days)
+- **Extension Target**: 518,400 ledgers (~30 days)
+- **Strategy**: Extend on every write to ensure data remains accessible
+
+### Protected Data
+
+**Asset Registry:**
+- Asset records (asset ID → Asset struct)
+- Deduplication keys (owner + metadata hash → asset ID)
+
+**Engineer Registry:**
+- Engineer credentials (address → Engineer struct)
+
+**Lifecycle Contract:**
+- Maintenance history (asset ID → Vec<MaintenanceRecord>)
+- Collateral scores (asset ID → u32)
+
+### Why This Matters
+
+Without TTL extension, critical data could silently expire:
+- Asset records would disappear, breaking the entire system
+- Engineer credentials would be lost, preventing maintenance verification
+- Maintenance histories would vanish, destroying the audit trail
+- Collateral scores would reset to zero, invalidating DeFi collateral
+
+The automatic TTL extension ensures that all data remains accessible as long as the contract is actively used, preventing data loss and maintaining system integrity.
+
+For a detailed breakdown of all storage keys and our extension strategy, see [docs/ttl-strategy.md](docs/ttl-strategy.md).
 
 ## 🌍 Why This Matters
 
@@ -180,6 +232,10 @@ Industrial assets like generators, turbines, and heavy vehicles represent trilli
 - **v4.0**: Mobile app for field engineers, multi-asset portfolio view
 
 See [docs/roadmap.md](docs/roadmap.md) for details.
+
+## 🛡️ Security
+
+We take the security of Mainstay very seriously. If you discover a vulnerability, please refer to our [Security Policy](SECURITY.md) for reporting instructions.
 
 ## 🤝 Contributing
 
