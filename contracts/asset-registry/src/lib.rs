@@ -14,6 +14,7 @@ pub enum ContractError {
     UnauthorizedAdmin = 3,
     UnauthorizedOwner = 4,
     NotInitialized = 5,
+    AdminAlreadyInitialized = 6,
 }
 
 #[contracttype]
@@ -65,6 +66,9 @@ fn owner_index_add(env: &Env, owner: &Address, asset_id: u64) {
 /// Remove an asset ID from the owner's index.
 fn owner_index_remove(env: &Env, owner: &Address, asset_id: u64) {
     let key = owner_index_key(owner);
+    if !env.storage().persistent().has(&key) {
+        return;
+    }
     let ids: Vec<u64> = env.storage().persistent().get(&key).unwrap_or_else(|| Vec::new(env));
     let mut updated: Vec<u64> = Vec::new(env);
     for id in ids.iter() {
@@ -81,6 +85,18 @@ pub struct AssetRegistry;
 
 #[contractimpl]
 impl AssetRegistry {
+    /// Register a new asset with the given type, metadata, and owner.
+    ///
+    /// # Arguments
+    /// * `asset_type` - A Symbol representing the type of asset (e.g., "GENSET", "TURBINE")
+    /// * `metadata` - String containing asset metadata and specifications
+    /// * `owner` - Address of the asset owner
+    ///
+    /// # Returns
+    /// The unique asset ID assigned to the registered asset
+    ///
+    /// # Panics
+    /// - [`ContractError::DuplicateAsset`] if the same owner tries to register identical metadata
     pub fn register_asset(env: Env, asset_type: Symbol, metadata: String, owner: Address) -> u64 {
         owner.require_auth();
 
@@ -118,6 +134,16 @@ impl AssetRegistry {
         id
     }
 
+    /// Retrieve an asset by its unique ID.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset to retrieve
+    ///
+    /// # Returns
+    /// The complete Asset struct containing all asset information
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
     pub fn get_asset(env: Env, asset_id: u64) -> Asset {
         env.storage()
             .persistent()
@@ -138,26 +164,51 @@ impl AssetRegistry {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Get the total count of registered assets in the system.
+    ///
+    /// # Returns
+    /// The total number of assets that have been registered
     pub fn asset_count(env: Env) -> u64 {
         env.storage().instance().get(&ASSET_COUNT).unwrap_or(0)
     }
 
-    /// Initialize the admin address (call once on deploy)
+    /// Initialize the admin address for the contract.
+    /// This function should be called once immediately after deployment.
+    ///
+    /// # Arguments
+    /// * `admin` - The address that will have administrative privileges
+    ///
+    /// # Panics
+    /// - [`ContractError::AdminAlreadyInitialized`] if admin has already been initialized
     pub fn initialize_admin(env: Env, admin: Address) {
         admin.require_auth();
         if env.storage().instance().has(&ADMIN_KEY) {
-            panic!("Admin already initialized");
+            panic_with_error!(&env, ContractError::AdminAlreadyInitialized);
         }
         env.storage().instance().set(&ADMIN_KEY, &admin);
     }
 
-    /// Get the current admin address
+    /// Get the current admin address of the contract.
+    ///
+    /// # Returns
+    /// The address of the current administrator
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if the admin has not been initialized
     pub fn get_admin(env: Env) -> Address {
         env.storage().instance().get(&ADMIN_KEY)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized))
     }
 
-    /// Admin-only: Deregister (remove) an asset
+    /// Admin-only function to deregister (remove) an asset from the registry.
+    /// This permanently removes the asset and all associated data.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset to deregister
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     pub fn deregister_asset(env: Env, asset_id: u64) {
         let admin = Self::get_admin(env.clone());
         admin.require_auth();
@@ -183,8 +234,19 @@ impl AssetRegistry {
         );
     }
 
-    /// Owner-only: update the metadata of an existing asset (e.g. after refurbishment).
-    /// Removes the old deduplication key and registers the new one.
+    /// Owner-only function to update the metadata of an existing asset.
+    /// This is typically used after refurbishment or specification changes.
+    /// Removes the old deduplication key and registers a new one.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset to update
+    /// * `owner` - The current owner of the asset (must match stored owner)
+    /// * `new_metadata` - The new metadata string to assign to the asset
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    /// - [`ContractError::UnauthorizedOwner`] if caller is not the asset owner
+    /// - [`ContractError::DuplicateAsset`] if new metadata already exists for this owner
     pub fn update_asset_metadata(env: Env, asset_id: u64, owner: Address, new_metadata: String) {
         owner.require_auth();
 
@@ -217,9 +279,11 @@ impl AssetRegistry {
 
         // Store new dedup key and updated asset
         env.storage().persistent().set(&new_dk, &asset_id);
+        env.storage().persistent().extend_ttl(&new_dk, 518400, 518400);
         asset.metadata = new_metadata.clone();
         asset.metadata_updated_at = env.ledger().timestamp();
         env.storage().persistent().set(&asset_key(asset_id), &asset);
+        env.storage().persistent().extend_ttl(&asset_key(asset_id), 518400, 518400);
 
         env.events().publish(
             (symbol_short!("UPD_META"), asset_id),
@@ -227,6 +291,17 @@ impl AssetRegistry {
         );
     }
 
+    /// Transfer ownership of an asset from the current owner to a new owner.
+    /// Only the current owner can initiate the transfer.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset to transfer
+    /// * `current_owner` - The current owner of the asset (must match stored owner)
+    /// * `new_owner` - The address of the new asset owner
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    /// - [`ContractError::UnauthorizedOwner`] if caller is not the current owner
     pub fn transfer_asset(env: Env, asset_id: u64, current_owner: Address, new_owner: Address) {
         current_owner.require_auth();
 
@@ -247,6 +322,7 @@ impl AssetRegistry {
             .into();
         env.storage().persistent().remove(&dedup_key(&current_owner, &hash));
         env.storage().persistent().set(&dedup_key(&new_owner, &hash), &asset_id);
+        env.storage().persistent().extend_ttl(&dedup_key(&new_owner, &hash), 518400, 518400);
 
         // Move owner index entry
         owner_index_remove(&env, &current_owner, asset_id);
@@ -262,7 +338,16 @@ impl AssetRegistry {
         );
     }
 
-    /// Admin-only: upgrade the contract WASM to a new hash.
+    /// Admin-only function to upgrade the contract WASM to a new hash.
+    /// This allows for contract updates while maintaining state.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored admin
+    /// * `new_wasm_hash` - The hash of the new WASM code to deploy
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if the admin has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     pub fn upgrade(env: Env, admin: Address, _new_wasm_hash: BytesN<32>) {
         admin.require_auth();
 
@@ -894,4 +979,97 @@ mod tests {
             ))),
         );
     }
+
+    #[test]
+    fn test_deregister_asset_with_expired_owner_index() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &owner,
+        );
+
+        // Simulate owner index expiration by removing it
+        env.as_contract(&contract_id, || {
+            let key = owner_index_key(&owner);
+            env.storage().persistent().remove(&key);
+        });
+
+        // Deregister should not create a stale empty entry
+        client.deregister_asset(&id);
+
+        // Verify owner index was not recreated
+        env.as_contract(&contract_id, || {
+            let key = owner_index_key(&owner);
+            assert!(!env.storage().persistent().has(&key));
+        });
+    }
+
+    #[test]
+    fn test_transfer_asset_extends_new_owner_dedup_key_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let metadata = String::from_str(&env, "CAT-3516");
+        let id = client.register_asset(&symbol_short!("GENSET"), &metadata, &owner);
+
+        client.transfer_asset(&id, &owner, &new_owner);
+
+        // Verify new owner's dedup key TTL is extended
+        env.as_contract(&contract_id, || {
+            let meta_bytes = Bytes::from(metadata.to_xdr(&env));
+            let meta_hash: BytesN<32> = env.crypto().sha256(&meta_bytes).into();
+            let new_dk = dedup_key(&new_owner, &meta_hash);
+            let dedup_ttl = env.storage().persistent().get_ttl(&new_dk);
+            assert!(dedup_ttl > 0, "New owner's dedup key TTL should be extended");
+        });
+    }
+
+    #[test]
+    fn test_update_metadata_extends_new_dedup_key_and_asset_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Original spec"),
+            &owner,
+        );
+
+        client.update_asset_metadata(
+            &id,
+            &owner,
+            &String::from_str(&env, "Updated spec"),
+        );
+
+        // Verify new dedup key TTL is extended
+        env.as_contract(&contract_id, || {
+            let new_metadata = String::from_str(&env, "Updated spec");
+            let meta_bytes = Bytes::from(new_metadata.to_xdr(&env));
+            let meta_hash: BytesN<32> = env.crypto().sha256(&meta_bytes).into();
+            let new_dk = dedup_key(&owner, &meta_hash);
+            let dedup_ttl = env.storage().persistent().get_ttl(&new_dk);
+            assert!(dedup_ttl > 0, "New dedup key TTL should be extended");
+
+            // Verify asset record TTL is extended
+            let asset_ttl = env.storage().persistent().get_ttl(&asset_key(id));
+            assert!(asset_ttl > 0, "Asset record TTL should be extended");
+        });
+    }
+}
 }

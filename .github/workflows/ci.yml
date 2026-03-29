@@ -16,3 +16,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - run: cargo test --workspace
+
+      - name: Audit Dependencies
+      run: cargo audit
+      if: failure()
+        run: echo "::error::Dependency vulnerabilities detected. Please review and update dependencies."

@@ -118,7 +118,7 @@
                   "symbol": "OIL_CHG"
                 },
                 {
-                  "string": "First"
+                  "string": ""
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
@@ -143,38 +143,10 @@
                   "u64": 1
                 },
                 {
-                  "symbol": "ENGINE"
+                  "symbol": "OIL_CHG"
                 },
                 {
-                  "string": "Second"
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
-                }
-              ]
-            }
-          },
-          "sub_invocations": []
-        }
-      ]
-    ],
-    [
-      [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
-        {
-          "function": {
-            "contract_fn": {
-              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
-              "function_name": "submit_maintenance",
-              "args": [
-                {
-                  "u64": 1
-                },
-                {
-                  "symbol": "FILTER"
-                },
-                {
-                  "string": "Third"
+                  "string": ""
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
@@ -186,6 +158,8 @@
         }
       ]
     ],
+    [],
+    [],
     []
   ],
   "ledger": {
@@ -702,7 +676,7 @@
                             "symbol": "notes"
                           },
                           "val": {
-                            "string": "First"
+                            "string": ""
                           }
                         },
                         {
@@ -746,7 +720,7 @@
                             "symbol": "notes"
                           },
                           "val": {
-                            "string": "Second"
+                            "string": ""
                           }
                         },
                         {
@@ -754,51 +728,7 @@
                             "symbol": "task_type"
                           },
                           "val": {
-                            "symbol": "ENGINE"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "timestamp"
-                          },
-                          "val": {
-                            "u64": 0
-                          }
-                        }
-                      ]
-                    },
-                    {
-                      "map": [
-                        {
-                          "key": {
-                            "symbol": "asset_id"
-                          },
-                          "val": {
-                            "u64": 1
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "engineer"
-                          },
-                          "val": {
-                            "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "notes"
-                          },
-                          "val": {
-                            "string": "Third"
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "task_type"
-                          },
-                          "val": {
-                            "symbol": "FILTER"
+                            "symbol": "OIL_CHG"
                           }
                         },
                         {
@@ -929,27 +859,7 @@
                             "symbol": "score"
                           },
                           "val": {
-                            "u32": 12
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "timestamp"
-                          },
-                          "val": {
-                            "u64": 0
-                          }
-                        }
-                      ]
-                    },
-                    {
-                      "map": [
-                        {
-                          "key": {
-                            "symbol": "score"
-                          },
-                          "val": {
-                            "u32": 17
+                            "u32": 4
                           }
                         },
                         {
@@ -1007,7 +917,7 @@
                 },
                 "durability": "persistent",
                 "val": {
-                  "u32": 17
+                  "u32": 4
                 }
               }
             },
@@ -1074,7 +984,7 @@
                                 "symbol": "max_history"
                               },
                               "val": {
-                                "u32": 200
+                                "u32": 3
                               }
                             },
                             {
@@ -1202,39 +1112,6 @@
                 "key": {
                   "ledger_key_nonce": {
                     "nonce": 4270020994084947596
-                  }
-                },
-                "durability": "temporary",
-                "val": "void"
-              }
-            },
-            "ext": "v0"
-          },
-          6311999
-        ]
-      ],
-      [
-        {
-          "contract_data": {
-            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
-            "key": {
-              "ledger_key_nonce": {
-                "nonce": 8370022561469687789
-              }
-            },
-            "durability": "temporary"
-          }
-        },
-        [
-          {
-            "last_modified_ledger_seq": 0,
-            "data": {
-              "contract_data": {
-                "ext": "v0",
-                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
-                "key": {
-                  "ledger_key_nonce": {
-                    "nonce": 8370022561469687789
                   }
                 },
                 "durability": "temporary",

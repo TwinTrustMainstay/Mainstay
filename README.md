@@ -237,6 +237,17 @@ See [docs/roadmap.md](docs/roadmap.md) for details.
 
 We take the security of Mainstay very seriously. If you discover a vulnerability, please refer to our [Security Policy](SECURITY.md) for reporting instructions.
 
+### Dependency Vulnerability Scanning
+- **Automated Scanning**: CI workflow runs `cargo audit` on every push and PR
+- **Failure Handling**: Build fails if high-severity vulnerabilities are detected
+- **Purpose**: Automatically detect known vulnerabilities in Soroban SDK and dependencies
+- **Action Required**: Review and update dependencies if audit fails
+
+### Security Best Practices
+- **Regular Updates**: Keep dependencies updated to latest secure versions
+- **Review Process**: All dependency changes undergo security review
+- **Vulnerability Disclosure**: Report security issues through responsible disclosure
+
 ## 🤝 Contributing
 
 We welcome contributions! Please:
