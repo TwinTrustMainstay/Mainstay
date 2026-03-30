@@ -1079,6 +1079,20 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "Admin already initialized")]
+    fn test_initialize_admin_called_twice_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        // Second call must panic
+        client.initialize_admin(&admin);
+    }
+
+    #[test]
     fn test_get_assets_by_owner_updated_after_deregister() {
         let env = Env::default();
         env.mock_all_auths();

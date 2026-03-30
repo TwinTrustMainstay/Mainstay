@@ -396,6 +396,20 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "admin already initialized")]
+    fn test_initialize_admin_called_twice_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(EngineerRegistry, ());
+        let client = EngineerRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        // Second call must panic
+        client.initialize_admin(&admin);
+    }
+
+    #[test]
     fn test_register_verify_revoke() {
         let env = Env::default();
         env.mock_all_auths();
@@ -830,7 +844,6 @@ mod tests {
         let record = client.get_engineer(&engineer);
         assert!(!record.active);
 
-        let contract_id = client.address.clone();
         let ttl = env.as_contract(&contract_id, || {
             env.storage().persistent().get_ttl(&engineer_key(&engineer))
         });
