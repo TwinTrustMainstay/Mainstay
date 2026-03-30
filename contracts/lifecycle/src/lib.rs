@@ -111,6 +111,82 @@ fn ensure_not_paused(env: &Env) {
     }
 }
 
+fn apply_decay(
+    env: &Env,
+    asset_id: u64,
+    emit_event: bool,
+    update_on_zero_interval: bool,
+) -> u32 {
+    let current_score: u32 = env
+        .storage()
+        .persistent()
+        .get(&score_key(asset_id))
+        .unwrap_or(0u32);
+
+    if current_score == 0 {
+        return 0;
+    }
+
+    let last_update: u64 = env
+        .storage()
+        .persistent()
+        .get(&last_update_key(asset_id))
+        .unwrap_or(0u64);
+
+    let config: Config = env
+        .storage()
+        .instance()
+        .get(&CONFIG)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized));
+
+    let current_time = env.ledger().timestamp();
+    let time_elapsed = current_time.saturating_sub(last_update);
+
+    // Calculate decay using configured rate and interval
+    let decay_intervals = time_elapsed / config.decay_interval;
+    if decay_intervals == 0 && !update_on_zero_interval {
+        return current_score;
+    }
+
+    let total_decay = (decay_intervals as u32) * config.decay_rate;
+    let new_score = current_score.saturating_sub(total_decay);
+
+    env.storage()
+        .persistent()
+        .set(&score_key(asset_id), &new_score);
+    env.storage()
+        .persistent()
+        .extend_ttl(&score_key(asset_id), 518400, 518400);
+    env.storage()
+        .persistent()
+        .set(&last_update_key(asset_id), &current_time);
+    env.storage()
+        .persistent()
+        .extend_ttl(&last_update_key(asset_id), 518400, 518400);
+
+    let mut score_history: Vec<ScoreEntry> = env
+        .storage()
+        .persistent()
+        .get(&score_history_key(asset_id))
+        .unwrap_or(Vec::new(env));
+    score_history.push_back(ScoreEntry {
+        timestamp: current_time,
+        score: new_score,
+    });
+    env.storage()
+        .persistent()
+        .set(&score_history_key(asset_id), &score_history);
+
+    if emit_event {
+        env.events().publish(
+            (symbol_short!("DECAY"), asset_id),
+            (current_score, new_score, current_time),
+        );
+    }
+
+    new_score
+}
+
 // Task type weight mapping for collateral scoring
 fn get_task_weight(env: &Env, task_type: &Symbol) -> u32 {
     // Minor tasks: 2 points
@@ -651,69 +727,7 @@ impl Lifecycle {
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     pub fn decay_score(env: Env, asset_id: u64) -> u32 {
         ensure_not_paused(&env);
-        let current_score: u32 = env
-            .storage()
-            .persistent()
-            .get(&score_key(asset_id))
-            .unwrap_or(0u32);
-
-        if current_score == 0 {
-            return 0;
-        }
-
-        let last_update: u64 = env
-            .storage()
-            .persistent()
-            .get(&last_update_key(asset_id))
-            .unwrap_or(0u64);
-
-        let config: Config = env
-            .storage()
-            .instance()
-            .get(&CONFIG)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-
-        let current_time = env.ledger().timestamp();
-        let time_elapsed = current_time.saturating_sub(last_update);
-
-        // Calculate decay using configured rate and interval
-        let decay_intervals = time_elapsed / config.decay_interval;
-        let total_decay = (decay_intervals as u32) * config.decay_rate;
-
-        let new_score = current_score.saturating_sub(total_decay);
-
-        env.storage()
-            .persistent()
-            .set(&score_key(asset_id), &new_score);
-        env.storage()
-            .persistent()
-            .extend_ttl(&score_key(asset_id), 518400, 518400);
-        env.storage()
-            .persistent()
-            .set(&last_update_key(asset_id), &current_time);
-        env.storage()
-            .persistent()
-            .extend_ttl(&last_update_key(asset_id), 518400, 518400);
-
-        let mut score_history: Vec<ScoreEntry> = env
-            .storage()
-            .persistent()
-            .get(&score_history_key(asset_id))
-            .unwrap_or(Vec::new(&env));
-        score_history.push_back(ScoreEntry {
-            timestamp: current_time,
-            score: new_score,
-        });
-        env.storage()
-            .persistent()
-            .set(&score_history_key(asset_id), &score_history);
-
-        env.events().publish(
-            (symbol_short!("DECAY"), asset_id),
-            (current_score, new_score, current_time),
-        );
-
-        new_score
+        apply_decay(&env, asset_id, true, true)
     }
 
     /// Get the complete maintenance history for an asset.
@@ -800,6 +814,7 @@ impl Lifecycle {
 
     /// Get the current collateral score for an asset.
     /// Verifies asset exists before returning the score.
+    /// Applies time-based decay lazily and persists the decayed score.
     ///
     /// # Arguments
     /// * `asset_id` - The unique identifier of the asset
@@ -820,11 +835,7 @@ impl Lifecycle {
         let asset_registry_client =
             asset_registry::AssetRegistryClient::new(&env, &asset_registry);
         asset_registry_client.get_asset(&asset_id);
-
-        env.storage()
-            .persistent()
-            .get(&score_key(asset_id))
-            .unwrap_or(0)
+        apply_decay(&env, asset_id, false, false)
     }
 
 pub fn is_collateral_eligible(env: Env, asset_id: u64) -> bool {
@@ -1552,6 +1563,8 @@ for _ in 0..3 {
             &engineer,
         );
 
+        let initial_score = client.get_collateral_score(&asset_id);
+
         // Update decay config: 10 points per 60 seconds (for testing)
         client.update_decay_config(&admin, &10, &60);
 
@@ -1559,7 +1572,6 @@ for _ in 0..3 {
         env.ledger().with_mut(|li| li.timestamp = li.timestamp + 120);
 
         // Apply decay: should lose 20 points (10 * 2 intervals)
-        let initial_score = client.get_collateral_score(&asset_id);
         client.decay_score(&asset_id);
         let new_score = client.get_collateral_score(&asset_id);
 
@@ -1616,6 +1628,8 @@ for _ in 0..3 {
             );
         }
 
+        let initial_score = client.get_collateral_score(&asset_id);
+
         // Set custom decay: 2 points per 100 seconds
         client.update_decay_config(&admin, &2, &100);
 
@@ -1623,11 +1637,43 @@ for _ in 0..3 {
         env.ledger().with_mut(|li| li.timestamp = li.timestamp + 250);
 
         // Apply decay: should lose 4 points (2 * 2 intervals)
-        let initial_score = client.get_collateral_score(&asset_id);
         client.decay_score(&asset_id);
         let new_score = client.get_collateral_score(&asset_id);
 
         assert_eq!(new_score, initial_score.saturating_sub(4));
+    }
+
+    #[test]
+    fn test_get_collateral_score_applies_lazy_decay() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        // Build score to 20 (ENGINE = 10 pts)
+        for _ in 0..2 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("ENGINE"),
+                &String::from_str(&env, "Build score"),
+                &engineer,
+            );
+        }
+
+        // Fast decay: 5 points per 60 seconds
+        client.update_decay_config(&admin, &5, &60);
+
+        // Advance 120 seconds (2 intervals -> 10 points decay)
+        env.ledger().with_mut(|li| li.timestamp = li.timestamp + 120);
+
+        let decayed = client.get_collateral_score(&asset_id);
+        assert_eq!(decayed, 10);
+
+        // Ensure value is written back to storage (subsequent reads are consistent)
+        let decayed_again = client.get_collateral_score(&asset_id);
+        assert_eq!(decayed_again, 10);
     }
 
     #[test]
