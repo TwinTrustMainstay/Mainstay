@@ -1449,6 +1449,14 @@
                             },
                             {
                               "key": {
+                                "symbol": "max_notes_length"
+                              },
+                              "val": {
+                                "u32": 256
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "score_increment"
                               },
                               "val": {
