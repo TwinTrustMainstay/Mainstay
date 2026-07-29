@@ -3753,6 +3753,24 @@ pub fn accept_admin(env: Env) {
                         engineer_history_remove(&env, &eng, asset_id);
                     }
                 }
+
+                // Issue #1072: the collateral score is derived from maintenance
+                // history, so it must be recalculated and persisted here —
+                // otherwise a stale, pre-prune score (potentially inflated by
+                // the records just removed) would keep being served.
+                let asset_registry = get_asset_registry_addr(&env);
+                let asset = asset_registry::AssetRegistryClient::new(&env, &asset_registry)
+                    .get_asset(&asset_id);
+                let new_score =
+                    compute_read_only_collateral_score(&env, asset_id, &asset.asset_type, &config);
+                env.storage()
+                    .persistent()
+                    .set(&score_key(asset_id), &new_score);
+                extend_persistent_ttl(&env, &score_key(asset_id));
+                env.storage()
+                    .persistent()
+                    .set(&last_update_key(asset_id), &env.ledger().timestamp());
+                extend_persistent_ttl(&env, &last_update_key(asset_id));
             }
         }
 
@@ -5525,6 +5543,47 @@ mod tests {
         assert_eq!(
             last_before.timestamp, last_after.timestamp,
             "Most recent entries should be kept"
+        );
+    }
+
+    /// Issue #1072: pruning must recalculate and persist the collateral score
+    /// immediately, otherwise readers of the raw stored score (e.g.
+    /// `take_health_snapshot`, which does not recompute from live history)
+    /// keep seeing the stale, pre-prune value.
+    #[test]
+    fn test_prune_asset_history_updates_stale_score_snapshot() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 10);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // 10 records at the default OIL_CHG weight (5) each = score 50.
+        for _ in 0..10 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &Priority::Low,
+                &String::from_str(&env, "Routine oil change"),
+                &engineer,
+                &None,
+            );
+        }
+        let score_before = client.take_health_snapshot(&asset_id).score;
+        assert_eq!(score_before, 50);
+
+        // Shrink max_history and prune — most of the scoring history is dropped.
+        client.update_max_history(&admin, &2);
+        client.prune_asset_history(&admin, &asset_id);
+
+        let score_after = client.take_health_snapshot(&asset_id).score;
+        assert!(
+            score_after < score_before,
+            "collateral score must be recalculated immediately after pruning, got {} (was {})",
+            score_after,
+            score_before
         );
     }
 
