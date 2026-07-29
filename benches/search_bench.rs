@@ -58,43 +58,7 @@ fn setup_large_dataset(env: &Env, n: u32) -> AssetRegistryClient {
     registry
 }
 
-fn bench_search_all_types(c: &mut Criterion) {
-    c.bench_function("search_assets/all_1000_no_filter", |b| {
-        let env = Env::default();
-        env.mock_all_auths();
-        let registry = setup_large_dataset(&env, 1000);
-        let filter = SearchFilter {
-            asset_type: None,
-            manufacturer: None,
-            min_age_months: None,
-            max_age_months: None,
-            sort: None,
-            lifecycle_contract: None,
-        };
-        b.iter(|| {
-            black_box(registry.search_assets(&filter));
-        });
-    });
-}
 
-fn bench_search_single_type(c: &mut Criterion) {
-    c.bench_function("search_assets/single_type_200", |b| {
-        let env = Env::default();
-        env.mock_all_auths();
-        let registry = setup_large_dataset(&env, 1000);
-        let filter = SearchFilter {
-            asset_type: Some(symbol_short!("GENSET")),
-            manufacturer: None,
-            min_age_months: None,
-            max_age_months: None,
-            sort: None,
-            lifecycle_contract: None,
-        };
-        b.iter(|| {
-            black_box(registry.search_assets(&filter));
-        });
-    });
-}
 
 fn bench_search_by_owner(c: &mut Criterion) {
     c.bench_function("get_assets_by_owner/1000", |b| {
