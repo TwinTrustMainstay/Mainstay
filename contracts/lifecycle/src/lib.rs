@@ -25,6 +25,7 @@ const ENG_REGISTRY: Symbol = symbol_short!("ENG_REG");
 const CONFIG: Symbol = symbol_short!("CONFIG");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 const PENDING_ADMIN_KEY: Symbol = symbol_short!("PADMIN");
+const DEPLOYER_KEY: Symbol = symbol_short!("DEPLOYER");
 const DEFAULT_MAX_HISTORY: u32 = 200;
 const DEFAULT_SCORE_INCREMENT: u32 = 5;
 const DEFAULT_DECAY_RATE: u32 = 5;
@@ -166,14 +167,16 @@ fn require_quorum(env: &Env, config: &Config, caller: &Address) {
 }
 
 fn require_engineer_authorized(env: &Env, asset_id: u64, engineer: &Address) {
+    let key = engineer_auth_key(asset_id, engineer);
     let authorized: bool = env
         .storage()
         .persistent()
-        .get(&engineer_auth_key(asset_id, engineer))
+        .get(&key)
         .unwrap_or(false);
     if !authorized {
         panic_with_error!(env, ContractError::EngineerNotAuthorized);
     }
+    extend_persistent_ttl(env, &key);
 }
 
 fn engineer_history_add(env: &Env, engineer: &Address, asset_id: u64, max_history: u32) {
@@ -595,6 +598,14 @@ pub struct Lifecycle;
 
 #[contractimpl]
 impl Lifecycle {
+    /// Store the deployer address at deploy time.
+    pub fn __constructor(env: Env, deployer: Address) {
+        env.storage().instance().set(&DEPLOYER_KEY, &deployer);
+        env.storage()
+            .instance()
+            .extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
+    }
+
     /// Propose a configuration change to the Lifecycle contract using the admin timelock.
     ///
     /// # Arguments
@@ -869,10 +880,15 @@ impl Lifecycle {
         admin: Address,
         max_history: u32,
     ) {
-        // Soroban SDK removed `env.invoker()`; `require_auth` enforces the
-        // deployer's signature instead, matching the standard pattern used
-        // elsewhere in this contract.
         deployer.require_auth();
+        let stored_deployer: Address = env
+            .storage()
+            .instance()
+            .get(&DEPLOYER_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if deployer != stored_deployer {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
         if env.storage().persistent().has(&CONFIG) {
             panic_with_error!(&env, ContractError::AlreadyInitialized);
         }

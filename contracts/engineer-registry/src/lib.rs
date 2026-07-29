@@ -1,7 +1,7 @@
 #![no_std]
 use shared::error::SharedContractError;
 use shared::validation::require_within_bounds;
-use shared::{extend_persistent_ttl, require_admin, TTL_THRESHOLD, TTL_TARGET};
+use shared::{extend_persistent_ttl, require_admin, DEFAULT_TTL_LEDGERS, TTL_THRESHOLD, TTL_TARGET};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
     BytesN, Env, String, Symbol, Vec,
@@ -127,6 +127,7 @@ const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
 const GRACE_PERIOD_SECS: u64 = 7 * 86_400;
 const GRACE_PERIOD_KEY: Symbol = symbol_short!("GRACE_P");
 const MAX_BATCH_REVOKE: u32 = 50;
+const DEPLOYER_KEY: Symbol = symbol_short!("DEPLOYER");
 
 fn is_paused(env: &Env) -> bool {
     env.storage().persistent().get(&PAUSED_KEY).unwrap_or(false)
@@ -229,6 +230,14 @@ pub struct EngineerRegistry;
 
 #[contractimpl]
 impl EngineerRegistry {
+    /// Store the deployer address at deploy time.
+    pub fn __constructor(env: Env, deployer: Address) {
+        env.storage().instance().set(&DEPLOYER_KEY, &deployer);
+        env.storage()
+            .instance()
+            .extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
+    }
+
     /// Propose the revocation of an engineer's credential.
     /// The revocation is subject to a timelock before it can be executed.
     ///
@@ -703,13 +712,15 @@ impl EngineerRegistry {
     /// - [`ContractError::AdminAlreadyInitialized`] if admin has already been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if deployer is not the transaction invoker
     pub fn initialize_admin(env: Env, deployer: Address, admin: Address) {
-        // SDK 22: identity enforced via require_auth below
-        if false {
+        deployer.require_auth();
+        let stored_deployer: Address = env
+            .storage()
+            .instance()
+            .get(&DEPLOYER_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if deployer != stored_deployer {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
-        // Soroban SDK removed `env.invoker()`; `require_auth` enforces the
-        // deployer's signature instead, matching the standard pattern.
-        deployer.require_auth();
         if env.storage().instance().has(&admin_key()) {
             panic_with_error!(&env, ContractError::AdminAlreadyInitialized);
         }
