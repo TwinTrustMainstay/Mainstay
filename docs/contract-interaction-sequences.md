@@ -287,8 +287,12 @@ sequenceDiagram
   (issue #794) — even though the *stored* frozen score keeps the real
   decayed value internally, so an already-issued loan's risk models can still
   inspect what the score was at the moment of decommissioning if needed.
-- Once `FROZEN` is set, all subsequent `get_collateral_score` calls for that
-  asset short-circuit to the frozen value — decay stops entirely.
+- Once `FROZEN` is set, `get_collateral_score`/`get_collateral_score_batch`
+  short-circuit to `0` for that asset from then on (issue #794 — a
+  decommissioned asset must never look like valid collateral); only
+  `get_collateral_score_opt` returns the actual stored `FRZ_SCR` value, for
+  callers that specifically want to inspect what the score was at the moment
+  of decommissioning.
 - `submit_maintenance` also independently checks `asset_status ==
   Decommissioned` and panics `AssetDecommissioned`, so no new maintenance can
   slip in between the two events above.
@@ -297,9 +301,14 @@ sequenceDiagram
 
 ## Collateral Score Query
 
-`get_collateral_score` looks read-only from the caller's side, but it lazily
-applies decay and **writes the result back** so repeated calls in the same
-ledger stay consistent without redundant recomputation.
+`get_collateral_score` is fully read-only: both scoring models are
+recomputed from stored history/config on every call and nothing is written
+back — repeat calls in the same ledger simply redo the same math. Its
+siblings `get_collateral_score_opt` and `get_collateral_score_batch` are
+*not* pure: they call the same lazy-decay routine used by `decay_score`
+internally, so if a whole `decay_interval` has elapsed since the last write,
+calling either of them persists the newly-decayed score (silently, without
+emitting a `DECAY` event) as a side effect of what looks like a plain query.
 
 ```mermaid
 sequenceDiagram
@@ -312,17 +321,14 @@ sequenceDiagram
 
     Lifecycle->>AssetRegistry: get_asset(asset_id)
     AssetRegistry-->>Lifecycle: Asset { deprecation_status, … }
-    Note over Lifecycle: return 0 immediately if Deprecated or Decommissioned (and not FROZEN)
+    Note over Lifecycle: return 0 immediately if Deprecated or Decommissioned
+    Note over Lifecycle: return 0 immediately if FROZEN (issue #794 — decommissioned assets never re-appear as collateral)
 
-    Note over Lifecycle: if FROZEN → return FRZ_SCR immediately (decay stopped at decommission)
-
-    Note over Lifecycle: Model A — recency-weighted history:<br/>Σ over HIST of score_increment × max(0, MAX_AGE_LEDGERS − age) / MAX_AGE_LEDGERS, capped at 100
+    Note over Lifecycle: Model A — recency-weighted history:<br/>Σ over HIST of score_increment × max(0, MAX_AGE_LEDGERS − age) / MAX_AGE_LEDGERS, capped at 100<br/>(records marked as duplicates via mark_maintenance_as_duplicate are skipped)
 
     Note over Lifecycle: Model B — stored value + lazy config decay:<br/>config_score = max(0, SCORE − (elapsed / decay_interval) × decay_rate)
 
-    Note over Lifecycle: score = min(Model A, Model B)<br/>floor at 1 if HIST is non-empty (MIN_SCORE_WITH_HISTORY)
-
-    Note over Lifecycle: persist score → SCORE, now → LUPD
+    Note over Lifecycle: score = min(Model A, Model B)<br/>floor at 1 if HIST is non-empty (MIN_SCORE_WITH_HISTORY)<br/>— purely computed, nothing persisted by this function
 
     Lifecycle-->>Caller: return score (0–100)
 ```
