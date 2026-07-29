@@ -36,6 +36,22 @@ pub enum ContractError {
     BatchTooLarge = 23,
     /// Fewer valid signers were provided than the configured admin_threshold requires.
     InsufficientSigners = 24,
+    /// Engineer's specialization does not match the asset's type.
+    SpecializationMismatch = 25,
+    /// No recurring task exists with the given task_id for this asset.
+    RecurringTaskNotFound = 26,
+    /// The recurring task exists but is not active.
+    RecurringTaskInactive = 27,
+    /// A recurring task with an equivalent schedule already exists for this asset.
+    DuplicateRecurringTask = 28,
+    /// Recurring task interval_type/interval_value combination is invalid.
+    InvalidRecurringSchedule = 29,
+    /// No duplicate maintenance record exists with the given timestamp.
+    DuplicateRecordNotFound = 30,
+    /// A compliance standard is already registered for this asset type.
+    StandardAlreadyRegistered = 31,
+    /// Not enough historical data points to compute a prediction.
+    InsufficientPredictionData = 32,
 }
 
 impl From<SharedContractError> for ContractError {
