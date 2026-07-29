@@ -10,36 +10,6 @@ use soroban_sdk::{
     Address, Env, String,
 };
 
-use asset_registry::{
-    AssetInput, AssetRegistry, AssetRegistryClient,
-};
-
-/// Create a fresh environment and bootstrap the asset-registry contract.
-fn setup(env: &Env) -> AssetRegistryClient {
-    let asset_registry_id = env.register(AssetRegistry, ());
-    let asset_registry = AssetRegistryClient::new(env, &asset_registry_id);
-    let admin = Address::generate(env);
-    asset_registry.initialize_admin(&admin, &admin);
-    asset_registry.add_asset_type(&admin, &symbol_short!("BENCH"));
-    asset_registry
-}
-
-fn bench_batch_register_1(c: &mut Criterion) {
-    c.bench_function("batch_register_assets/size_1", |b| {
-        b.iter(|| {
-            let env = Env::default();
-            env.mock_all_auths();
-            let registry = setup(&env);
-            let owner = Address::generate(&env);
-            let assets = soroban_sdk::vec![&env, AssetInput {
-                asset_type: symbol_short!("BENCH"),
-                metadata: String::from_str(&env, "single asset"),
-                serial_number: String::from_str(&env, "SN-001"),
-            }];
-            black_box(registry.batch_register_assets(&owner, &assets));
-        });
-    });
-}
 
 fn bench_batch_register_10(c: &mut Criterion) {
     c.bench_function("batch_register_assets/size_10", |b| {
