@@ -114,4 +114,6 @@ pub enum DataKey {
     RecurringTasks(u64),
     /// Stores duplicate maintenance record IDs per asset.
     DuplicateRecords(u64),
+    /// Stores `Vec<(timestamp: u64, value: u64)>` collateral-valuation history for an asset.
+    CollateralValuationHistory(u64),
 }
