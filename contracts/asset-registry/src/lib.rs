@@ -225,6 +225,12 @@ pub const DEREG_TOPIC: Symbol = symbol_short!("DEREG");
 pub const ADD_TYPE_TOPIC: Symbol = symbol_short!("ADD_TYPE");
 pub const RM_TYPE_TOPIC: Symbol = symbol_short!("RM_TYPE");
 
+/// Sentinel score returned by [`AssetRegistry::get_lifecycle_score`] for assets that
+/// have never had a maintenance record submitted. Distinguishes a brand-new asset
+/// from one with an actual score of 0 (e.g. deprecated or decommissioned), so DeFi
+/// lenders don't mistake "no history yet" for "poor maintenance record".
+pub const NO_LIFECYCLE_HISTORY_SCORE: u32 = u32::MAX;
+
 fn asset_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("ASSET"), id)
 }
@@ -2119,7 +2125,9 @@ impl AssetRegistry {
     /// * `lifecycle_contract` - The address of the Lifecycle contract
     ///
     /// # Returns
-    /// The collateral score (u32) for the asset
+    /// The collateral score (u32) for the asset, or [`NO_LIFECYCLE_HISTORY_SCORE`]
+    /// if the asset has never had a maintenance record submitted. This sentinel lets
+    /// callers distinguish a brand-new asset from one with an actual score of 0.
     ///
     /// # Panics
     /// - [`ContractError::AssetNotFound`] if the asset does not exist
@@ -2135,6 +2143,19 @@ impl AssetRegistry {
             &env,
             soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(&asset_id, &env)
         ];
+
+        // A fresh asset with no maintenance history at all must be reported with the
+        // sentinel rather than the raw score, which would otherwise read as 0 and be
+        // indistinguishable from a poorly-maintained (also-0) asset.
+        let last_service: Option<u64> = env.invoke_contract(
+            &lifecycle_contract,
+            &Symbol::new(&env, "get_last_service_timestamp"),
+            args.clone(),
+        );
+        if last_service.is_none() {
+            return NO_LIFECYCLE_HISTORY_SCORE;
+        }
+
         let score: u32 = env.invoke_contract(
             &lifecycle_contract,
             &Symbol::new(&env, "get_collateral_score"),
@@ -5672,8 +5693,8 @@ mod tests {
         // Get lifecycle score via cross-contract call
         let score = asset_client.get_lifecycle_score(&asset_id, &lifecycle_id);
 
-        // Score should be a valid u32 (initially 0 for new asset)
-        assert_eq!(score, 0);
+        // A fresh asset with no maintenance history returns the sentinel, not 0.
+        assert_eq!(score, NO_LIFECYCLE_HISTORY_SCORE);
     }
 
     #[test]
