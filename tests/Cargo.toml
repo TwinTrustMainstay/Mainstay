@@ -98,3 +98,7 @@ path = "test_suspended_engineer_rejected.rs"
 [[test]]
 name = "test_issues_1010_1013"
 path = "test_issues_1010_1013.rs"
+
+[[test]]
+name = "test_engineer_history_cap"
+path = "test_engineer_history_cap.rs"

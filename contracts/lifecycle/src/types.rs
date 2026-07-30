@@ -94,6 +94,12 @@ pub struct Config {
     /// Ignored when `admins` is empty (single-admin mode) or when set to 0 / 1.
     pub admin_threshold: u32,
     pub max_history: u32,
+    /// Maximum number of asset IDs retained in an engineer's per-address history.
+    /// When the list reaches this cap the oldest entry is dropped before the new
+    /// one is appended (sliding-window pruning).  A value of `0` is treated as
+    /// "use the contract default" and is replaced with
+    /// `DEFAULT_MAX_ENGINEER_HISTORY` at initialisation time.
+    pub max_engineer_history: u32,
     pub score_increment: u32,
     pub decay_rate: u32,
     pub decay_interval: u64,

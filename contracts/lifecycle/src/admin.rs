@@ -368,6 +368,41 @@ pub(crate) fn update_max_history(env: Env, admin: Address, new_max: u32) {
     );
 }
 
+/// Admin-only function to update the per-engineer history cap.
+///
+/// # Arguments
+/// * `admin`   - The admin address that must match the stored config admin.
+/// * `new_max` - New cap on the number of asset IDs kept in each engineer's
+///               history list (must be > 0).
+///
+/// # Panics
+/// - [`ContractError::NotInitialized`] if the contract has not been initialised.
+/// - [`ContractError::UnauthorizedAdmin`] if the caller is not the admin.
+/// - [`ContractError::InvalidConfig`] if `new_max` is 0.
+pub(crate) fn update_max_engineer_history(env: Env, admin: Address, new_max: u32) {
+    ensure_not_paused(&env);
+    admin.require_auth();
+    if new_max == 0 {
+        panic_with_error!(&env, ContractError::InvalidConfig);
+    }
+    let mut config: Config = env.storage().persistent().get(&CONFIG)
+        .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+    if config.admin != admin {
+        panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+    }
+    config.max_engineer_history = new_max;
+    env.storage().persistent().set(&CONFIG, &config);
+    extend_persistent_ttl(&env, &CONFIG);
+    env.events().publish(
+        (symbol_short!("UPD_ENGH"), admin.clone()),
+        new_max,
+    );
+    env.events().publish(
+        (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
+        (admin, env.ledger().timestamp(), symbol_short!("ENG_HIST"), new_max),
+    );
+}
+
 pub(crate) fn update_max_notes_length(env: Env, admin: Address, new_max: u32) {
     ensure_not_paused(&env);
     admin.require_auth();
