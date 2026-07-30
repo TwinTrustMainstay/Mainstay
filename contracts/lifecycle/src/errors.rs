@@ -36,6 +36,8 @@ pub enum ContractError {
     BatchTooLarge = 23,
     /// Fewer valid signers were provided than the configured admin_threshold requires.
     InsufficientSigners = 24,
+    /// The admins list supplied to set_admin_quorum contains a duplicate address.
+    DuplicateAdmin = 25,
     /// The requested health snapshot index does not exist for the given asset.
     SnapshotNotFound = 25,
     /// Fewer than 2 matching task-type records exist; cannot compute a prediction.

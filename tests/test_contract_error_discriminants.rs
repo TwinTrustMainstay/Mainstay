@@ -98,11 +98,12 @@ fn test_engineer_registry_discriminants_are_unique() {
 #[test]
 fn test_lifecycle_discriminants_are_unique() {
     use lifecycle::ContractError::{
-        AlreadyInitialized, AssetDecommissioned, AssetNotFound, BatchTooLarge, EngineerNotAuthorized,
-        HistoryCapReached, IndexOutOfBounds, InsufficientSigners, InvalidConfig, InvalidTaskType,
-        NoMaintenanceHistory, NotInitialized, NotesTooLong, Paused, PendingAdminAlreadyExists,
-        ProposalNotFound, SameRegistryAddress, ScoreFrozen, ScoreOverflow, TimelockNotExpired,
-        UnauthorizedAdmin, UnauthorizedEngineer, UnauthorizedOwner, ZeroAddress,
+        AlreadyInitialized, AssetDecommissioned, AssetNotFound, BatchTooLarge, DuplicateAdmin,
+        EngineerNotAuthorized, HistoryCapReached, IndexOutOfBounds, InsufficientSigners,
+        InvalidConfig, InvalidTaskType, NoMaintenanceHistory, NotInitialized, NotesTooLong, Paused,
+        PendingAdminAlreadyExists, ProposalNotFound, SameRegistryAddress, ScoreFrozen,
+        ScoreOverflow, TimelockNotExpired, UnauthorizedAdmin, UnauthorizedEngineer,
+        UnauthorizedOwner, ZeroAddress,
     };
 
     let discriminants = [
@@ -130,6 +131,7 @@ fn test_lifecycle_discriminants_are_unique() {
         AssetDecommissioned as u32,
         BatchTooLarge as u32,
         InsufficientSigners as u32,
+        DuplicateAdmin as u32,
     ];
 
     assert_unique_discriminants(&discriminants, "Lifecycle");
