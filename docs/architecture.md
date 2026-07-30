@@ -152,6 +152,40 @@ sequenceDiagram
     Lifecycle-->>Engineer: emit (maint, asset_id, engineer, task_type, timestamp)
 ```
 
+### submit_maintenance — Cross-Contract Call Chain
+
+This diagram shows only the contract-to-contract calls triggered by a single
+`submit_maintenance` invocation. It omits actor details and internal
+computation to make the dependency order clear at a glance.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Lifecycle
+    participant AssetRegistry
+    participant EngineerRegistry
+
+    Note over Lifecycle: submit_maintenance called<br/>(local validation first)
+
+    Lifecycle->>AssetRegistry: try_get_asset(asset_id)
+    AssetRegistry-->>Lifecycle: Asset | None
+
+    Lifecycle->>EngineerRegistry: get_credential_status(engineer)
+    EngineerRegistry-->>Lifecycle: CredentialStatus
+
+    alt status is Valid or GracePeriod
+        Note over Lifecycle: credential accepted
+    else status is anything else
+        Lifecycle->>EngineerRegistry: verify_engineer(engineer)
+        EngineerRegistry-->>Lifecycle: bool (false → panic UnauthorizedEngineer)
+    end
+
+    Lifecycle->>EngineerRegistry: get_reputation(engineer)
+    EngineerRegistry-->>Lifecycle: reputation_score (0–1000)
+
+    Note over Lifecycle: weighted score update, append record, emit event
+```
+
 ### Collateral Score Query Flow (with Lazy Decay)
 
 `get_collateral_score` is read-only from the caller's perspective but applies
@@ -184,6 +218,50 @@ sequenceDiagram
     Note over Lifecycle: Persist score → SCORE<br/>Persist current timestamp → LUPD
 
     Lifecycle-->>Caller: return score (0–100)
+```
+
+### Loan Request with Collateral Verification
+
+The `Lending` contract does not make cross-contract calls autonomously — a
+lender performs collateral verification by calling `Lifecycle` and
+`AssetRegistry` directly before submitting a loan request and recording a lien.
+The diagram below shows the full off-chain → on-chain sequence a lender
+integration must execute.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Lender
+    participant AssetRegistry
+    participant Lifecycle
+    participant Lending
+
+    Lender->>AssetRegistry: get_asset(asset_id)
+    AssetRegistry-->>Lender: Asset { owner, deprecation_status, … }
+    Note over Lender: reject if asset is None, Deprecated,<br/>or Decommissioned
+
+    Note over Lender: verify asset.owner == borrower address
+
+    Lender->>Lifecycle: get_collateral_score(asset_id)
+    Note over Lifecycle: lazy decay applied; reads HIST, SCORE, LUPD
+    Lifecycle->>AssetRegistry: get_asset(asset_id)
+    AssetRegistry-->>Lifecycle: Asset { deprecation_status, … }
+    Note over Lifecycle: return 0 immediately if deprecated
+    Lifecycle-->>Lender: score (0–100)
+    Note over Lender: reject if score < 50 (configurable threshold)
+
+    Lender->>Lending: get_liens(asset_id)
+    Lending-->>Lender: Vec<LienRecord>
+    Note over Lender: reject if total encumbrance + loan_amount > asset_value
+
+    Lender->>Lending: request_loan(borrower, amount)
+    Note over Lending: borrower.require_auth()<br/>check for existing active loan<br/>verify contract token balance ≥ amount<br/>set deadline = now + loan_duration
+    Lending-->>Lender: emit loan_req event; transfer tokens to borrower
+
+    Note over Lender: Admin records lien to secure the claim
+    Lender->>Lending: record_lien(admin, asset_id, lender, loan_id, amount)
+    Note over Lending: require admin auth<br/>check no duplicate (lender, loan_id)<br/>append LienRecord; extend TTL
+    Lending-->>Lender: lien recorded (on-chain claim secured)
 ```
 
 ---
