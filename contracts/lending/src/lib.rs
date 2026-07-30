@@ -46,6 +46,9 @@ pub enum ContractError {
     VouchWithdrawNotAllowed = 15,
     /// Caller is not the authorized borrower for this loan.
     UnauthorizedBorrower = 16,
+    /// An identical lien (same asset + lender + loan_id) already exists.
+    LienAlreadyExists = 17,
+    /// No matching lien exists for the given asset, lender, and loan_id.
     /// A lien with the same asset, lender, and loan_id already exists.
     LienAlreadyExists = 17,
     /// No matching lien found for the given asset, lender, and loan_id.
