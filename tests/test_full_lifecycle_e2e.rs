@@ -1,5 +1,6 @@
 use asset_registry::{AssetRegistry, AssetRegistryClient};
 use engineer_registry::{EngineerRegistry, EngineerRegistryClient, EngineerStatus, CredentialStatus};
+use engineer_registry::{CredentialStatus, EngineerRegistry, EngineerRegistryClient, EngineerStatus};
 use lifecycle::{Lifecycle, LifecycleClient};
 use soroban_sdk::{
     symbol_short,
@@ -58,6 +59,7 @@ fn test_full_lifecycle_e2e() {
         engineer_registry.verify_engineer(&engineer, &None::<Symbol>),
         engineer_registry::CredentialStatus::Valid
     );
+    assert_eq!(engineer_registry.verify_engineer(&engineer), CredentialStatus::Valid);
     assert_eq!(
         engineer_registry.get_engineer_status(&engineer),
         EngineerStatus::Active
@@ -145,6 +147,7 @@ fn test_asset_transfer_preserves_history() {
     assert_eq!(pre_score, 30);
 
     // Transfer asset to new owner
+    let transfer_timestamp = env.ledger().timestamp();
     asset_registry.transfer_asset(&asset_id, &owner, &new_owner);
     lifecycle.record_transfer(&asset_id, &owner, &new_owner);
 
@@ -161,6 +164,7 @@ fn test_asset_transfer_preserves_history() {
     let sentinel = history.get(3).unwrap();
     assert_eq!(sentinel.task_type, symbol_short!("XFER"));
     assert_eq!(sentinel.engineer, new_owner);
+    assert_eq!(sentinel.timestamp, transfer_timestamp);
 
     // Assert collateral score unchanged after transfer
     let post_score = lifecycle.get_collateral_score(&asset_id);

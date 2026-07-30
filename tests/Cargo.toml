@@ -60,10 +60,34 @@ name = "test_decay_clamps_at_zero"
 path = "test_decay_clamps_at_zero.rs"
 
 [[test]]
+name = "test_engineer_credential_expiry"
+path = "test_engineer_credential_expiry.rs"
+
+[[test]]
+name = "test_depin_to_defi_e2e"
+path = "test_depin_to_defi_e2e.rs"
+
+[[test]]
+name = "test_lending_view_functions"
+path = "test_lending_view_functions.rs"
+
+[[test]]
+name = "test_submit_maintenance_fuzz"
+path = "test_submit_maintenance_fuzz.rs"
+
+[[test]]
+name = "test_expired_credential_submit_maintenance"
+path = "test_expired_credential_submit_maintenance.rs"
 name = "test_decommissioned_asset_maintenance"
 path = "test_decommissioned_asset_maintenance.rs"
 
 [[test]]
+name = "test_collateral_eligible_after_decay"
+path = "test_collateral_eligible_after_decay.rs"
+
+[[test]]
+name = "test_asset_dedup_cross_owner"
+path = "test_asset_dedup_cross_owner.rs"
 name = "test_collateral_score_decay_intervals"
 path = "test_collateral_score_decay_intervals.rs"
 

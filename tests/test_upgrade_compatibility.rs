@@ -167,6 +167,7 @@ fn test_engineer_registry_data_survives_upgrade() {
 
     // ── Verify credential verification works ────────────────────────
     let verified = er.verify_engineer(&engineer, &None::<Symbol>);
+    let verified = er.verify_engineer(&engineer);
     assert_eq!(
         verified,
         CredentialStatus::Valid,
@@ -180,6 +181,7 @@ fn test_engineer_registry_data_survives_upgrade() {
 
     // ── Credential must still be verifiable ──────────────────────────
     let verified_after = er.verify_engineer(&engineer, &None::<Symbol>);
+    let verified_after = er.verify_engineer(&engineer);
     assert_eq!(
         verified_after,
         CredentialStatus::Valid,
