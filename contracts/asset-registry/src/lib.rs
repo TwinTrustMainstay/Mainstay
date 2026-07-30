@@ -2852,6 +2852,48 @@ mod tests {
         );
     }
 
+    /// Closes #1067 — the owner+metadata dedup key must reject a duplicate even
+    /// when the serial number differs, proving this check is independent from
+    /// (and not merely a side effect of) the serial-number dedup check.
+    #[test]
+    fn test_register_asset_same_owner_metadata_different_serial_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let metadata = String::from_str(&env, "CAT-3516-SAME-METADATA");
+
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &metadata,
+            &String::from_str(&env, "SN-FIRST-001"),
+            &owner,
+        );
+        assert_eq!(id, 1);
+
+        // Same owner + same metadata, but a distinct serial number: the
+        // secondary (owner, asset_type, metadata_hash) dedup key must still
+        // reject this as a duplicate asset.
+        let result = client.try_register_asset(
+            &symbol_short!("GENSET"),
+            &metadata,
+            &String::from_str(&env, "SN-SECOND-002"),
+            &owner,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::DuplicateAsset as u32
+            )))
+        );
+    }
+
     #[test]
     fn test_different_owners_same_metadata_allowed() {
         let env = Env::default();

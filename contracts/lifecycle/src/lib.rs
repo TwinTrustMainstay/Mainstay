@@ -4793,6 +4793,7 @@ mod tests {
             &Priority::Low,
             &String::from_str(&env, "Should fail"),
             &engineer,
+            &None,
         );
 
         assert_eq!(
