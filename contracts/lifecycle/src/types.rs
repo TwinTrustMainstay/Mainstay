@@ -88,7 +88,7 @@ pub struct TimelockProposal {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HealthSnapshot {
-    pub timestamp: u64,
+    pub snapshot_timestamp: u64,
     pub score: u32,
     pub maintenance_count: u32,
     pub last_service_date: u64,
@@ -132,4 +132,6 @@ pub enum DataKey {
     RecurringTasks(u64),
     /// Stores duplicate maintenance record IDs per asset.
     DuplicateRecords(u64),
+    /// Stores `Vec<(timestamp: u64, value: u64)>` collateral-valuation history for an asset.
+    CollateralValuationHistory(u64),
 }

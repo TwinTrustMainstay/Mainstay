@@ -3,6 +3,24 @@
 mod errors;
 mod scoring;
 mod types;
+pub(crate) mod storage;
+pub(crate) mod events;
+pub(crate) mod admin;
+
+// Re-export storage key helpers at the crate root so that
+// `super::history_key(...)` etc. in scoring.rs keep working unchanged.
+pub(crate) use storage::{
+    engineer_auth_key, engineer_history_key, frozen_key, frozen_score_key,
+    health_snapshot_key, history_key, last_update_key, revoke_eng_timelock_key,
+    score_history_key, score_key, scoring_weights_key, standard_key, timelock_key,
+    transfer_hist_key,
+};
+
+// Re-export event constants at the crate root for the same reason.
+pub(crate) use events::{
+    EVENT_ADMIN_SET, EVENT_DECAY, EVENT_INIT, EVENT_MAINT, EVENT_PROP_ADMIN, EVENT_PRUNED,
+    EVENT_REG_AST, EVENT_REG_ENG, EVENT_RST_SCR, EVENT_XFER,
+};
 
 use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
@@ -12,6 +30,8 @@ use crate::types::{
 };
 use shared::extend_persistent_ttl;
 use shared::validation::require_non_empty_vec;
+use shared::{TIMELOCK_DELAY_SECS, DEFAULT_DECAY_INTERVAL_SECS, DEFAULT_TTL_LEDGERS};
+use shared::{TTL_THRESHOLD, TTL_TARGET};
 use shared::TTL_THRESHOLD;
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
@@ -65,6 +85,10 @@ const MAX_BUILT_IN_TASK_WEIGHT: u32 = 10;
 /// for the cross-contract calls and per-record validation performed
 /// inside the batch path.
 pub const MAX_BATCH_SIZE: u32 = 50;
+/// Upper bound on `limit` accepted by [`LifecycleContract::get_maintenance_history_page`].
+/// Without this cap a caller could pass an arbitrarily large `limit` and reintroduce
+/// the unbounded-response failure the paginated endpoint exists to prevent.
+pub const MAX_PAGE_SIZE: u32 = 100;
 const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
 /// Minimum score returned for an asset that has at least one maintenance record.
 /// Prevents decay from making a legitimately-maintained asset indistinguishable
@@ -76,65 +100,30 @@ const MIN_SCORE_WITH_HISTORY: u32 = 1;
 /// Older records still contribute nothing, newer records are weighted linearly.
 const MAX_AGE_LEDGERS: u64 = TTL_THRESHOLD as u64;
 
-const EVENT_INIT: Symbol = symbol_short!("INIT");
-const EVENT_MAINT: Symbol = symbol_short!("MAINT");
-const EVENT_DECAY: Symbol = symbol_short!("DECAY");
-const EVENT_REG_AST: Symbol = symbol_short!("REG_AST");
-const EVENT_REG_ENG: Symbol = symbol_short!("REG_ENG");
-const EVENT_RST_SCR: Symbol = symbol_short!("RST_SCR");
-const EVENT_XFER: Symbol = symbol_short!("XFER");
-const EVENT_PROP_ADMIN: Symbol = symbol_short!("PROP_ADM");
-const EVENT_ADMIN_SET: Symbol = symbol_short!("ADMIN_SET");
-const EVENT_PRUNED: Symbol = symbol_short!("PRUNED");
 
-fn history_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("HIST"), asset_id)
-}
 
-fn timelock_key(op: Symbol) -> (Symbol, Symbol) {
     (symbol_short!("TL_PROP"), op)
-}
 
-fn score_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("SCORE"), asset_id)
-}
 
-fn score_history_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("SCHIST"), asset_id)
-}
 
-fn last_update_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("LUPD"), asset_id)
-}
 
-fn engineer_history_key(engineer: &Address) -> (Symbol, Address) {
     (symbol_short!("ENG_HIST"), engineer.clone())
-}
 
-fn engineer_auth_key(asset_id: u64, engineer: &Address) -> (Symbol, u64, Address) {
     (symbol_short!("ENG_AUTH"), asset_id, engineer.clone())
-}
 
-fn frozen_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("FROZEN"), asset_id)
-}
 
-fn frozen_score_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("FRZ_SCR"), asset_id)
-}
 
-fn health_snapshot_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("HLTH_SNP"), asset_id)
-}
 
-fn transfer_hist_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("XFER_HIST"), asset_id)
-}
-fn revoke_eng_timelock_key(asset_id: u64, engineer: &Address) -> (Symbol, u64, Address) {
     (symbol_short!("RVK_TL"), asset_id, engineer.clone())
-}
 
-fn standard_key(asset_type: &Symbol) -> (Symbol, Symbol) {
     (symbol_short!("MSTD"), asset_type.clone())
 }
 
@@ -168,7 +157,7 @@ fn next_chain_link(env: &Env, history: &Vec<MaintenanceRecord>) -> Option<Bytes>
 ///
 /// The `caller` is expected to have already called `caller.require_auth()` before
 /// this function.
-fn require_quorum(env: &Env, config: &Config, caller: &Address) {
+pub(crate) fn require_quorum(env: &Env, config: &Config, caller: &Address) {
     if config.admins.is_empty() || config.admin_threshold <= 1 {
         // Single-admin mode: caller must be the configured admin.
         if config.admin != *caller {
@@ -207,6 +196,7 @@ fn require_quorum(env: &Env, config: &Config, caller: &Address) {
     }
 }
 
+pub(crate) fn require_engineer_authorized(env: &Env, asset_id: u64, engineer: &Address) {
 fn require_engineer_authorized(env: &Env, asset_id: u64, engineer: &Address) {
     let key = engineer_auth_key(asset_id, engineer);
     let authorized: bool = env
@@ -220,7 +210,7 @@ fn require_engineer_authorized(env: &Env, asset_id: u64, engineer: &Address) {
     extend_persistent_ttl(env, &key);
 }
 
-fn engineer_history_add(env: &Env, engineer: &Address, asset_id: u64, max_history: u32) {
+pub(crate) fn engineer_history_add(env: &Env, engineer: &Address, asset_id: u64, max_history: u32) {
     let key = engineer_history_key(engineer);
     let mut ids: Vec<u64> = env
         .storage()
@@ -248,7 +238,7 @@ fn engineer_history_add(env: &Env, engineer: &Address, asset_id: u64, max_histor
     extend_persistent_ttl(&env, &key);
 }
 
-fn engineer_history_remove(env: &Env, engineer: &Address, asset_id: u64) {
+pub(crate) pub(crate) fn engineer_history_remove(env: &Env, engineer: &Address, asset_id: u64) {
     let key = engineer_history_key(engineer);
     if let Some(ids) = env.storage().persistent().get::<_, Vec<u64>>(&key) {
         let mut new_ids: Vec<u64> = Vec::new(env);
@@ -264,31 +254,31 @@ fn engineer_history_remove(env: &Env, engineer: &Address, asset_id: u64) {
     }
 }
 
-fn get_asset_registry_addr(env: &Env) -> Address {
+pub(crate) fn get_asset_registry_addr(env: &Env) -> Address {
     env.storage()
         .persistent()
         .get(&ASSET_REGISTRY)
         .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized))
 }
 
-fn get_engineer_registry_addr(env: &Env) -> Address {
+pub(crate) fn get_engineer_registry_addr(env: &Env) -> Address {
     env.storage()
         .persistent()
         .get(&ENG_REGISTRY)
         .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized))
 }
 
-fn set_asset_registry_addr(env: &Env, addr: &Address) {
+pub(crate) fn set_asset_registry_addr(env: &Env, addr: &Address) {
     env.storage().persistent().set(&ASSET_REGISTRY, addr);
     extend_persistent_ttl(&env, &ASSET_REGISTRY);
 }
 
-fn set_engineer_registry_addr(env: &Env, addr: &Address) {
+pub(crate) fn set_engineer_registry_addr(env: &Env, addr: &Address) {
     env.storage().persistent().set(&ENG_REGISTRY, addr);
     extend_persistent_ttl(&env, &ENG_REGISTRY);
 }
 
-fn is_zero_address(env: &Env, addr: &Address) -> bool {
+pub(crate) fn is_zero_address(env: &Env, addr: &Address) -> bool {
     *addr
         == Address::from_str(
             env,
@@ -296,17 +286,17 @@ fn is_zero_address(env: &Env, addr: &Address) -> bool {
         )
 }
 
-fn is_paused(env: &Env) -> bool {
+pub(crate) fn is_paused(env: &Env) -> bool {
     env.storage().persistent().get(&PAUSED_KEY).unwrap_or(false)
 }
 
-fn ensure_not_paused(env: &Env) {
+pub(crate) fn ensure_not_paused(env: &Env) {
     if is_paused(env) {
         panic_with_error!(env, ContractError::Paused);
     }
 }
 
-fn require_admin(env: &Env, admin: &Address) {
+pub(crate) fn require_admin(env: &Env, admin: &Address) {
     admin.require_auth();
     let config: Config = env
         .storage()
@@ -328,7 +318,7 @@ struct FrequencyWeights {
     window_days: u32,
 }
 
-fn json_number(bytes: &Bytes, key: &[u8]) -> Option<u32> {
+pub(crate) fn json_number(bytes: &Bytes, key: &[u8]) -> Option<u32> {
     let len = bytes.len();
     if len == 0 || key.is_empty() || key.len() as u32 >= len {
         return None;
@@ -390,7 +380,7 @@ fn json_number(bytes: &Bytes, key: &[u8]) -> Option<u32> {
     None
 }
 
-fn parse_frequency_weights(weights_json: &Bytes) -> Option<FrequencyWeights> {
+pub(crate) fn parse_frequency_weights(weights_json: &Bytes) -> Option<FrequencyWeights> {
     let low = json_number(weights_json, b"\"low\"")?;
     let medium = json_number(weights_json, b"\"medium\"")?;
     let high = json_number(weights_json, b"\"high\"")?;
@@ -418,7 +408,7 @@ fn parse_frequency_weights(weights_json: &Bytes) -> Option<FrequencyWeights> {
     })
 }
 
-fn recent_maintenance_count(env: &Env, asset_id: u64, window_days: u32) -> u32 {
+pub(crate) fn recent_maintenance_count(env: &Env, asset_id: u64, window_days: u32) -> u32 {
     let history: Vec<MaintenanceRecord> = env
         .storage()
         .persistent()
@@ -441,7 +431,7 @@ fn recent_maintenance_count(env: &Env, asset_id: u64, window_days: u32) -> u32 {
     count
 }
 
-fn apply_dynamic_frequency_weight(env: &Env, asset_id: u64, asset_type: &Symbol, score: u32) -> u32 {
+pub(crate) fn apply_dynamic_frequency_weight(env: &Env, asset_id: u64, asset_type: &Symbol, score: u32) -> u32 {
     if score == 0 {
         return 0;
     }
@@ -470,7 +460,7 @@ fn apply_dynamic_frequency_weight(env: &Env, asset_id: u64, asset_type: &Symbol,
     ((score as u64).saturating_mul(multiplier as u64) / 100) as u32
 }
 
-fn compute_read_only_collateral_score(env: &Env, asset_id: u64, asset_type: &Symbol, config: &Config) -> u32 {
+pub(crate) fn compute_read_only_collateral_score(env: &Env, asset_id: u64, asset_type: &Symbol, config: &Config) -> u32 {
     let history_score = compute_decay(env, asset_id);
     let stored: u32 = env.storage().persistent().get(&score_key(asset_id)).unwrap_or(0);
     let last_update: u64 = env
@@ -499,7 +489,7 @@ fn compute_read_only_collateral_score(env: &Env, asset_id: u64, asset_type: &Sym
     }
 }
 
-fn store_timelock(env: &Env, op: Symbol) {
+pub(crate) fn store_timelock(env: &Env, op: Symbol) {
     let key = timelock_key(op);
     env.storage().persistent().set(
         &key,
@@ -511,7 +501,7 @@ fn store_timelock(env: &Env, op: Symbol) {
     extend_persistent_ttl(&env, &key);
 }
 
-fn require_timelock_ready(env: &Env, op: Symbol) {
+pub(crate) fn require_timelock_ready(env: &Env, op: Symbol) {
     let key = timelock_key(op);
     let mut proposal: TimelockProposal = env
         .storage()
@@ -529,7 +519,7 @@ fn require_timelock_ready(env: &Env, op: Symbol) {
     extend_persistent_ttl(&env, &key);
 }
 
-fn validate_notes_length(env: &Env, notes: &soroban_sdk::String, max: u32) {
+pub(crate) fn validate_notes_length(env: &Env, notes: &soroban_sdk::String, max: u32) {
     if notes.is_empty() {
         panic_with_error!(env, ContractError::NotesTooLong);
     }
@@ -538,7 +528,7 @@ fn validate_notes_length(env: &Env, notes: &soroban_sdk::String, max: u32) {
     }
 }
 
-fn verify_asset_exists(env: &Env, asset_registry: &Address, asset_id: &u64) {
+pub(crate) fn verify_asset_exists(env: &Env, asset_registry: &Address, asset_id: &u64) {
     let client = asset_registry::AssetRegistryClient::new(env, asset_registry);
     let result = client.try_get_asset(asset_id);
     if result.is_err() {
@@ -551,7 +541,7 @@ fn verify_asset_exists(env: &Env, asset_registry: &Address, asset_id: &u64) {
 /// Uses a moving average of historical intervals between consecutive records
 /// of the same task type. Returns [`ContractError::InsufficientPredictionData`]
 /// if fewer than 2 matching records exist.
-fn try_predict_next_service(
+pub(crate) fn try_predict_next_service(
     env: &Env,
     asset_id: u64,
     task_type: &Symbol,
@@ -653,9 +643,7 @@ impl Lifecycle {
     /// * `admin` - The administrator requesting the config update
     /// * `op` - Symbol representing the update operation
     pub fn propose_config_update(env: Env, admin: Address, op: Symbol) {
-        ensure_not_paused(&env);
-        require_admin(&env, &admin);
-        store_timelock(&env, op);
+        crate::admin::propose_config_update(env, admin, op);
     }
 
     /// Execute a pending score increment update after the timelock expires.
@@ -665,7 +653,7 @@ impl Lifecycle {
     /// * `score_increment` - New increment value for each maintenance task
     pub fn execute_update_score_increment(env: Env, admin: Address, score_increment: u32) {
         require_timelock_ready(&env, symbol_short!("SC_INC"));
-        Self::update_score_increment(env, admin, score_increment);
+        crate::admin::update_score_increment(env, admin, score_increment);
     }
 
     /// Execute a pending decay configuration update after the timelock expires.
@@ -681,7 +669,7 @@ impl Lifecycle {
         decay_interval: u64,
     ) {
         require_timelock_ready(&env, symbol_short!("DEC_CFG"));
-        Self::update_decay_config(env, admin, decay_rate, decay_interval);
+        crate::admin::update_decay_config(env, admin, decay_rate, decay_interval);
     }
 
     /// Execute a pending eligibility threshold update after the timelock expires.
@@ -691,7 +679,7 @@ impl Lifecycle {
     /// * `threshold` - New collateral eligibility threshold
     pub fn execute_update_eligibility(env: Env, admin: Address, threshold: u32) {
         require_timelock_ready(&env, symbol_short!("ELIG"));
-        Self::update_eligibility_threshold(env, admin, threshold);
+        crate::admin::update_eligibility_threshold(env, admin, threshold);
     }
 
     /// Execute a pending max history update after the timelock expires.
@@ -701,7 +689,7 @@ impl Lifecycle {
     /// * `new_max` - Maximum maintenance history entries per asset
     pub fn execute_update_max_history(env: Env, admin: Address, new_max: u32) {
         require_timelock_ready(&env, symbol_short!("MAX_HIST"));
-        Self::update_max_history(env, admin, new_max);
+        crate::admin::update_max_history(env, admin, new_max);
     }
 
     /// Execute a pending max notes length update after the timelock expires.
@@ -711,7 +699,7 @@ impl Lifecycle {
     /// * `new_max` - Maximum length of maintenance notes
     pub fn execute_update_max_notes_length(env: Env, admin: Address, new_max: u32) {
         require_timelock_ready(&env, symbol_short!("MAX_NOTE"));
-        Self::update_max_notes_length(env, admin, new_max);
+        crate::admin::update_max_notes_length(env, admin, new_max);
     }
 
     /// Execute a pending asset registry address update after the timelock expires.
@@ -721,7 +709,7 @@ impl Lifecycle {
     /// * `new_registry` - Address of the new asset registry contract
     pub fn execute_update_asset_registry(env: Env, admin: Address, new_registry: Address) {
         require_timelock_ready(&env, symbol_short!("AST_REG"));
-        Self::update_asset_registry(env, admin, new_registry);
+        crate::admin::update_asset_registry(env, admin, new_registry);
     }
 
     /// Execute a pending engineer registry address update after the timelock expires.
@@ -731,7 +719,7 @@ impl Lifecycle {
     /// * `new_registry` - Address of the new engineer registry contract
     pub fn execute_update_engineer_registry(env: Env, admin: Address, new_registry: Address) {
         require_timelock_ready(&env, symbol_short!("ENG_REG"));
-        Self::update_engineer_registry(env, admin, new_registry);
+        crate::admin::update_engineer_registry(env, admin, new_registry);
     }
 
     /// Owner-approved per-asset authorization for maintenance submissions.
@@ -976,21 +964,7 @@ impl Lifecycle {
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     pub fn pause(env: Env, admin: Address) {
-        admin.require_auth();
-        let config: Config = env
-            .storage()
-            .persistent()
-            .get(&CONFIG)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        require_quorum(&env, &config, &admin);
-        env.storage().persistent().set(&PAUSED_KEY, &true);
-        extend_persistent_ttl(&env, &PAUSED_KEY);
-        env.events()
-            .publish((symbol_short!("PAUSED"),), (admin.clone(),));
-        env.events().publish(
-            (symbol_short!("ADM_AUD"), symbol_short!("PAUSED")),
-            (admin, env.ledger().timestamp()),
-        );
+        crate::admin::pause(env, admin);
     }
 
     /// Admin-only function to unpause the contract.
@@ -1002,123 +976,46 @@ impl Lifecycle {
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     pub fn unpause(env: Env, admin: Address) {
-        admin.require_auth();
-        let config: Config = env
-            .storage()
-            .persistent()
-            .get(&CONFIG)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        if config.admin != admin {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
-        env.storage().persistent().set(&PAUSED_KEY, &false);
-        extend_persistent_ttl(&env, &PAUSED_KEY);
-        env.events()
-            .publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
-env.events().publish(
-             (symbol_short!("ADM_AUD"), symbol_short!("UNPAUSED")),
-             (admin, env.ledger().timestamp()),
-         );
-     }
+        crate::admin::unpause(env, admin);
+    }
 
      /// Propose pausing the contract using the admin timelock.
      ///
      /// # Arguments
      /// * `admin` - The administrator requesting the pause
-     pub fn propose_pause(env: Env, admin: Address) {
-         ensure_not_paused(&env);
-         admin.require_auth();
-         let config: Config = env
-             .storage()
-             .persistent()
-             .get(&CONFIG)
-             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-         require_quorum(&env, &config, &admin);
-         store_timelock(&env, symbol_short!("PAUSE"));
-         env.events().publish(
-             (symbol_short!("PROP_PAUSE"),), (admin.clone(),));
-         env.events().publish(
-             (symbol_short!("ADM_AUD"), symbol_short!("PROP_PAUSE")),
-             (admin, env.ledger().timestamp()),
-         );
-     }
+    pub fn propose_pause(env: Env, admin: Address) {
+        crate::admin::propose_pause(env, admin);
+    }
 
      /// Execute a pending pause after the timelock expires.
      ///
      /// # Arguments
      /// * `admin` - The administrator performing the pause
-     pub fn execute_pause(env: Env, admin: Address) {
-         require_timelock_ready(&env, symbol_short!("PAUSE"));
-         admin.require_auth();
-         let config: Config = env
-             .storage()
-             .persistent()
-             .get(&CONFIG)
-             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-         require_quorum(&env, &config, &admin);
-         env.storage().persistent().set(&PAUSED_KEY, &true);
-         extend_persistent_ttl(&env, &PAUSED_KEY);
-         env.events()
-             .publish((symbol_short!("PAUSED"),), (admin.clone(),));
-         env.events().publish(
-             (symbol_short!("ADM_AUD"), symbol_short!("PAUSED")),
-             (admin, env.ledger().timestamp()),
-         );
-     }
+    pub fn execute_pause(env: Env, admin: Address) {
+        crate::admin::execute_pause(env, admin);
+    }
 
      /// Propose unpausing the contract using the admin timelock.
      ///
      /// # Arguments
      /// * `admin` - The administrator requesting the unpause
-     pub fn propose_unpause(env: Env, admin: Address) {
-         admin.require_auth();
-         let config: Config = env
-             .storage()
-             .persistent()
-             .get(&CONFIG)
-             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-         if config.admin != admin {
-             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-         }
-         store_timelock(&env, symbol_short!("UNPAUSE"));
-         env.events().publish(
-             (symbol_short!("PROP_UNPAUSE"),), (admin.clone(),));
-         env.events().publish(
-             (symbol_short!("ADM_AUD"), symbol_short!("PROP_UNPAUSE")),
-             (admin, env.ledger().timestamp()),
-         );
-     }
+    pub fn propose_unpause(env: Env, admin: Address) {
+        crate::admin::propose_unpause(env, admin);
+    }
 
      /// Execute a pending unpause after the timelock expires.
      ///
      /// # Arguments
      /// * `admin` - The administrator performing the unpause
-     pub fn execute_unpause(env: Env, admin: Address) {
-         require_timelock_ready(&env, symbol_short!("UNPAUSE"));
-         admin.require_auth();
-         let config: Config = env
-             .storage()
-             .persistent()
-             .get(&CONFIG)
-             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-         if config.admin != admin {
-             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-         }
-         env.storage().persistent().set(&PAUSED_KEY, &false);
-         extend_persistent_ttl(&env, &PAUSED_KEY);
-         env.events()
-             .publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
-         env.events().publish(
-             (symbol_short!("ADM_AUD"), symbol_short!("UNPAUSED")),
-             (admin, env.ledger().timestamp()),
-         );
-     }
+    pub fn execute_unpause(env: Env, admin: Address) {
+        crate::admin::execute_unpause(env, admin);
+    }
 
      /// Check if the contract is currently paused.
     ///
     /// # Returns
     /// `true` if paused; `false` otherwise
-    pub fn is_paused(env: Env) -> bool {
+    pub pub(crate) fn is_paused(env: Env) -> bool {
         is_paused(&env)
     }
 
@@ -1133,28 +1030,9 @@ env.events().publish(
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
     /// - [`ContractError::PendingAdminAlreadyExists`] if a pending admin already exists
-pub fn propose_admin(env: Env, admin: Address, new_admin: Address) {
-         admin.require_auth();
-         let config: Config = env
-             .storage()
-             .persistent()
-             .get(&CONFIG)
-             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-         if config.admin != admin {
-             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-         }
-         if env.storage().instance().has(&PENDING_ADMIN_KEY) {
-             panic_with_error!(&env, ContractError::PendingAdminAlreadyExists);
-         }
-         env.storage().instance().set(&PENDING_ADMIN_KEY, &new_admin);
-         store_timelock(&env, symbol_short!("ADM_XFER"));
-         env.events()
-             .publish((EVENT_PROP_ADMIN,), (admin.clone(), new_admin.clone()));
-         env.events().publish(
-             (symbol_short!("ADM_AUD"), symbol_short!("PROP_ADM")),
-             (admin, env.ledger().timestamp(), new_admin),
-         );
-     }
+    pub fn propose_admin(env: Env, admin: Address, new_admin: Address) {
+        crate::admin::propose_admin(env, admin, new_admin);
+    }
 
     /// Accept the admin transfer (step 2 of 2-step transfer).
     /// Only the pending admin can accept and become the new admin.
@@ -1162,30 +1040,9 @@ pub fn propose_admin(env: Env, admin: Address, new_admin: Address) {
     /// # Panics
     /// - [`ContractError::NotInitialized`] if no pending admin exists
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the pending admin
-pub fn accept_admin(env: Env) {
-         require_timelock_ready(&env, symbol_short!("ADM_XFER"));
-         let pending_admin: Address = env
-             .storage()
-             .instance()
-             .get(&PENDING_ADMIN_KEY)
-             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-         pending_admin.require_auth();
-
-         let mut config: Config = env
-             .storage()
-             .persistent()
-             .get(&CONFIG)
-             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-         config.admin = pending_admin.clone();
-         env.storage().persistent().set(&CONFIG, &config);
-         extend_persistent_ttl(&env, &CONFIG);
-         env.storage().instance().remove(&PENDING_ADMIN_KEY);
-         env.events().publish(
-             (symbol_short!("ADM_AUD"), symbol_short!("ADMIN_SET")),
-             (pending_admin.clone(), env.ledger().timestamp()),
-         );
-         env.events().publish((EVENT_ADMIN_SET,), (pending_admin,));
-     }
+    pub fn accept_admin(env: Env) {
+        crate::admin::accept_admin(env);
+    }
 
     /// Admin-only function to configure the M-of-N multisig set for critical operations.
     ///
@@ -1203,36 +1060,7 @@ pub fn accept_admin(env: Env) {
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
     /// - [`ContractError::InvalidConfig`] if threshold exceeds the length of new_admins
     pub fn set_admin_quorum(env: Env, admin: Address, new_admins: Vec<Address>, threshold: u32) {
-        ensure_not_paused(&env);
-        admin.require_auth();
-
-        let mut config: Config = env
-            .storage()
-            .persistent()
-            .get(&CONFIG)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        if config.admin != admin {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
-        if threshold > 0 && threshold as u32 > new_admins.len() {
-            panic_with_error!(&env, ContractError::InvalidConfig);
-        }
-
-        config.admins = new_admins.clone();
-        config.admin_threshold = threshold;
-        env.storage().persistent().set(&CONFIG, &config);
-        env.storage()
-            .persistent()
-            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
-
-        env.events().publish(
-            (symbol_short!("SET_QRUM"), admin.clone()),
-            (new_admins, threshold),
-        );
-        env.events().publish(
-            (symbol_short!("ADM_AUD"), symbol_short!("SET_QRUM")),
-            (admin, env.ledger().timestamp(), threshold),
-        );
+        crate::admin::set_admin_quorum(env, admin, new_admins, threshold);
     }
 
     /// Admin-only function to update the score increment configuration.
@@ -1247,39 +1075,7 @@ pub fn accept_admin(env: Env) {
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     /// - [`ContractError::InvalidConfig`] if score_increment is 0
     pub fn update_score_increment(env: Env, admin: Address, score_increment: u32) {
-        ensure_not_paused(&env);
-        admin.require_auth();
-
-        if score_increment == 0 {
-            panic_with_error!(&env, ContractError::InvalidConfig);
-        }
-
-        let mut config: Config = env
-            .storage()
-            .persistent()
-            .get(&CONFIG)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        if config.admin != admin {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
-
-        let old_increment = config.score_increment;
-        config.score_increment = score_increment;
-        env.storage().persistent().set(&CONFIG, &config);
-        extend_persistent_ttl(&env, &CONFIG);
-        env.events().publish(
-            (symbol_short!("CFG_UPD"),),
-            (old_increment, score_increment),
-        );
-        env.events().publish(
-            (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
-            (
-                admin,
-                env.ledger().timestamp(),
-                symbol_short!("SCORE_INC"),
-                score_increment,
-            ),
-        );
+        crate::admin::update_score_increment(env, admin, score_increment);
     }
 
     /// Admin-only function to update the decay rate and interval for collateral score decay.
@@ -1295,48 +1091,7 @@ pub fn accept_admin(env: Env) {
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     /// - [`ContractError::InvalidConfig`] if decay_interval is 0
     pub fn update_decay_config(env: Env, admin: Address, decay_rate: u32, decay_interval: u64) {
-        ensure_not_paused(&env);
-        admin.require_auth();
-
-        if decay_rate == 0 || decay_interval == 0 {
-            panic_with_error!(&env, ContractError::InvalidConfig);
-        }
-
-        let mut config: Config = env
-            .storage()
-            .persistent()
-            .get(&CONFIG)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        if config.admin != admin {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
-
-        let old_decay_rate = config.decay_rate;
-        let old_decay_interval = config.decay_interval;
-        config.decay_rate = decay_rate;
-        config.decay_interval = decay_interval;
-
-        env.events().publish(
-            (symbol_short!("CFG_UPD"),),
-            (
-                old_decay_rate,
-                decay_rate,
-                old_decay_interval,
-                decay_interval,
-            ),
-        );
-        env.storage().persistent().set(&CONFIG, &config);
-        extend_persistent_ttl(&env, &CONFIG);
-        env.events().publish(
-            (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
-            (
-                admin,
-                env.ledger().timestamp(),
-                symbol_short!("DECAY"),
-                decay_rate,
-                decay_interval,
-            ),
-        );
+        crate::admin::update_decay_config(env, admin, decay_rate, decay_interval);
     }
 
     /// Admin-only function to update the eligibility threshold for collateral scoring.
@@ -1381,6 +1136,7 @@ pub fn accept_admin(env: Env) {
                 threshold,
             ),
         );
+        crate::admin::update_eligibility_threshold(env, admin, threshold);
     }
 
     /// Admin-only function to update the minimum collateral score required for eligibility.
@@ -1449,37 +1205,7 @@ pub fn accept_admin(env: Env) {
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     /// - [`ContractError::InvalidConfig`] if new_max is 0
     pub fn update_max_history(env: Env, admin: Address, new_max: u32) {
-        ensure_not_paused(&env);
-        admin.require_auth();
-
-        if new_max == 0 {
-            panic_with_error!(&env, ContractError::InvalidConfig);
-        }
-
-        let mut config: Config = env
-            .storage()
-            .persistent()
-            .get(&CONFIG)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        if config.admin != admin {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
-
-        config.max_history = new_max;
-        env.storage().persistent().set(&CONFIG, &config);
-        extend_persistent_ttl(&env, &CONFIG);
-
-        env.events()
-            .publish((symbol_short!("UPD_MAX"), admin.clone()), new_max);
-        env.events().publish(
-            (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
-            (
-                admin,
-                env.ledger().timestamp(),
-                symbol_short!("MAX_HIST"),
-                new_max,
-            ),
-        );
+        crate::admin::update_max_history(env, admin, new_max);
     }
 
     /// Admin-only function to update the maximum allowed notes length per maintenance record.
@@ -1493,37 +1219,7 @@ pub fn accept_admin(env: Env) {
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     /// - [`ContractError::InvalidConfig`] if new_max is 0
     pub fn update_max_notes_length(env: Env, admin: Address, new_max: u32) {
-        ensure_not_paused(&env);
-        admin.require_auth();
-
-        if new_max == 0 {
-            panic_with_error!(&env, ContractError::InvalidConfig);
-        }
-
-        let mut config: Config = env
-            .storage()
-            .persistent()
-            .get(&CONFIG)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        if config.admin != admin {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
-
-        config.max_notes_length = new_max;
-        env.storage().persistent().set(&CONFIG, &config);
-        extend_persistent_ttl(&env, &CONFIG);
-
-        env.events()
-            .publish((symbol_short!("UPD_NOTES"), admin.clone()), new_max);
-        env.events().publish(
-            (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
-            (
-                admin,
-                env.ledger().timestamp(),
-                symbol_short!("MAX_NOTE"),
-                new_max,
-            ),
-        );
+        crate::admin::update_max_notes_length(env, admin, new_max);
     }
 
     /// Admin-only function to directly set the maximum allowed notes length.
@@ -1539,37 +1235,7 @@ pub fn accept_admin(env: Env) {
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     /// - [`ContractError::InvalidConfig`] if length is 0
     pub fn set_max_notes_length(env: Env, admin: Address, length: u32) {
-        ensure_not_paused(&env);
-        admin.require_auth();
-
-        if length == 0 {
-            panic_with_error!(&env, ContractError::InvalidConfig);
-        }
-
-        let mut config: Config = env
-            .storage()
-            .persistent()
-            .get(&CONFIG)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        if config.admin != admin {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
-
-        config.max_notes_length = length;
-        env.storage().persistent().set(&CONFIG, &config);
-        extend_persistent_ttl(&env, &CONFIG);
-
-        env.events()
-            .publish((symbol_short!("SET_NOTES"), admin.clone()), length);
-        env.events().publish(
-            (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
-            (
-                admin,
-                env.ledger().timestamp(),
-                symbol_short!("MAX_NOTE"),
-                length,
-            ),
-        );
+        crate::admin::set_max_notes_length(env, admin, length);
     }
 
     /// Admin-only function to set the minimum lifecycle score required for collateral eligibility.
@@ -1584,42 +1250,7 @@ pub fn accept_admin(env: Env) {
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     /// - [`ContractError::InvalidConfig`] if value is 0
     pub fn set_eligibility_threshold(env: Env, admin: Address, value: u32) {
-        ensure_not_paused(&env);
-        admin.require_auth();
-
-        if value == 0 {
-            panic_with_error!(&env, ContractError::InvalidConfig);
-        }
-
-        let mut config: Config = env
-            .storage()
-            .persistent()
-            .get(&CONFIG)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        if config.admin != admin {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
-
-        let old_threshold = config.eligibility_threshold;
-        config.eligibility_threshold = value;
-        env.storage().persistent().set(&CONFIG, &config);
-        env.storage()
-            .persistent()
-            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
-
-        env.events().publish(
-            (symbol_short!("SET_ELIG"), admin.clone()),
-            (old_threshold, value),
-        );
-        env.events().publish(
-            (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
-            (
-                admin,
-                env.ledger().timestamp(),
-                symbol_short!("ELIG_THR"),
-                value,
-            ),
-        );
+        crate::admin::set_eligibility_threshold(env, admin, value);
     }
 
     /// Admin-only function to set a custom weight for a specific task type.
@@ -1659,6 +1290,7 @@ pub fn accept_admin(env: Env) {
             (symbol_short!("ADM_AUD"), symbol_short!("TSK_WT")),
             (admin, env.ledger().timestamp(), task_type, weight),
         );
+        crate::admin::set_task_weight(env, admin, task_type, weight);
     }
 
     /// Admin-only function to set per-asset-type maintenance-frequency scoring weights.
@@ -1667,27 +1299,7 @@ pub fn accept_admin(env: Env) {
     /// `low`, `medium`, `high`, and optional `medium_threshold`, `high_threshold`, `window_days`.
     /// Weight values are treated as percentages, so `120` means a 1.2x multiplier.
     pub fn update_scoring_weights(env: Env, admin: Address, asset_type: Symbol, weights_json: Bytes) {
-        ensure_not_paused(&env);
-        require_admin(&env, &admin);
-
-        if parse_frequency_weights(&weights_json).is_none() {
-            panic_with_error!(&env, ContractError::InvalidConfig);
-        }
-
-        let key = scoring_weights_key(&env, &asset_type);
-        env.storage().persistent().set(&key, &weights_json);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
-
-        env.events().publish(
-            (symbol_short!("SCR_WT"), asset_type.clone()),
-            weights_json.clone(),
-        );
-        env.events().publish(
-            (symbol_short!("ADM_AUD"), symbol_short!("SCR_WT")),
-            (admin, env.ledger().timestamp(), asset_type, weights_json),
-        );
+        crate::admin::update_scoring_weights(env, admin, asset_type, weights_json);
     }
 
     /// Returns the stored dynamic scoring weights for an asset type.
@@ -2223,12 +1835,7 @@ pub fn accept_admin(env: Env) {
     /// * `admin` - The admin address that must match the stored config admin
     /// * `asset_id` - The asset to decay
     pub fn force_decay(env: Env, admin: Address, asset_id: u64) {
-        ensure_not_paused(&env);
-        require_admin(&env, &admin);
-
-        // Reuse the standard decay calculation path, including history/last_update
-        // updates and DECAY event emission.
-        let _new_score = Self::decay_score(env, asset_id);
+        crate::admin::force_decay(env, admin, asset_id);
     }
 
     /// Called by the asset registry when an asset is decommissioned.
@@ -2410,7 +2017,8 @@ pub fn accept_admin(env: Env) {
     /// # Arguments
     /// * `asset_id` - The unique identifier of the asset
     /// * `offset` - Zero-based start index for pagination
-    /// * `limit` - Maximum number of records to return (returns empty vec if 0)
+    /// * `limit` - Maximum number of records to return (returns empty vec if 0),
+    ///   capped at [`MAX_PAGE_SIZE`]
     ///
     /// # Returns
     /// Vec containing the requested page of maintenance records
@@ -2440,6 +2048,7 @@ pub fn accept_admin(env: Env) {
             return Vec::new(&env);
         }
 
+        let limit = limit.min(MAX_PAGE_SIZE);
         let end = (offset + limit).min(len);
         let mut page = Vec::new(&env);
         for i in offset..end {
@@ -3194,6 +2803,25 @@ pub fn accept_admin(env: Env) {
         Some(apply_decay(&env, asset_id, false, false, config.max_history))
     }
 
+    /// Returns the current collateral score for each requested asset.
+    ///
+    /// # Parameters
+    /// - `asset_ids`: the list of asset IDs to score.
+    ///
+    /// # Errors
+    /// Does not panic on a missing or deprecated asset; instead it is skipped
+    /// from the returned list. Panics with [`ContractError::NotInitialized`]
+    /// if the contract has not been initialized.
+    ///
+    /// # Events
+    /// None. This is a read-only batch query and does not mutate storage or
+    /// emit events (equivalent to calling `get_collateral_score` with
+    /// `write = false` for each ID, so no decay is persisted).
+    ///
+    /// # Soroban notes
+    /// Performs one cross-contract call to AssetRegistry per asset ID via
+    /// `try_get_asset`, so callers should keep `asset_ids` reasonably small
+    /// to stay within the transaction's CPU/instruction budget.
     pub fn get_collateral_score_batch(env: Env, asset_ids: Vec<u64>) -> Vec<(u64, u32)> {
         let config: Config = env
             .storage()
@@ -3583,32 +3211,7 @@ pub fn accept_admin(env: Env) {
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     pub fn update_asset_registry(env: Env, admin: Address, new_registry: Address) {
-        ensure_not_paused(&env);
-        admin.require_auth();
-
-        let config: Config = env
-            .storage()
-            .persistent()
-            .get(&CONFIG)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        if config.admin != admin {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
-        if is_zero_address(&env, &new_registry) {
-            panic_with_error!(&env, ContractError::ZeroAddress);
-        }
-        if new_registry == get_engineer_registry_addr(&env) {
-            panic_with_error!(&env, ContractError::SameRegistryAddress);
-        }
-
-        set_asset_registry_addr(&env, &new_registry);
-
-        env.events()
-            .publish((EVENT_REG_AST,), (admin.clone(), new_registry.clone()));
-        env.events().publish(
-            (symbol_short!("ADM_AUD"), symbol_short!("REG_AST")),
-            (admin, env.ledger().timestamp(), new_registry),
-        );
+        crate::admin::update_asset_registry(env, admin, new_registry);
     }
 
     /// Get the address of the engineer registry contract.
@@ -3633,32 +3236,7 @@ pub fn accept_admin(env: Env) {
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     pub fn update_engineer_registry(env: Env, admin: Address, new_registry: Address) {
-        ensure_not_paused(&env);
-        admin.require_auth();
-
-        let config: Config = env
-            .storage()
-            .persistent()
-            .get(&CONFIG)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        if config.admin != admin {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
-        if is_zero_address(&env, &new_registry) {
-            panic_with_error!(&env, ContractError::ZeroAddress);
-        }
-        if new_registry == get_asset_registry_addr(&env) {
-            panic_with_error!(&env, ContractError::SameRegistryAddress);
-        }
-
-        set_engineer_registry_addr(&env, &new_registry);
-
-        env.events()
-            .publish((EVENT_REG_ENG,), (admin.clone(), new_registry.clone()));
-        env.events().publish(
-            (symbol_short!("ADM_AUD"), symbol_short!("REG_ENG")),
-            (admin, env.ledger().timestamp(), new_registry),
-        );
+        crate::admin::update_engineer_registry(env, admin, new_registry);
     }
 
     /// Get the current configuration of the lifecycle contract.
@@ -3686,28 +3264,7 @@ pub fn accept_admin(env: Env) {
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     pub fn propose_upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
-        ensure_not_paused(&env);
-        admin.require_auth();
-
-        let config: Config = env
-            .storage()
-            .persistent()
-            .get(&CONFIG)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        if config.admin != admin {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
-
-        store_timelock(&env, symbol_short!("UPGRADE"));
-        env.storage()
-            .persistent()
-            .set(&symbol_short!("PEND_UPG"), &new_wasm_hash);
-        extend_persistent_ttl(&env, &symbol_short!("PEND_UPG"));
-
-        env.events().publish(
-            (symbol_short!("PROP_UPG"), admin.clone()),
-            (new_wasm_hash, env.ledger().timestamp()),
-        );
+        crate::admin::propose_upgrade(env, admin, new_wasm_hash);
     }
 
     /// Execute a previously proposed WASM upgrade after the timelock delay has expired.
@@ -3721,42 +3278,7 @@ pub fn accept_admin(env: Env) {
     /// - [`ContractError::ProposalNotFound`] if no upgrade was proposed or already executed
     /// - [`ContractError::TimelockNotExpired`] if the delay has not elapsed
     pub fn execute_upgrade(env: Env, admin: Address) {
-        ensure_not_paused(&env);
-        admin.require_auth();
-
-        let config: Config = env
-            .storage()
-            .persistent()
-            .get(&CONFIG)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        if config.admin != admin {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
-
-        require_timelock_ready(&env, symbol_short!("UPGRADE"));
-
-        let new_wasm_hash: BytesN<32> = env
-            .storage()
-            .persistent()
-            .get(&symbol_short!("PEND_UPG"))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ProposalNotFound));
-        env.storage()
-            .persistent()
-            .remove(&symbol_short!("PEND_UPG"));
-
-        env.events().publish(
-            (symbol_short!("UPGRADE"), admin.clone()),
-            new_wasm_hash.clone(),
-        );
-        env.events().publish(
-            (symbol_short!("ADM_AUD"), symbol_short!("UPGRADE")),
-            (admin, env.ledger().timestamp(), new_wasm_hash.clone()),
-        );
-
-        #[cfg(not(test))]
-        {
-            env.deployer().update_current_contract_wasm(new_wasm_hash);
-        }
+        crate::admin::execute_upgrade(env, admin);
     }
 
     /// Admin-only: reset an asset's collateral score to zero.
@@ -3768,43 +3290,7 @@ pub fn accept_admin(env: Env) {
     /// - [`ContractError::NotInitialized`] if the contract has not been initialized.
     /// - [`ContractError::UnauthorizedAdmin`] if `admin` does not match the stored config admin.
     pub fn reset_score(env: Env, admin: Address, asset_id: u64) {
-        ensure_not_paused(&env);
-        admin.require_auth();
-
-        let config: Config = env
-            .storage()
-            .persistent()
-            .get(&CONFIG)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        require_quorum(&env, &config, &admin);
-
-        let now = env.ledger().timestamp();
-        // Clear the maintenance history so compute_decay returns 0 after reset.
-        let empty_history: Vec<MaintenanceRecord> = Vec::new(&env);
-        env.storage().persistent().set(&history_key(asset_id), &empty_history);
-        extend_persistent_ttl(&env, &history_key(asset_id));
-        env.storage().persistent().set(&score_key(asset_id), &0u32);
-        extend_persistent_ttl(&env, &score_key(asset_id));
-        env.storage()
-            .persistent()
-            .set(&last_update_key(asset_id), &now);
-        extend_persistent_ttl(&env, &last_update_key(asset_id));
-        score_history_push(
-            &env,
-            asset_id,
-            ScoreEntry {
-                timestamp: now,
-                score: 0,
-            },
-            config.max_history,
-        );
-
-        env.events()
-            .publish((EVENT_RST_SCR, asset_id), (admin.clone(), now));
-        env.events().publish(
-            (symbol_short!("ADM_AUD"), symbol_short!("RST_SCR")),
-            (admin, now, asset_id),
-        );
+        crate::admin::reset_score(env, admin, asset_id);
     }
 
     /// Check collateral eligibility for multiple assets in a single call.
@@ -3856,6 +3342,7 @@ pub fn accept_admin(env: Env) {
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     pub fn prune_asset_history(env: Env, admin: Address, asset_id: u64) {
+        crate::admin::prune_asset_history(env, admin, asset_id);
         ensure_not_paused(&env);
         admin.require_auth();
 
@@ -3932,6 +3419,24 @@ pub fn accept_admin(env: Env) {
                         engineer_history_remove(&env, &eng, asset_id);
                     }
                 }
+
+                // Issue #1072: the collateral score is derived from maintenance
+                // history, so it must be recalculated and persisted here —
+                // otherwise a stale, pre-prune score (potentially inflated by
+                // the records just removed) would keep being served.
+                let asset_registry = get_asset_registry_addr(&env);
+                let asset = asset_registry::AssetRegistryClient::new(&env, &asset_registry)
+                    .get_asset(&asset_id);
+                let new_score =
+                    compute_read_only_collateral_score(&env, asset_id, &asset.asset_type, &config);
+                env.storage()
+                    .persistent()
+                    .set(&score_key(asset_id), &new_score);
+                extend_persistent_ttl(&env, &score_key(asset_id));
+                env.storage()
+                    .persistent()
+                    .set(&last_update_key(asset_id), &env.ledger().timestamp());
+                extend_persistent_ttl(&env, &last_update_key(asset_id));
             }
         }
 
@@ -4002,61 +3507,7 @@ pub fn accept_admin(env: Env) {
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     pub fn purge_asset_data(env: Env, admin: Address, asset_id: u64) {
-        ensure_not_paused(&env);
-        admin.require_auth();
-
-        let config: Config = env
-            .storage()
-            .persistent()
-            .get(&CONFIG)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        if config.admin != admin {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
-
-        // Remove the asset ID from the history of all engineers who worked on it
-        let history_key_val = history_key(asset_id);
-        if let Some(history) = env
-            .storage()
-            .persistent()
-            .get::<_, Vec<MaintenanceRecord>>(&history_key_val)
-        {
-            let mut engineers = Vec::new(&env);
-            for record in history.iter() {
-                let eng = record.engineer;
-                // Check if already in our engineers list to avoid redundant removals
-                let mut found = false;
-                for existing in engineers.iter() {
-                    if existing == eng {
-                        found = true;
-                        break;
-                    }
-                }
-                if !found {
-                    engineers.push_back(eng.clone());
-                    engineer_history_remove(&env, &eng, asset_id);
-                }
-            }
-        }
-
-        env.storage().persistent().remove(&history_key(asset_id));
-        env.storage().persistent().remove(&score_key(asset_id));
-        env.storage()
-            .persistent()
-            .remove(&score_history_key(asset_id));
-        env.storage()
-            .persistent()
-            .remove(&DataKey::CollateralValuationHistory(asset_id));
-        env.storage()
-            .persistent()
-            .remove(&last_update_key(asset_id));
-
-        env.events()
-            .publish((symbol_short!("PURGE"), admin.clone()), asset_id);
-        env.events().publish(
-            (symbol_short!("ADM_AUD"), symbol_short!("PURGE")),
-            (admin, env.ledger().timestamp(), asset_id),
-        );
+        crate::admin::purge_asset_data(env, admin, asset_id);
     }
 
     /// Request a loan against a collateral-eligible asset.
@@ -4125,7 +3576,7 @@ pub fn accept_admin(env: Env) {
             .fold(0u64, |acc, t| if t > acc { t } else { acc });
 
         let snapshot = HealthSnapshot {
-            timestamp: env.ledger().timestamp(),
+            snapshot_timestamp: env.ledger().timestamp(),
             score,
             maintenance_count,
             last_service_date,
@@ -4825,6 +4276,7 @@ mod tests {
             &Priority::Low,
             &String::from_str(&env, "Should fail"),
             &engineer,
+            &None,
         );
 
         assert_eq!(
@@ -5884,6 +5336,47 @@ mod tests {
         assert_eq!(
             last_before.timestamp, last_after.timestamp,
             "Most recent entries should be kept"
+        );
+    }
+
+    /// Issue #1072: pruning must recalculate and persist the collateral score
+    /// immediately, otherwise readers of the raw stored score (e.g.
+    /// `take_health_snapshot`, which does not recompute from live history)
+    /// keep seeing the stale, pre-prune value.
+    #[test]
+    fn test_prune_asset_history_updates_stale_score_snapshot() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 10);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // 10 records at the default OIL_CHG weight (5) each = score 50.
+        for _ in 0..10 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &Priority::Low,
+                &String::from_str(&env, "Routine oil change"),
+                &engineer,
+                &None,
+            );
+        }
+        let score_before = client.take_health_snapshot(&asset_id).score;
+        assert_eq!(score_before, 50);
+
+        // Shrink max_history and prune — most of the scoring history is dropped.
+        client.update_max_history(&admin, &2);
+        client.prune_asset_history(&admin, &asset_id);
+
+        let score_after = client.take_health_snapshot(&asset_id).score;
+        assert!(
+            score_after < score_before,
+            "collateral score must be recalculated immediately after pruning, got {} (was {})",
+            score_after,
+            score_before
         );
     }
 
@@ -9353,6 +8846,38 @@ mod tests {
     }
 
     #[test]
+    fn test_get_maintenance_history_page_limit_capped_at_max_page_size() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        // max_history=0 → default of 200, comfortably above MAX_PAGE_SIZE (100)
+        // so none of the records submitted below get pruned.
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Submit 150 records (3 batches of 50, MAX_BATCH_SIZE) — more than MAX_PAGE_SIZE.
+        for _ in 0..3 {
+            let mut records = Vec::new(&env);
+            for _ in 0..MAX_BATCH_SIZE {
+                records.push_back(BatchRecord {
+                    task_type: symbol_short!("OIL_CHG"),
+                    notes: String::from_str(&env, "Maintenance record"),
+                });
+            }
+            client.batch_submit_maintenance(&asset_id, &records, &engineer);
+        }
+        assert_eq!(client.get_maintenance_history(&asset_id).len(), 150);
+
+        // Requesting a limit far above MAX_PAGE_SIZE must be clamped, not
+        // return every available record — this is the guard against the
+        // unbounded-response failure the pagination endpoint exists to prevent.
+        let page = client.get_maintenance_history_page(&asset_id, &0, &(MAX_PAGE_SIZE * 10));
+        assert_eq!(page.len(), MAX_PAGE_SIZE);
+    }
+
+    #[test]
     fn test_get_engineer_maintenance_history_page() {
         let env = Env::default();
         env.mock_all_auths();
@@ -11625,7 +11150,7 @@ mod tests {
         assert_eq!(snapshot.score, 0);
         assert_eq!(snapshot.maintenance_count, 0);
         assert_eq!(snapshot.last_service_date, 0);
-        assert_eq!(snapshot.timestamp, env.ledger().timestamp());
+        assert_eq!(snapshot.snapshot_timestamp, env.ledger().timestamp());
     }
 
     #[test]
@@ -11679,7 +11204,7 @@ mod tests {
         let snapshots = client.get_health_snapshots(&asset_id);
         assert_eq!(snapshots.len(), 2, "should have one snapshot per take_health_snapshot call");
         assert!(
-            snapshots.get(1).unwrap().timestamp > snapshots.get(0).unwrap().timestamp,
+            snapshots.get(1).unwrap().snapshot_timestamp > snapshots.get(0).unwrap().snapshot_timestamp,
             "snapshots should be in chronological order"
         );
         assert_eq!(snapshots.get(1).unwrap().maintenance_count, 2);
@@ -11842,7 +11367,7 @@ mod tests {
         let snapshots = client.get_health_snapshots(&asset_id);
         assert!(snapshots.len() >= 2, "should accumulate snapshots");
         assert!(
-            snapshots.get(1).unwrap().timestamp >= snapshots.get(0).unwrap().timestamp,
+            snapshots.get(1).unwrap().snapshot_timestamp >= snapshots.get(0).unwrap().snapshot_timestamp,
             "snapshots should be in chronological order"
         );
         assert_eq!(snapshots.get(1).unwrap().maintenance_count, 2);

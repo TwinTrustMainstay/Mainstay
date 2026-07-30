@@ -34,6 +34,7 @@ pub enum ContractError {
     InvalidSuspensionPeriod = 19,
     BatchRevokeTooLarge = 20,
     CredentialExpired = 21,
+    UnauthorizedRevoker = 22,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -268,14 +269,17 @@ impl EngineerRegistry {
     /// Execute a pending engineer credential revocation after its timelock has expired.
     ///
     /// # Arguments
+    /// * `caller` - The address executing the revocation; must be the engineer's
+    ///   original issuer or the contract admin
     /// * `engineer` - The address of the engineer whose credential revocation is being executed
     ///
     /// # Panics
     /// - [`ContractError::EngineerNotFound`] if the engineer record does not exist
+    /// - [`ContractError::UnauthorizedRevoker`] if `caller` is neither the issuer nor the admin
     /// - [`ContractError::TimelockNotReady`] if the revocation timelock is not yet ready
-    pub fn execute_revoke_credential(env: Env, engineer: Address) {
+    pub fn execute_revoke_credential(env: Env, caller: Address, engineer: Address) {
         require_revoke_timelock_ready(&env, &engineer);
-        Self::revoke_credential(env, engineer);
+        Self::revoke_credential(env, caller, engineer);
     }
 
     /// Register a new engineer with their credential information.
@@ -464,26 +468,34 @@ impl EngineerRegistry {
     }
 
     /// Revoke an engineer's credentials, making them inactive.
-    /// Only the original issuer can revoke credentials.
+    /// Only the original issuer or the contract admin can revoke credentials.
     ///
     /// # Arguments
+    /// * `caller` - The address performing the revocation; must be the engineer's
+    ///   original issuer or the contract admin
     /// * `engineer` - The address of the engineer whose credentials should be revoked
     ///
     /// # Authorization
-    /// Requires signature from the original issuer stored in the engineer's record.
+    /// Requires a signature from `caller`, and `caller` must match either the
+    /// original issuer stored in the engineer's record or the contract admin.
     /// A different trusted issuer cannot revoke another issuer's engineer.
     ///
     /// # Panics
     /// - [`ContractError::EngineerNotFound`] if no engineer exists with the given address
+    /// - [`ContractError::UnauthorizedRevoker`] if `caller` is neither the issuer nor the admin
     /// - [`ContractError::CredentialAlreadyRevoked`] if the credentials are already revoked
-    pub fn revoke_credential(env: Env, engineer: Address) {
+    pub fn revoke_credential(env: Env, caller: Address, engineer: Address) {
         ensure_not_paused(&env);
+        caller.require_auth();
         let mut record: Engineer = env
             .storage()
             .persistent()
             .get(&engineer_key(&engineer))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
-        record.issuer.require_auth();
+        let stored_admin = Self::get_admin(env.clone());
+        if caller != record.issuer && caller != stored_admin {
+            panic_with_error!(&env, ContractError::UnauthorizedRevoker);
+        }
         if !record.active {
             panic_with_error!(&env, ContractError::CredentialAlreadyRevoked);
         }
@@ -497,6 +509,7 @@ impl EngineerRegistry {
             .set(&engineer_key(&engineer), &record);
 
         // Emit credential revocation event
+        let timestamp = env.ledger().timestamp();
         env.events().publish(
             (symbol_short!("ADM_AUD"), symbol_short!("REV_CRED")),
             (
@@ -1728,7 +1741,7 @@ mod tests {
         client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
 
         let revoked_at = env.ledger().timestamp();
-        client.revoke_credential(&engineer);
+        client.revoke_credential(&issuer, &engineer);
 
         let events = env.events().all();
         let (_, topics, data) = events.last().unwrap();
@@ -1761,13 +1774,61 @@ mod tests {
 
         client.add_trusted_issuer(&admin, &issuer);
         client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
-        client.revoke_credential(&engineer);
+        client.revoke_credential(&issuer, &engineer);
 
-        let result = client.try_revoke_credential(&engineer);
+        let result = client.try_revoke_credential(&issuer, &engineer);
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::CredentialAlreadyRevoked as u32
+            )))
+        );
+    }
+
+    #[test]
+    fn test_revoke_credential_by_admin_succeeds() {
+        // Issue #1074: the contract admin must be able to revoke a credential
+        // even if they are not the issuer who registered it.
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+
+        client.revoke_credential(&admin, &engineer);
+
+        assert_eq!(
+            client.verify_engineer(&engineer),
+            CredentialStatus::Revoked
+        );
+    }
+
+    #[test]
+    fn test_revoke_credential_by_unrelated_caller_rejected() {
+        // Issue #1074: an address that is neither the original issuer nor the
+        // contract admin must not be able to revoke another engineer's credential.
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+
+        let result = client.try_revoke_credential(&stranger, &engineer);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedRevoker as u32
             )))
         );
     }
