@@ -2691,6 +2691,25 @@ impl Lifecycle {
         Some(apply_decay(&env, asset_id, false, false, config.max_history))
     }
 
+    /// Returns the current collateral score for each requested asset.
+    ///
+    /// # Parameters
+    /// - `asset_ids`: the list of asset IDs to score.
+    ///
+    /// # Errors
+    /// Does not panic on a missing or deprecated asset; instead it is skipped
+    /// from the returned list. Panics with [`ContractError::NotInitialized`]
+    /// if the contract has not been initialized.
+    ///
+    /// # Events
+    /// None. This is a read-only batch query and does not mutate storage or
+    /// emit events (equivalent to calling `get_collateral_score` with
+    /// `write = false` for each ID, so no decay is persisted).
+    ///
+    /// # Soroban notes
+    /// Performs one cross-contract call to AssetRegistry per asset ID via
+    /// `try_get_asset`, so callers should keep `asset_ids` reasonably small
+    /// to stay within the transaction's CPU/instruction budget.
     pub fn get_collateral_score_batch(env: Env, asset_ids: Vec<u64>) -> Vec<(u64, u32)> {
         let config: Config = env
             .storage()
