@@ -90,6 +90,12 @@ pub const MAX_BATCH_SIZE: u32 = 50;
 /// Without this cap a caller could pass an arbitrarily large `limit` and reintroduce
 /// the unbounded-response failure the paginated endpoint exists to prevent.
 pub const MAX_PAGE_SIZE: u32 = 100;
+/// Upper bound on `limit` accepted by
+/// [`LifecycleContract::get_maintenance_history_paginated`].
+///
+/// Stricter than [`MAX_PAGE_SIZE`] (100) to keep individual responses
+/// well within Soroban's per-call data budget as history grows (#996).
+pub const MAX_PAGINATED_LIMIT: u32 = 50;
 const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
 /// Minimum score returned for an asset that has at least one maintenance record.
 /// Prevents decay from making a legitimately-maintained asset indistinguishable
@@ -2450,6 +2456,12 @@ impl Lifecycle {
 
     /// Get the complete maintenance history for an asset.
     ///
+    /// **Deprecated** — returns the entire history vector in a single read.
+    /// With `max_history` at its default of 200 this is a 200-element `Vec`,
+    /// which is expensive and can approach Soroban's per-call data limits as
+    /// history grows. Use [`get_maintenance_history_paginated`] (cap 50) or
+    /// [`get_maintenance_history_page`] (cap 100) for new integrations (#996).
+    ///
     /// # Arguments
     /// * `asset_id` - The unique identifier of the asset
     ///
@@ -2466,6 +2478,65 @@ impl Lifecycle {
             .persistent()
             .get(&history_key(asset_id))
             .unwrap_or(Vec::new(&env))
+    }
+
+    /// Get a paginated slice of the maintenance history for an asset (#996).
+    ///
+    /// This is the preferred replacement for [`get_maintenance_history`], which
+    /// returns the entire history vector in a single read. With `max_history`
+    /// set to 200 that is a 200-element `Vec` — expensive and potentially close
+    /// to Soroban's per-call data limits as history grows.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `offset`   - Zero-based start index (inclusive). Returns an empty vec
+    ///                when `offset` ≥ history length.
+    /// * `limit`    - Maximum number of records to return. A value of `0`
+    ///                returns an empty vec. Hard-capped at
+    ///                [`MAX_PAGINATED_LIMIT`] (50).
+    ///
+    /// # Returns
+    /// `Vec<MaintenanceRecord>` — the requested page, possibly shorter than
+    /// `limit` if the end of the history is reached.
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist
+    ///
+    /// # Deprecation note
+    /// [`get_maintenance_history`] (unbounded) is deprecated. New integrations
+    /// should use this function or [`get_maintenance_history_page`].
+    pub fn get_maintenance_history_paginated(
+        env: Env,
+        asset_id: u64,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<MaintenanceRecord> {
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+
+        if limit == 0 {
+            return Vec::new(&env);
+        }
+
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or(Vec::new(&env));
+
+        let len = history.len();
+        if offset >= len {
+            return Vec::new(&env);
+        }
+
+        let capped_limit = limit.min(MAX_PAGINATED_LIMIT);
+        let end = (offset + capped_limit).min(len);
+        let mut page = Vec::new(&env);
+        for i in offset..end {
+            page.push_back(history.get(i).unwrap());
+        }
+        page
     }
 
     /// Issue #799 — Option-returning variant of [`get_maintenance_history`].
@@ -3517,6 +3588,19 @@ impl Lifecycle {
     /// # Panics
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::AssetNotFound`] if the asset does not exist
+    /// Check if an asset is currently eligible to be used as collateral.
+    ///
+    /// # On-demand decay
+    ///
+    /// Before reading the collateral score this function calls [`apply_decay`]
+    /// to write the time-decayed score back to storage. Without this step the
+    /// stored score could be stale — an asset that was last serviced months ago
+    /// might still show its original high score and appear eligible when its
+    /// real decayed score is below the eligibility threshold (#994).
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist
     pub fn is_collateral_eligible(env: Env, asset_id: u64) -> bool {
         // Verify asset exists before checking eligibility
         let asset_registry = get_asset_registry_addr(&env);
@@ -3539,19 +3623,11 @@ impl Lifecycle {
             return false;
         }
 
-        // Use read-only decay computation since we already verified asset exists
-        let score = compute_decay(&env, asset_id);
-        let has_history = env
-            .storage()
-            .persistent()
-            .get::<_, Vec<MaintenanceRecord>>(&history_key(asset_id))
-            .map(|h| !h.is_empty())
-            .unwrap_or(false);
-        let effective_score = if has_history && score < MIN_SCORE_WITH_HISTORY {
-            MIN_SCORE_WITH_HISTORY
-        } else {
-            compute_read_only_collateral_score(&env, asset_id, &asset.asset_type, &config)
-        };
+        // #994: Apply decay before reading the score so the stored value is
+        // always up-to-date and we never compare against a stale high score.
+        apply_decay(&env, asset_id, true, false, config.max_history);
+
+        let effective_score = compute_read_only_collateral_score(&env, asset_id, &asset.asset_type, &config);
         effective_score >= effective_min_collateral_score(&config)
     }
 
