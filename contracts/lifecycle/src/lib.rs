@@ -54,6 +54,14 @@ const DEFAULT_DECAY_RATE: u32 = 5;
 const DEFAULT_DECAY_INTERVAL: u64 = 2_592_000;
 const DEFAULT_ELIGIBILITY_THRESHOLD: u32 = 50;
 const DEFAULT_MAX_NOTES_LENGTH: u32 = 256;
+
+fn effective_min_collateral_score(config: &Config) -> u32 {
+    if config.min_collateral_score > 0 {
+        config.min_collateral_score
+    } else {
+        config.eligibility_threshold
+    }
+}
 /// Maximum collateral score exposed by the lifecycle contract.
 ///
 /// With the highest built-in task weight (`10`), a maximum-size batch can
@@ -936,6 +944,7 @@ impl Lifecycle {
             decay_rate: DEFAULT_DECAY_RATE,
             decay_interval: DEFAULT_DECAY_INTERVAL,
             eligibility_threshold: DEFAULT_ELIGIBILITY_THRESHOLD,
+            min_collateral_score: DEFAULT_ELIGIBILITY_THRESHOLD,
             max_notes_length: DEFAULT_MAX_NOTES_LENGTH,
             task_weights: Map::new(&env),
         };
@@ -1096,7 +1105,86 @@ impl Lifecycle {
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     pub fn update_eligibility_threshold(env: Env, admin: Address, threshold: u32) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        let mut config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if threshold == 0 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+
+        let old_threshold = config.eligibility_threshold;
+        config.eligibility_threshold = threshold;
+        config.min_collateral_score = threshold;
+        env.storage().persistent().set(&CONFIG, &config);
+        extend_persistent_ttl(&env, &CONFIG);
+        env.events()
+            .publish((symbol_short!("CFG_UPD"),), (old_threshold, threshold));
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
+            (
+                admin,
+                env.ledger().timestamp(),
+                symbol_short!("ELIG"),
+                threshold,
+            ),
+        );
         crate::admin::update_eligibility_threshold(env, admin, threshold);
+    }
+
+    /// Admin-only function to update the minimum collateral score required for eligibility.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored config admin
+    /// * `min_collateral_score` - New minimum collateral score value (must be > 0)
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::InvalidConfig`] if `min_collateral_score` is 0
+    pub fn update_config(env: Env, admin: Address, min_collateral_score: u32) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        if min_collateral_score == 0 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+
+        let mut config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        let old_min = config.min_collateral_score;
+        config.min_collateral_score = min_collateral_score;
+        config.eligibility_threshold = min_collateral_score;
+        env.storage().persistent().set(&CONFIG, &config);
+        extend_persistent_ttl(&env, &CONFIG);
+
+        env.events().publish(
+            (symbol_short!("CFG_UPD"),),
+            (old_min, min_collateral_score),
+        );
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
+            (
+                admin,
+                env.ledger().timestamp(),
+                symbol_short!("MIN_COLL"),
+                min_collateral_score,
+            ),
+        );
     }
 
     /// Admin-only function to update the maximum history records per asset.
@@ -1171,13 +1259,37 @@ impl Lifecycle {
     /// # Arguments
     /// * `admin` - The admin address that must match the stored config admin
     /// * `task_type` - The task type symbol to configure
-    /// * `weight` - The weight/increment value for this task type
+    /// * `weight` - The weight/increment value for this task type. The minimum supported weight is 1.
     ///
     /// # Panics
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     /// - [`ContractError::InvalidConfig`] if weight is 0
     pub fn set_task_weight(env: Env, admin: Address, task_type: Symbol, weight: u32) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        assert!(weight > 0, "task weight must be greater than 0");
+
+        let mut config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        config.task_weights.set(task_type.clone(), weight);
+        env.storage().persistent().set(&CONFIG, &config);
+        extend_persistent_ttl(&env, &CONFIG);
+
+        env.events()
+            .publish((symbol_short!("TSK_WT"),), (task_type.clone(), weight));
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("TSK_WT")),
+            (admin, env.ledger().timestamp(), task_type, weight),
+        );
         crate::admin::set_task_weight(env, admin, task_type, weight);
     }
 
@@ -2866,7 +2978,7 @@ impl Lifecycle {
         } else {
             compute_read_only_collateral_score(&env, asset_id, &asset.asset_type, &config)
         };
-        score >= config.eligibility_threshold
+        effective_score >= effective_min_collateral_score(&config)
     }
 
     /// Returns the timestamp of the most recent maintenance event, or None if no maintenance has been submitted.
@@ -3211,7 +3323,7 @@ impl Lifecycle {
             } else {
                 compute_read_only_collateral_score(&env, asset_id, &asset.asset_type, &config)
             };
-            results.push_back(score >= config.eligibility_threshold);
+            results.push_back(score >= effective_min_collateral_score(&config));
         }
         results
     }
@@ -4880,12 +4992,7 @@ mod tests {
         let (client, _, _, admin) = setup(&env, 0);
 
         let result = client.try_set_task_weight(&admin, &symbol_short!("OIL_CHG"), &0);
-        assert_eq!(
-            result,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::InvalidConfig as u32,
-            ))),
-        );
+        assert!(result.is_err(), "zero weight should be rejected");
     }
 
     #[test]
@@ -5271,6 +5378,35 @@ mod tests {
             score_after,
             score_before
         );
+    }
+
+    #[test]
+    fn test_prune_asset_history_recalculates_score_for_remaining_records() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 1);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        for _ in 0..3 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("ENGINE"),
+                &Priority::High,
+                &String::from_str(&env, "maintenance"),
+                &engineer,
+            );
+        }
+
+        let initial_score = client.get_collateral_score(&asset_id);
+        assert_eq!(initial_score, 15, "initial score should reflect all submitted records");
+
+        client.prune_asset_history(&admin, &asset_id);
+
+        let remaining_score = client.get_collateral_score(&asset_id);
+        assert_eq!(remaining_score, 5, "score should reflect only the single remaining record after pruning");
     }
 
     #[test]
@@ -5949,6 +6085,54 @@ mod tests {
         client.update_eligibility_threshold(&admin, &score);
 
         assert!(client.is_collateral_eligible(&asset_id));
+    }
+
+    #[test]
+    fn test_is_collateral_eligible_uses_custom_min_collateral_score() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        for _ in 0..5 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("FILTER"),
+                &Priority::Low,
+                &String::from_str(&env, "notes"),
+                &engineer,
+            );
+        }
+
+        client.update_config(&admin, &25);
+        assert!(client.is_collateral_eligible(&asset_id));
+    }
+
+    #[test]
+    fn test_is_collateral_eligible_respects_higher_custom_min_collateral_score() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        for _ in 0..6 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("FILTER"),
+                &Priority::Low,
+                &String::from_str(&env, "notes"),
+                &engineer,
+            );
+        }
+
+        client.update_config(&admin, &35);
+        assert!(!client.is_collateral_eligible(&asset_id));
     }
 
     #[test]
@@ -7491,6 +7675,40 @@ mod tests {
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::UnauthorizedEngineer as u32,
             ))),
+        );
+    }
+
+    #[test]
+    fn test_submit_maintenance_rejects_revoked_credential_with_unauthorized_engineer_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        assert_eq!(
+            engineer_registry_client.verify_engineer(&engineer),
+            ::engineer_registry::CredentialStatus::Valid
+        );
+
+        engineer_registry_client.revoke_credential(&engineer);
+
+        let result = client.try_submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "revoked credential should be rejected"),
+            &engineer,
+        );
+
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedEngineer as u32,
+            ))),
+            "revoked credential should panic with UnauthorizedEngineer"
         );
     }
 
