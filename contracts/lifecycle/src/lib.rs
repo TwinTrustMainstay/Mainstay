@@ -1302,6 +1302,8 @@ impl Lifecycle {
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     /// - [`ContractError::InvalidConfig`] if weight is 0
+    /// - [`ContractError::ProposalNotFound`] if no task-weight update has been proposed
+    /// - [`ContractError::TimelockNotExpired`] if the proposal is still inside the timelock delay
     pub fn set_task_weight(env: Env, admin: Address, task_type: Symbol, weight: u32) {
         ensure_not_paused(&env);
         admin.require_auth();
@@ -1316,6 +1318,8 @@ impl Lifecycle {
         if config.admin != admin {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
+
+        require_timelock_ready(&env, symbol_short!("TSK_WT"));
 
         config.task_weights.set(task_type.clone(), weight);
         env.storage().persistent().set(&CONFIG, &config);
@@ -4110,6 +4114,16 @@ mod tests {
         )
     }
 
+    fn propose_and_expire_task_weight_timelock(
+        env: &Env,
+        client: &LifecycleClient,
+        admin: &Address,
+    ) {
+        client.propose_config_update(admin, &symbol_short!("TSK_WT"));
+        let base = env.ledger().timestamp();
+        env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+    }
+
     /// Generate a unique serial number string for each test asset registration.
     fn unique_serial(env: &Env) -> String {
         use core::sync::atomic::{AtomicU64, Ordering};
@@ -5326,6 +5340,7 @@ mod tests {
         client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         // Set custom weight for OIL_CHG to 20
+        propose_and_expire_task_weight_timelock(&env, &client, &admin);
         client.set_task_weight(&admin, &symbol_short!("OIL_CHG"), &20);
 
         // Submit OIL_CHG maintenance and verify score uses custom weight
@@ -5405,7 +5420,9 @@ mod tests {
         client.authorize_engineer(&asset_owner2, &asset_id2, &engineer);
 
         // Configure different weights
+        propose_and_expire_task_weight_timelock(&env, &client, &admin);
         client.set_task_weight(&admin, &symbol_short!("OIL_CHG"), &10);
+        propose_and_expire_task_weight_timelock(&env, &client, &admin);
         client.set_task_weight(&admin, &symbol_short!("ENGINE"), &50);
 
         // Submit OIL_CHG to asset1
