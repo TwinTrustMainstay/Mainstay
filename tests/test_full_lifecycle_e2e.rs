@@ -47,7 +47,7 @@ fn test_full_lifecycle_e2e() {
     assert_eq!(asset.owner, owner);
 
     let credential_hash = BytesN::from_array(&env, &[7u8; 32]);
-    engineer_registry.register_engineer(&engineer, &credential_hash, &issuer, &31_536_000);
+    engineer_registry.register_engineer(&engineer, &credential_hash, &issuer, &31_536_000, &None);
     let engineer_record = engineer_registry.get_engineer(&engineer);
     assert_eq!(engineer_record.address, engineer);
     assert_eq!(engineer_record.credential_hash, credential_hash);
@@ -65,7 +65,7 @@ fn test_full_lifecycle_e2e() {
             &asset_id,
             &symbol_short!("ENGINE"),
             &String::from_str(&env, "Engine overhaul"),
-            &engineer,
+            &engineer, &None,
         );
 
         let history = lifecycle.get_maintenance_history(&asset_id);
@@ -126,14 +126,14 @@ fn test_asset_transfer_preserves_history() {
     let asset_id = asset_registry.register_asset(&symbol_short!("GENSET"), &metadata, &owner);
 
     let credential_hash = BytesN::from_array(&env, &[7u8; 32]);
-    engineer_registry.register_engineer(&engineer, &credential_hash, &issuer, &31_536_000);
+    engineer_registry.register_engineer(&engineer, &credential_hash, &issuer, &31_536_000, &None);
 
     for i in 0..3u32 {
         lifecycle.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
             &String::from_str(&env, "Maintenance task"),
-            &engineer,
+            &engineer, &None,
         );
         env.ledger().set_timestamp(env.ledger().timestamp() + 1);
     }

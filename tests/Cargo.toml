@@ -52,6 +52,10 @@ name = "test_collateral_score_cap"
 path = "test_collateral_score_cap.rs"
 
 [[test]]
+name = "test_maintenance_features"
+path = "test_maintenance_features.rs"
+
+[[test]]
 name = "test_decay_clamps_at_zero"
 path = "test_decay_clamps_at_zero.rs"
 
@@ -74,3 +78,13 @@ path = "test_submit_maintenance_fuzz.rs"
 [[test]]
 name = "test_expired_credential_submit_maintenance"
 path = "test_expired_credential_submit_maintenance.rs"
+name = "test_decommissioned_asset_maintenance"
+path = "test_decommissioned_asset_maintenance.rs"
+
+[[test]]
+name = "test_collateral_score_decay_intervals"
+path = "test_collateral_score_decay_intervals.rs"
+
+[[test]]
+name = "test_suspended_engineer_rejected"
+path = "test_suspended_engineer_rejected.rs"

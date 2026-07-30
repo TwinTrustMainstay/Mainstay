@@ -32,8 +32,10 @@ pub enum ContractError {
     ScoreFrozen = 21,
     /// Asset is decommissioned and cannot accept maintenance records.
     AssetDecommissioned = 22,
+    /// Batch submission exceeds the maximum allowed batch size (DoS / gas-limit guard).
+    BatchTooLarge = 23,
     /// Fewer valid signers were provided than the configured admin_threshold requires.
-    InsufficientSigners = 22,
+    InsufficientSigners = 24,
 }
 
 impl From<SharedContractError> for ContractError {

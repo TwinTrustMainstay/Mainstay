@@ -386,6 +386,7 @@ fn test_lifecycle_paused_rejects_submit_maintenance() {
         &symbol_short!("OIL_CHG"),
         &String::from_str(&env, "Routine oil change"),
         &s.engineer,
+        &None,
     );
 
     assert_eq!(
@@ -436,6 +437,7 @@ fn test_lifecycle_paused_rejects_batch_submit_maintenance() {
         &s.asset_id,
         &records,
         &s.engineer,
+        &None,
     );
 
     assert_eq!(
@@ -480,6 +482,7 @@ fn test_lifecycle_unpause_restores_submit_maintenance() {
         &symbol_short!("OIL_CHG"),
         &String::from_str(&env, "Post-unpause oil change"),
         &s.engineer,
+        &None,
     );
 
     let history = s.lifecycle.get_maintenance_history(&s.asset_id);

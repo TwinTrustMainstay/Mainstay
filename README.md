@@ -1,6 +1,7 @@
 # Mainstay — Proof of Maintenance for Industrial Assets
 
 [![CI](https://github.com/marvs8/Mainstay/actions/workflows/ci.yml/badge.svg)](https://github.com/marvs8/Mainstay/actions/workflows/ci.yml)
+[![WASM Size](https://img.shields.io/badge/WASM%20size-%E2%89%A4%2051%20KB-brightgreen)](https://github.com/marvs8/Mainstay/actions/workflows/ci.yml)
 [![Clippy](https://img.shields.io/badge/clippy-passing-brightgreen)](https://github.com/marvs8/Mainstay/actions/workflows/ci.yml)
 [![rustfmt](https://img.shields.io/badge/rustfmt-passing-brightgreen)](https://github.com/marvs8/Mainstay/actions/workflows/ci.yml)
 [![cargo audit](https://img.shields.io/badge/cargo%20audit-high--severity%20gate-blue)](https://github.com/marvs8/Mainstay/actions/workflows/ci.yml)

@@ -19,6 +19,9 @@ pub struct MaintenanceRecord {
     pub notes: String,
     pub engineer: Address,
     pub timestamp: u64,
+    /// Maintenance cost in stroops (1 stroop = 10^-7 XLM).
+    /// `None` indicates no cost was recorded for this maintenance event.
+    pub cost: Option<u64>,
 }
 
 /// A point-in-time snapshot of the collateral score, recorded at each maintenance event.
@@ -73,6 +76,22 @@ pub struct HealthSnapshot {
     pub last_service_date: u64,
 }
 
+/// A recurring maintenance task definition.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecurringTask {
+    pub task_id: u64,
+    pub task_type: Symbol,
+    /// Unit for the recurrence interval (e.g., "HOURS", "DAYS", "MONTHS", "CYCLES").
+    pub interval_type: Symbol,
+    /// Numeric value for the interval (e.g., 500 for "every 500 hours").
+    pub interval_value: u64,
+    /// Timestamp when the next maintenance is due.
+    pub next_due: u64,
+    /// Whether this recurring task is active.
+    pub is_active: bool,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(dead_code)]
@@ -91,4 +110,8 @@ pub enum DataKey {
     Timelock(Symbol),
     HealthSnapshots(u64),
     TransferHistory(u64),
+    /// Stores `Vec<RecurringTask>` for a given asset.
+    RecurringTasks(u64),
+    /// Stores duplicate maintenance record IDs per asset.
+    DuplicateRecords(u64),
 }
