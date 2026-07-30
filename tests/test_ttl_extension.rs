@@ -16,7 +16,7 @@
 //! | `REGISTRY` (asset registry addr) | `initialize` | `test_registry_ttl_extended_on_init` |
 //! | `ENG_REG` (engineer registry addr) | `initialize` | `test_eng_reg_ttl_extended_on_init` |
 //! | `PAUSED` (pause flag) | `pause`, `unpause` | `test_paused_ttl_extended_on_toggle` |
-//! | `ENG_AUTH` (engineer auth) | `authorize_engineer` | `test_eng_auth_ttl_extended` |
+//! | `ENG_AUTH` (engineer auth) | `authorize_engineer`, `submit_maintenance` | `test_eng_auth_ttl_extended`, `test_eng_auth_ttl_extended_on_submit` |
 //! | `ENG_HIST` (engineer history) | `submit_maintenance` | `test_eng_hist_ttl_extended` |
 
 use asset_registry::{AssetRegistry, AssetRegistryClient};
@@ -295,23 +295,54 @@ fn test_paused_ttl_extended_on_toggle() {
 
 #[test]
 fn test_eng_auth_ttl_extended() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (lifecycle, asset_registry, engineer_registry, _admin, owner, issuer) = setup(&env);
-    let asset_id = register_asset(&env, &asset_registry, &owner);
-    let engineer = register_engineer(&env, &engineer_registry, &issuer);
+     let env = Env::default();
+     env.mock_all_auths();
+     let (lifecycle, asset_registry, engineer_registry, _admin, owner, issuer) = setup(&env);
+     let asset_id = register_asset(&env, &asset_registry, &owner);
+     let engineer = register_engineer(&env, &engineer_registry, &issuer);
+ 
+     lifecycle.authorize_engineer(&owner, &asset_id, &engineer);
+     advance_ledger(&env, 500);
+ 
+     // Engineer must still be authorized — ENG_AUTH key TTL was extended.
+     lifecycle.submit_maintenance(
+         &asset_id,
+         &symbol_short!("INSPECT"),
+         &String::from_str(&env, "post-auth-ttl"),
+         &engineer,
+     );
+ }
 
-    lifecycle.authorize_engineer(&owner, &asset_id, &engineer);
-    advance_ledger(&env, 500);
+ #[test]
+ fn test_eng_auth_ttl_extended_on_submit() {
+     let env = Env::default();
+     env.mock_all_auths();
+     let (lifecycle, asset_registry, engineer_registry, _admin, owner, issuer) = setup(&env);
+     let asset_id = register_asset(&env, &asset_registry, &owner);
+     let engineer = register_engineer(&env, &engineer_registry, &issuer);
 
-    // Engineer must still be authorized — ENG_AUTH key TTL was extended.
-    lifecycle.submit_maintenance(
-        &asset_id,
-        &symbol_short!("INSPECT"),
-        &String::from_str(&env, "post-auth-ttl"),
-        &engineer,
-    );
-}
+     lifecycle.authorize_engineer(&owner, &asset_id, &engineer);
+     // Advance close to TTL expiry boundary (TTL_THRESHOLD = 518400).
+     advance_ledger(&env, TTL_THRESHOLD - 100);
+
+     // submit_maintenance must extend ENG_AUTH TTL so the key survives.
+     lifecycle.submit_maintenance(
+         &asset_id,
+         &symbol_short!("INSPECT"),
+         &String::from_str(&env, "submit-extends-auth-ttl"),
+         &engineer,
+     );
+
+     advance_ledger(&env, 200);
+
+     // Engineer must still be authorized — ENG_AUTH key TTL was extended by submit_maintenance.
+     lifecycle.submit_maintenance(
+         &asset_id,
+         &symbol_short!("INSPECT"),
+         &String::from_str(&env, "post-submit-ttl"),
+         &engineer,
+     );
+ }
 
 #[test]
 fn test_eng_hist_ttl_extended() {

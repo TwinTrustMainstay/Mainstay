@@ -58,7 +58,7 @@
 /// to stay within gas limits.
 
 use asset_registry::{AssetRegistry, AssetRegistryClient};
-use engineer_registry::{EngineerRegistry, EngineerRegistryClient};
+use engineer_registry::{CredentialStatus, EngineerRegistry, EngineerRegistryClient};
 use lending::{LendingContract, LendingContractClient};
 use lifecycle::{Lifecycle, LifecycleClient};
 use soroban_sdk::{
@@ -167,9 +167,10 @@ fn test_engineer_registry_data_survives_upgrade() {
 
     // ── Verify credential verification works ────────────────────────
     let verified = er.verify_engineer(&engineer);
-    assert!(
+    assert_eq!(
         verified,
-        "verify_engineer must return true for active credential"
+        CredentialStatus::Valid,
+        "verify_engineer must return Valid for active credential"
     );
 
     // ── Simulate post-upgrade ledger advance ────────────────────────
@@ -179,8 +180,9 @@ fn test_engineer_registry_data_survives_upgrade() {
 
     // ── Credential must still be verifiable ──────────────────────────
     let verified_after = er.verify_engineer(&engineer);
-    assert!(
+    assert_eq!(
         verified_after,
+        CredentialStatus::Valid,
         "Credential must remain valid after simulated upgrade"
     );
 }
