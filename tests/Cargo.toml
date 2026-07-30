@@ -12,6 +12,18 @@ lending = { path = "../contracts/lending" }
 soroban-sdk = { version = "22.0.0", features = ["testutils"] }
 
 [[test]]
+name = "test_storage_migration"
+path = "test_storage_migration.rs"
+
+[[test]]
+name = "test_signature_compatibility"
+path = "test_signature_compatibility.rs"
+
+[[test]]
+name = "test_upgrade_error_recovery"
+path = "test_upgrade_error_recovery.rs"
+
+[[test]]
 name = "cross_platform_tests"
 path = "cross_platform_tests.rs"
 
