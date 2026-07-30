@@ -24,7 +24,7 @@ fn test_pause_disables_vouch() {
     let voucher = Address::generate(&env);
 
     env.mock_all_auths();
-    client.request_loan(&borrower, &1000);
+    client.request_loan(&borrower, &1000, &0u64);
 
     // Pause the contract
     client.pause(&admin);
@@ -50,7 +50,7 @@ fn test_pause_disables_request_loan() {
 
     // Try to request loan - should fail
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.request_loan(&borrower, &1000);
+        client.request_loan(&borrower, &1000, &0u64);
     }));
     assert!(result.is_err());
 }
@@ -63,7 +63,7 @@ fn test_pause_disables_repay() {
     let borrower = Address::generate(&env);
 
     env.mock_all_auths();
-    client.request_loan(&borrower, &1000);
+    client.request_loan(&borrower, &1000, &0u64);
 
     // Pause the contract
     client.pause(&admin);
@@ -90,7 +90,7 @@ fn test_unpause_restores_functionality() {
     client.unpause(&admin);
 
     // Should be able to request loan
-    client.request_loan(&borrower, &1000);
+    client.request_loan(&borrower, &1000, &0u64);
 
     // Should be able to vouch
     client.vouch(&borrower, &voucher, &100);
