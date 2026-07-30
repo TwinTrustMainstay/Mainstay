@@ -1,7 +1,7 @@
 #![no_std]
 use shared::error::SharedContractError;
 use shared::validation::require_within_bounds;
-use shared::{extend_persistent_ttl, require_admin, TTL_THRESHOLD, TTL_TARGET};
+use shared::{extend_persistent_ttl, require_admin, DEFAULT_TTL_LEDGERS, TTL_THRESHOLD, TTL_TARGET};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
     BytesN, Env, String, Symbol, Vec,
@@ -127,6 +127,7 @@ const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
 const GRACE_PERIOD_SECS: u64 = 7 * 86_400;
 const GRACE_PERIOD_KEY: Symbol = symbol_short!("GRACE_P");
 const MAX_BATCH_REVOKE: u32 = 50;
+const DEPLOYER_KEY: Symbol = symbol_short!("DEPLOYER");
 
 fn is_paused(env: &Env) -> bool {
     env.storage().persistent().get(&PAUSED_KEY).unwrap_or(false)
@@ -229,6 +230,14 @@ pub struct EngineerRegistry;
 
 #[contractimpl]
 impl EngineerRegistry {
+    /// Store the deployer address at deploy time.
+    pub fn __constructor(env: Env, deployer: Address) {
+        env.storage().instance().set(&DEPLOYER_KEY, &deployer);
+        env.storage()
+            .instance()
+            .extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
+    }
+
     /// Propose the revocation of an engineer's credential.
     /// The revocation is subject to a timelock before it can be executed.
     ///
@@ -703,13 +712,15 @@ impl EngineerRegistry {
     /// - [`ContractError::AdminAlreadyInitialized`] if admin has already been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if deployer is not the transaction invoker
     pub fn initialize_admin(env: Env, deployer: Address, admin: Address) {
-        // SDK 22: identity enforced via require_auth below
-        if false {
+        deployer.require_auth();
+        let stored_deployer: Address = env
+            .storage()
+            .instance()
+            .get(&DEPLOYER_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if deployer != stored_deployer {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
-        // Soroban SDK removed `env.invoker()`; `require_auth` enforces the
-        // deployer's signature instead, matching the standard pattern.
-        deployer.require_auth();
         if env.storage().instance().has(&admin_key()) {
             panic_with_error!(&env, ContractError::AdminAlreadyInitialized);
         }
@@ -4793,8 +4804,14 @@ mod tests {
             batch.push_back(Address::generate(&env));
         }
 
-        let e1 = Address::generate(&env);
-        client.register_engineer(&e1, &BytesN::from_array(&env, &[1u8; 32]), &issuer, &31_536_000, &None);
+        let result = client.try_batch_revoke_credentials(&admin, &batch);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::BatchRevokeTooLarge as u32
+            )))
+        );
+    }
 
     #[test]
     fn test_suspend_with_past_timestamp_fails() {
@@ -4815,12 +4832,29 @@ mod tests {
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::InvalidSuspensionPeriod as u32
             )))
-    fn test_batch_revoke_credentials_non_admin_fails() {
+        );
+    }
+
+    #[test]
+    fn test_suspend_with_current_timestamp_fails() {
         let env = Env::default();
         env.mock_all_auths();
-        let (client, _admin) = setup(&env);
+        let (client, admin) = setup(&env);
+        let (_, engineer) = setup_suspended_engineer(&env, &client, &admin);
 
-        assert_eq!(client.get_reputation(&e1), 50);
+        env.ledger().set_timestamp(10_000);
+        // A suspension ending exactly now would be a no-op, so it must be rejected
+        let result = client.try_suspend_engineer(
+            &engineer,
+            &10_000,
+            &soroban_sdk::String::from_str(&env, "reason"),
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidSuspensionPeriod as u32
+            )))
+        );
     }
 
     #[test]
