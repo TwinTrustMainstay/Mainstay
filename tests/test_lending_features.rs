@@ -29,7 +29,7 @@ fn test_configurable_slash_rate_at_initialize() {
     let voucher = Address::generate(&env);
 
     env.mock_all_auths();
-    client.request_loan(&borrower, &1000);
+    client.request_loan(&borrower, &1000, &0u64);
     client.vouch(&borrower, &voucher, &100);
     client.slash(&admin, &borrower);
 
@@ -47,7 +47,7 @@ fn test_loan_deadline_set_on_request() {
     env.mock_all_auths();
 
     let initial_time = env.ledger().timestamp();
-    client.request_loan(&borrower, &1000);
+    client.request_loan(&borrower, &1000, &0u64);
 
     let loan = client.get_loan(&borrower).unwrap();
     // Default duration is 2_592_000 seconds (30 days)
@@ -63,7 +63,7 @@ fn test_auto_slash_after_deadline() {
     let voucher = Address::generate(&env);
 
     env.mock_all_auths();
-    client.request_loan(&borrower, &1000);
+    client.request_loan(&borrower, &1000, &0u64);
     client.vouch(&borrower, &voucher, &100);
 
     let loan = client.get_loan(&borrower).unwrap();
@@ -97,7 +97,7 @@ fn test_pause_disables_vouch() {
     let voucher = Address::generate(&env);
 
     env.mock_all_auths();
-    client.request_loan(&borrower, &1000);
+    client.request_loan(&borrower, &1000, &0u64);
 
     // Pause the contract
     client.pause(&admin);
@@ -123,7 +123,7 @@ fn test_pause_disables_request_loan() {
 
     // Try to request loan - should fail
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.request_loan(&borrower, &1000);
+        client.request_loan(&borrower, &1000, &0u64);
     }));
     assert!(result.is_err());
 }
@@ -136,7 +136,7 @@ fn test_pause_disables_repay() {
     let borrower = Address::generate(&env);
 
     env.mock_all_auths();
-    client.request_loan(&borrower, &1000);
+    client.request_loan(&borrower, &1000, &0u64);
 
     // Pause the contract
     client.pause(&admin);
@@ -163,7 +163,7 @@ fn test_unpause_restores_functionality() {
     client.unpause(&admin);
 
     // Should be able to request loan
-    client.request_loan(&borrower, &1000);
+    client.request_loan(&borrower, &1000, &0u64);
 
     // Should be able to vouch
     client.vouch(&borrower, &voucher, &100);
@@ -188,7 +188,7 @@ fn test_propose_admin_two_step_transfer() {
 
     // Verify new admin is now the admin by calling an admin function
     let borrower = Address::generate(&env);
-    client.request_loan(&borrower, &1000);
+    client.request_loan(&borrower, &1000, &0u64);
     client.pause(&new_admin);
 
     // Old admin should not be able to unpause
@@ -253,7 +253,7 @@ fn test_auto_slash_callable_by_anyone() {
     let anyone = Address::generate(&env);
 
     env.mock_all_auths();
-    client.request_loan(&borrower, &1000);
+    client.request_loan(&borrower, &1000, &0u64);
     client.vouch(&borrower, &voucher, &100);
 
     let loan = client.get_loan(&borrower).unwrap();
@@ -276,7 +276,7 @@ fn test_slash_rate_applied_correctly() {
     let voucher2 = Address::generate(&env);
 
     env.mock_all_auths();
-    client.request_loan(&borrower, &1000);
+    client.request_loan(&borrower, &1000, &0u64);
     client.vouch(&borrower, &voucher1, &200);
     client.vouch(&borrower, &voucher2, &300);
 
@@ -298,7 +298,7 @@ fn test_deadline_prevents_repay_after_slash() {
     let voucher = Address::generate(&env);
 
     env.mock_all_auths();
-    client.request_loan(&borrower, &1000);
+    client.request_loan(&borrower, &1000, &0u64);
     client.vouch(&borrower, &voucher, &100);
 
     let loan = client.get_loan(&borrower).unwrap();

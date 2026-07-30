@@ -27,7 +27,7 @@ fn test_loan_deadline_set_on_request() {
     env.mock_all_auths();
 
     let initial_time = env.ledger().timestamp();
-    client.request_loan(&borrower, &1000);
+    client.request_loan(&borrower, &1000, &0u64);
 
     let loan = client.get_loan(&borrower).unwrap();
     // Default duration is 2_592_000 seconds (30 days)
@@ -43,7 +43,7 @@ fn test_auto_slash_after_deadline() {
     let voucher = Address::generate(&env);
 
     env.mock_all_auths();
-    client.request_loan(&borrower, &1000);
+    client.request_loan(&borrower, &1000, &0u64);
     client.vouch(&borrower, &voucher, &100);
 
     let loan = client.get_loan(&borrower).unwrap();
@@ -77,7 +77,7 @@ fn test_auto_slash_callable_by_anyone() {
     let voucher = Address::generate(&env);
 
     env.mock_all_auths();
-    client.request_loan(&borrower, &1000);
+    client.request_loan(&borrower, &1000, &0u64);
     client.vouch(&borrower, &voucher, &100);
 
     let loan = client.get_loan(&borrower).unwrap();
@@ -99,7 +99,7 @@ fn test_deadline_prevents_repay_after_slash() {
     let voucher = Address::generate(&env);
 
     env.mock_all_auths();
-    client.request_loan(&borrower, &1000);
+    client.request_loan(&borrower, &1000, &0u64);
     client.vouch(&borrower, &voucher, &100);
 
     let loan = client.get_loan(&borrower).unwrap();
