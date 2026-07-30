@@ -36,6 +36,12 @@ pub enum ContractError {
     BatchTooLarge = 23,
     /// Fewer valid signers were provided than the configured admin_threshold requires.
     InsufficientSigners = 24,
+    /// The requested health snapshot index does not exist for the given asset.
+    SnapshotNotFound = 25,
+    /// Fewer than 2 matching task-type records exist; cannot compute a prediction.
+    InsufficientPredictionData = 26,
+    /// A weight-change proposal already exists and has not been executed yet.
+    WeightProposalAlreadyExists = 27,
     /// Engineer's specialization does not match the asset's type.
     SpecializationMismatch = 25,
     /// No recurring task exists with the given task_id for this asset.

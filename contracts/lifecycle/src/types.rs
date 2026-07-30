@@ -11,6 +11,13 @@ pub struct TransferRecord {
     pub timestamp: u64,
 }
 
+/// Priority level for a maintenance record.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Priority {
+    Low = 0,
+    Medium = 1,
+    High = 2,
 /// Urgency/severity of a maintenance task.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,6 +33,7 @@ pub enum Priority {
 pub struct MaintenanceRecord {
     pub asset_id: u64,
     pub task_type: Symbol,
+    /// Maintenance priority level.
     pub priority: Priority,
     pub notes: String,
     pub engineer: Address,
@@ -92,6 +100,25 @@ pub struct HealthSnapshot {
     pub score: u32,
     pub maintenance_count: u32,
     pub last_service_date: u64,
+    /// Whether this snapshot was used as an anchor for reconstructed history.
+    /// Set to `true` by `anchor_history_to_snapshot` to mark that lost or pruned
+    /// maintenance records have been partially recovered via this snapshot.
+    pub reconstructed: bool,
+}
+
+/// An on-chain governance proposal to change a task-type score weight.
+///
+/// Created by `propose_weight_change`; consumed (executed) by `execute_weight_change`
+/// after the `TIMELOCK_DELAY_SECS` delay has elapsed.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WeightProposal {
+    /// The new weight value proposed for the task type.
+    pub new_weight: u32,
+    /// Ledger timestamp at which the proposal was created.
+    pub proposed_at: u64,
+    /// Whether this proposal has already been executed.
+    pub executed: bool,
 }
 
 /// A recurring maintenance task definition.
@@ -132,6 +159,8 @@ pub enum DataKey {
     RecurringTasks(u64),
     /// Stores duplicate maintenance record IDs per asset.
     DuplicateRecords(u64),
+    /// Stores a `WeightProposal` for the given task-type symbol.
+    WeightProposal(Symbol),
     /// Stores `Vec<(timestamp: u64, value: u64)>` collateral-valuation history for an asset.
     CollateralValuationHistory(u64),
 }
