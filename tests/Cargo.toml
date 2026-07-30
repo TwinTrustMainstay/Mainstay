@@ -130,6 +130,8 @@ name = "test_issues_1010_1013"
 path = "test_issues_1010_1013.rs"
 
 [[test]]
+name = "test_engineer_history_cap"
+path = "test_engineer_history_cap.rs"
 name = "test_asset_lien_blocks_transfer_1043"
 path = "test_asset_lien_blocks_transfer_1043.rs"
 

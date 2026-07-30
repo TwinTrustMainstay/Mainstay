@@ -54,6 +54,10 @@ const PENDING_ADMIN_KEY: Symbol = symbol_short!("PADMIN");
 const REENTRANCY_LOCK: Symbol = symbol_short!("LOCKED");
 const DEPLOYER_KEY: Symbol = symbol_short!("DEPLOYER");
 const DEFAULT_MAX_HISTORY: u32 = 200;
+/// Default cap on the number of asset IDs kept in each engineer's history list.
+/// Matches `DEFAULT_MAX_HISTORY` so both sliding windows share the same default
+/// out of the box; operators can tune them independently via admin calls.
+const DEFAULT_MAX_ENGINEER_HISTORY: u32 = 200;
 const DEFAULT_SCORE_INCREMENT: u32 = 5;
 const DEFAULT_DECAY_RATE: u32 = 5;
 /// 30 days in seconds — the default length of one decay interval.
@@ -1227,6 +1231,7 @@ impl Lifecycle {
             } else {
                 max_history
             },
+            max_engineer_history: DEFAULT_MAX_ENGINEER_HISTORY,
             score_increment: DEFAULT_SCORE_INCREMENT,
             decay_rate: DEFAULT_DECAY_RATE,
             decay_interval: DEFAULT_DECAY_INTERVAL,
@@ -1571,6 +1576,26 @@ impl Lifecycle {
     /// - [`ContractError::InvalidConfig`] if new_max is 0
     pub fn update_max_history(env: Env, admin: Address, new_max: u32) {
         crate::admin::update_max_history(env, admin, new_max);
+    }
+
+    /// Admin-only function to update the cap on each engineer's per-address
+    /// asset-history list.
+    ///
+    /// Once the list reaches `new_max` entries the oldest entry is silently
+    /// dropped on the next write, bounding per-engineer storage and keeping
+    /// every `submit_maintenance` / `batch_submit_maintenance` call to O(cap)
+    /// work instead of O(ever-growing list).
+    ///
+    /// # Arguments
+    /// * `admin`   - The admin address that must match the stored config admin.
+    /// * `new_max` - New per-engineer history cap (must be > 0).
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialised.
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin.
+    /// - [`ContractError::InvalidConfig`] if `new_max` is 0.
+    pub fn update_max_engineer_history(env: Env, admin: Address, new_max: u32) {
+        crate::admin::update_max_engineer_history(env, admin, new_max);
     }
 
     /// Admin-only function to update the maximum allowed notes length per maintenance record.
@@ -1928,7 +1953,7 @@ impl Lifecycle {
             .set(&history_key(asset_id), &history);
         extend_persistent_ttl(&env, &history_key(asset_id));
 
-        engineer_history_add(&env, &engineer, asset_id, config.max_history);
+        engineer_history_add(&env, &engineer, asset_id, config.max_engineer_history);
 
         // Accumulate score: add this submission's increment to the stored score (cap at 100).
         // Weight the increment by the engineer's reputation (0–1000), scaled to 0.5×–1.5×:
@@ -2377,7 +2402,7 @@ impl Lifecycle {
         }
 
         // Add to engineer history only once per asset per batch
-        engineer_history_add(&env, &engineer, asset_id, config.max_history);
+        engineer_history_add(&env, &engineer, asset_id, config.max_engineer_history);
 
         env.storage()
             .persistent()
