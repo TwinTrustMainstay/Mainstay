@@ -50,6 +50,11 @@ pub enum ContractError {
     LienAlreadyExists = 17,
     /// No matching lien found for the given asset, lender, and loan_id.
     LienNotFound = 18,
+    /// A timelock proposal has not yet expired; the caller must wait before
+    /// executing the guarded operation.
+    TimelockNotExpired = 19,
+    /// No pending admin-transfer proposal exists for the given address.
+    ProposalNotFound = 20,
     /// Asset is not eligible to be used as collateral.
     CollateralIneligible = 19,
     /// Requested loan amount exceeds the maximum allowed by the LTV ratio.
@@ -63,9 +68,9 @@ impl From<SharedContractError> for ContractError {
             SharedContractError::AlreadyInitialized => ContractError::AlreadyInitialized,
             SharedContractError::UnauthorizedAdmin => ContractError::UnauthorizedAdmin,
             SharedContractError::Paused => ContractError::ContractPaused,
-            SharedContractError::TimelockNotExpired => ContractError::NotInitialized,
-            SharedContractError::ProposalNotFound => ContractError::NotInitialized,
-            SharedContractError::PendingAdminAlreadyExists => ContractError::NotInitialized,
+            SharedContractError::TimelockNotExpired => ContractError::TimelockNotExpired,
+            SharedContractError::ProposalNotFound => ContractError::ProposalNotFound,
+            SharedContractError::PendingAdminAlreadyExists => ContractError::AlreadyInitialized,
         }
     }
 }
@@ -216,6 +221,50 @@ pub enum DataKey {
 
 fn liens_key(asset_id: u64) -> DataKey {
     DataKey::Liens(asset_id)
+}
+
+/// Storage key that maps `(LOAN_ASSET, loan_id)` → `asset_id`.
+///
+/// Written by `record_lien` so that `slash` and `auto_slash` can look up
+/// which asset is locked as collateral for a given loan and release the
+/// lien without requiring callers to pass the `asset_id` explicitly.
+const LOAN_ASSET_KEY: soroban_sdk::Symbol = symbol_short!("LN_ASSET");
+
+fn loan_asset_key(loan_id: u64) -> (soroban_sdk::Symbol, u64) {
+    (LOAN_ASSET_KEY, loan_id)
+}
+
+/// Internal helper: remove all liens for `asset_id` whose `loan_id` matches
+/// `loan_id`.  This is a best-effort release — if no matching lien exists the
+/// function returns without panicking so that the slash path is never blocked
+/// by a missing lien entry.
+fn release_lien_internal(env: &Env, asset_id: u64, loan_id: u64) {
+    let key = liens_key(asset_id);
+    let liens_opt: Option<Vec<LienRecord>> = env.storage().persistent().get(&key);
+    let Some(mut liens) = liens_opt else { return };
+
+    let mut found_index: Option<u32> = None;
+    for (i, lien) in liens.iter().enumerate() {
+        if lien.loan_id == loan_id {
+            found_index = Some(i as u32);
+            break;
+        }
+    }
+
+    if let Some(idx) = found_index {
+        liens.remove(idx);
+        if liens.is_empty() {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &liens);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        }
+    }
+
+    // Clean up the loan→asset mapping regardless.
+    env.storage().persistent().remove(&loan_asset_key(loan_id));
 }
 
 fn get_admin(env: &Env) -> Address {
@@ -728,6 +777,16 @@ impl LendingContract {
         env.storage().persistent().set(&SLASH_BAL, &updated_slash);
         extend_persistent_ttl(&env, &SLASH_BAL);
 
+        // #995: Release any lien recorded against the defaulted loan so the
+        // asset is no longer locked indefinitely after a slash.
+        if let Some(asset_id) = env
+            .storage()
+            .persistent()
+            .get::<_, u64>(&loan_asset_key(loan.id))
+        {
+            release_lien_internal(&env, asset_id, loan.id);
+        }
+
         env.events()
             .publish((LOAN_SLASHED,), (borrower.clone(), slash_accum));
     }
@@ -933,6 +992,11 @@ impl LendingContract {
     /// against the asset identified by `asset_id` under the loan `loan_id`.
     /// If an identical lien (same asset + lender + loan_id) already exists,
     /// panics with [`ContractError::LienAlreadyExists`].
+    ///
+    /// Also writes a `(LOAN_ASSET, loan_id) → asset_id` mapping so that
+    /// `slash` / `auto_slash` can release the lien automatically when the
+    /// loan is defaulted without the caller having to supply the asset_id
+    /// again (#995).
     pub fn record_lien(
         env: Env,
         admin: Address,
@@ -965,6 +1029,13 @@ impl LendingContract {
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+        // #995: Write loan→asset_id mapping so slash can release the lien.
+        let la_key = loan_asset_key(loan_id);
+        env.storage().persistent().set(&la_key, &asset_id);
+        env.storage()
+            .persistent()
+            .extend_ttl(&la_key, TTL_THRESHOLD, TTL_TARGET);
     }
 
     /// Release (remove) a previously recorded lien. Only the contract admin may call this.
