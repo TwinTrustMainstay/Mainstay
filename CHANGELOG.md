@@ -15,6 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - `apply_decay` in `lifecycle/src/scoring.rs`: enforce `MIN_SCORE_WITH_HISTORY = 1` in both the main decay path and the early-return path so the stored score is never written as 0 for an asset that has at least one maintenance record (closes [#784](https://github.com/TwinTrustMainstay/Mainstay/issues/784))
+- `get_maintenance_history_page` in `lifecycle`: cap the caller-supplied `limit` at `MAX_PAGE_SIZE` (100) so a large `limit` can no longer reintroduce an unbounded, potentially oversized response (closes [#1075](https://github.com/TwinTrustMainstay/Mainstay/issues/1075))
+- `HealthSnapshot` in `lifecycle`: renamed the `timestamp` field to `snapshot_timestamp` to make explicit that it records when the snapshot was captured (closes [#1076](https://github.com/TwinTrustMainstay/Mainstay/issues/1076))
 
 ### Security
 - `initialize_admin` in `asset-registry` already required `deployer.require_auth()`, preventing front-run attacks; the existing `test_initialize_admin_rejects_non_deployer` test and deployment-runbook section 3 now explicitly document this protection (closes [#783](https://github.com/TwinTrustMainstay/Mainstay/issues/783))

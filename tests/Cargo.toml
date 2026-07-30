@@ -82,6 +82,12 @@ name = "test_decommissioned_asset_maintenance"
 path = "test_decommissioned_asset_maintenance.rs"
 
 [[test]]
+name = "test_collateral_eligible_after_decay"
+path = "test_collateral_eligible_after_decay.rs"
+
+[[test]]
+name = "test_asset_dedup_cross_owner"
+path = "test_asset_dedup_cross_owner.rs"
 name = "test_collateral_score_decay_intervals"
 path = "test_collateral_score_decay_intervals.rs"
 
