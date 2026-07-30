@@ -7819,6 +7819,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_submit_maintenance_rejects_revoked_credential_with_unauthorized_engineer_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        assert_eq!(
+            engineer_registry_client.verify_engineer(&engineer),
+            ::engineer_registry::CredentialStatus::Valid
+        );
+
+        engineer_registry_client.revoke_credential(&engineer);
+
+        let result = client.try_submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "revoked credential should be rejected"),
+            &engineer,
+        );
+
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedEngineer as u32,
+            ))),
+            "revoked credential should panic with UnauthorizedEngineer"
+        );
+    }
+
     /// Issue #128: revoked engineer cannot submit, but can after re-registration with a new credential.
     #[test]
     fn test_submit_maintenance_revoked_then_reregistered_engineer() {
