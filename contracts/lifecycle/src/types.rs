@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contracttype, Address, String, Symbol, Map, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, String, Symbol, Map, Vec};
 
 /// A single ownership-transfer event recorded in the on-chain transfer history.
 #[contracttype]
@@ -11,17 +11,32 @@ pub struct TransferRecord {
     pub timestamp: u64,
 }
 
+/// Urgency/severity of a maintenance task.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Priority {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaintenanceRecord {
     pub asset_id: u64,
     pub task_type: Symbol,
+    pub priority: Priority,
     pub notes: String,
     pub engineer: Address,
     pub timestamp: u64,
     /// Maintenance cost in stroops (1 stroop = 10^-7 XLM).
     /// `None` indicates no cost was recorded for this maintenance event.
     pub cost: Option<u64>,
+    /// Sha256 hash of the previous record in this asset's history, forming a
+    /// tamper-evident hash chain over the (possibly TTL/cap-pruned) history.
+    /// `None` for the oldest record currently visible for this asset.
+    pub previous_record_hash: Option<Bytes>,
 }
 
 /// A point-in-time snapshot of the collateral score, recorded at each maintenance event.
@@ -36,6 +51,7 @@ pub struct ScoreEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BatchRecord {
     pub task_type: Symbol,
+    pub priority: Priority,
     pub notes: String,
 }
 
@@ -70,7 +86,7 @@ pub struct TimelockProposal {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HealthSnapshot {
-    pub timestamp: u64,
+    pub snapshot_timestamp: u64,
     pub score: u32,
     pub maintenance_count: u32,
     pub last_service_date: u64,
