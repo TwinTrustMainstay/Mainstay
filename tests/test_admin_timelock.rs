@@ -128,6 +128,46 @@ fn test_admin_timelock_rejects_execution_one_second_before_expiry() {
     );
 }
 
+#[test]
+fn test_set_task_weight_timelock_cannot_be_bypassed() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (lifecycle, admin) = setup(&env);
+
+    lifecycle.propose_config_update(&admin, &symbol_short!("TSK_WT"));
+
+    let res = lifecycle.try_set_task_weight(&admin, &symbol_short!("OIL_CHG"), &20u32);
+    assert_eq!(
+        res,
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            LIFECYCLE_TIMELOCK_NOT_EXPIRED,
+        ))),
+        "set_task_weight must fail with TimelockNotExpired before the timelock expires",
+    );
+}
+
+#[test]
+fn test_set_task_weight_timelock_allows_update_after_expiry() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (lifecycle, admin) = setup(&env);
+
+    lifecycle.propose_config_update(&admin, &symbol_short!("TSK_WT"));
+
+    let base = env.ledger().timestamp();
+    env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+
+    lifecycle.set_task_weight(&admin, &symbol_short!("OIL_CHG"), &20u32);
+
+    let config = lifecycle.get_config();
+    assert_eq!(
+        config.task_weights.get(symbol_short!("OIL_CHG")).unwrap(),
+        20u32
+    );
+}
+
 // --- Admin transfer timelock tests ---
 
 #[test]
