@@ -43,6 +43,10 @@ const DEFAULT_MAX_NOTES_LENGTH: u32 = 256;
 /// for the cross-contract calls and per-record validation performed
 /// inside the batch path.
 pub const MAX_BATCH_SIZE: u32 = 50;
+/// Upper bound on `limit` accepted by [`LifecycleContract::get_maintenance_history_page`].
+/// Without this cap a caller could pass an arbitrarily large `limit` and reintroduce
+/// the unbounded-response failure the paginated endpoint exists to prevent.
+pub const MAX_PAGE_SIZE: u32 = 100;
 const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
 /// Minimum score returned for an asset that has at least one maintenance record.
 /// Prevents decay from making a legitimately-maintained asset indistinguishable
@@ -2287,7 +2291,8 @@ pub fn accept_admin(env: Env) {
     /// # Arguments
     /// * `asset_id` - The unique identifier of the asset
     /// * `offset` - Zero-based start index for pagination
-    /// * `limit` - Maximum number of records to return (returns empty vec if 0)
+    /// * `limit` - Maximum number of records to return (returns empty vec if 0),
+    ///   capped at [`MAX_PAGE_SIZE`]
     ///
     /// # Returns
     /// Vec containing the requested page of maintenance records
@@ -2317,6 +2322,7 @@ pub fn accept_admin(env: Env) {
             return Vec::new(&env);
         }
 
+        let limit = limit.min(MAX_PAGE_SIZE);
         let end = (offset + limit).min(len);
         let mut page = Vec::new(&env);
         for i in offset..end {
@@ -8851,6 +8857,38 @@ mod tests {
                 ContractError::AssetNotFound as u32,
             ))),
         );
+    }
+
+    #[test]
+    fn test_get_maintenance_history_page_limit_capped_at_max_page_size() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        // max_history=0 → default of 200, comfortably above MAX_PAGE_SIZE (100)
+        // so none of the records submitted below get pruned.
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Submit 150 records (3 batches of 50, MAX_BATCH_SIZE) — more than MAX_PAGE_SIZE.
+        for _ in 0..3 {
+            let mut records = Vec::new(&env);
+            for _ in 0..MAX_BATCH_SIZE {
+                records.push_back(BatchRecord {
+                    task_type: symbol_short!("OIL_CHG"),
+                    notes: String::from_str(&env, "Maintenance record"),
+                });
+            }
+            client.batch_submit_maintenance(&asset_id, &records, &engineer);
+        }
+        assert_eq!(client.get_maintenance_history(&asset_id).len(), 150);
+
+        // Requesting a limit far above MAX_PAGE_SIZE must be clamped, not
+        // return every available record — this is the guard against the
+        // unbounded-response failure the pagination endpoint exists to prevent.
+        let page = client.get_maintenance_history_page(&asset_id, &0, &(MAX_PAGE_SIZE * 10));
+        assert_eq!(page.len(), MAX_PAGE_SIZE);
     }
 
     #[test]
