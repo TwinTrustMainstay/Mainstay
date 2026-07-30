@@ -83,6 +83,47 @@ Maintenance tasks are categorized into three tiers with different point values:
 - **Default Weight**: 3 points
 - Applied to any task type not explicitly categorized
 
+### Default weights and rationale
+
+| Task type | Weight | Rationale |
+|-----------|-------:|-----------|
+| `OIL_CHG` | 2 | Routine consumable service; low cost, frequent cadence, minimal impact on asset longevity per event. |
+| `LUBE` | 2 | Preventive, low-cost, high-frequency task with a small marginal effect on collateral value. |
+| `INSPECT` | 2 | Diagnostic only — verifies condition but does not itself extend asset life, so it is weighted like other minor tasks. |
+| `FILTER` | 5 | Protects core components (engine/fuel system) from contamination; moderate cost and moderate impact on reliability. |
+| `TUNE_UP` | 5 | Restores performance and efficiency; broader scope than a single-part swap, so weighted above minor tasks. |
+| `BRAKE` | 5 | Safety-critical system service; weighted at the medium tier to reflect both cost and risk mitigation. |
+| `ENGINE` | 10 | High cost, directly extends the useful life of the highest-value component on most DePIN hardware. |
+| `OVERHAUL` | 10 | Comprehensive multi-system rebuild; the strongest signal of long-term asset care available. |
+| `REBUILD` | 10 | Equivalent scope/cost to an overhaul — restores the asset close to as-new condition. |
+| *(unrecognized)* | 3 | Default for task types outside the allowlist; deliberately between minor and medium so unknown work is never over- or under-credited. |
+
+### Worked Example: 5 Maintenance Records Over 90 Days
+
+A minimal example isolating just the decay/score interaction, using the documented defaults (`decay_rate = 5`, `decay_interval = 30 days`, `score_increment` via task weights):
+
+| # | Day | Task | Weight | Days since prior | Decay before event | Score after decay | Score after event |
+|--:|----:|------|-------:|------------------:|--------------------:|-------------------:|--------------------:|
+| — | 0 (registration) | — | — | — | — | — | **0** |
+| 1 | 0 | `ENGINE` | 10 | 0 | 0 | 0 | **10** |
+| 2 | 18 | `FILTER` | 5 | 18 | `floor(18/30)*5 = 0` | 10 | **15** |
+| 3 | 40 | `BRAKE` | 5 | 22 | `floor(22/30)*5 = 0` | 15 | **20** |
+| 4 | 65 | `OVERHAUL` | 10 | 25 | `floor(25/30)*5 = 0` | 20 | **30** |
+| 5 | 90 | `TUNE_UP` | 5 | 25 | `floor(25/30)*5 = 0` | 30 | **35** |
+
+At registration (day 0, before any record) the score is **0** — no maintenance history yet. After the 5th record on day 90, the score is **35**.
+
+**After 60 further days of inactivity** (day 150, no new records):
+
+```text
+elapsed_time = 60 days
+decay_intervals = floor(60 / 30) = 2
+total_decay = 2 * 5 = 10
+new_score = max(35 - 10, 0) = 25
+```
+
+Score at day 150: **25** (still above the score floor of 1 since the asset has maintenance history, and below the default eligibility threshold of 50 — this asset would not be collateral-eligible at that point).
+
 ## Time-Based Decay
 
 ### Default Decay Configuration
@@ -300,3 +341,89 @@ Current Score: 95
 ---
 
 *This documentation is maintained alongside the Mainstay smart contract system. For the most current implementation details, refer to the source code in the lifecycle contract.*
+
+## Lien Release on Slash / Liquidation
+
+### Overview (#995)
+
+When an asset is used as collateral it is locked via `lock_asset_as_collateral` in the
+Asset Registry and a `LienRecord` is written in the Lending contract
+(`record_lien`).  Before fix #995, defaulting a loan via `slash` marked the
+loan as `Defaulted` but left the `LienRecord` intact.  The asset remained
+permanently locked, preventing the owner from transferring it or pledging it as
+collateral for a new loan.
+
+### Fixed behaviour
+
+`record_lien` now writes a `(LOAN_ASSET, loan_id) → asset_id` mapping in
+persistent storage.  When `slash` is called:
+
+1. The loan is marked `Defaulted` (unchanged behaviour).
+2. The voucher stakes are slashed (unchanged behaviour).
+3. The `(LOAN_ASSET, loan_id)` mapping is looked up.  If an `asset_id` is
+   found, `release_lien_internal` is called to remove the matching
+   `LienRecord` and delete the mapping key.
+
+The release is **best-effort**: if no lien was ever recorded for the loan (e.g.
+the loan was not collateralised) the function completes normally without
+panicking.
+
+### Lender integration note
+
+After a slash the lien is released automatically inside the contract.  Lenders
+or integrators that also call `lock_asset_as_collateral` directly on the Asset
+Registry should separately call `unlock_asset_from_collateral` to clear the
+`is_locked` flag on the asset, as the lending contract does not call the Asset
+Registry itself during slash.
+
+## Maintenance History Pagination
+
+### Deprecation of `get_maintenance_history` (#996)
+
+`get_maintenance_history` returns the **entire** history vector in a single
+read.  At the default `max_history` of 200 that is a 200-element `Vec`,
+which is expensive and can approach Soroban's per-call data and instruction
+limits as history grows.
+
+The function is **deprecated** for new integrations.  Use one of the
+paginated alternatives instead:
+
+| Function | Cap | Notes |
+|---|---|---|
+| `get_maintenance_history_paginated(asset_id, offset, limit)` | 50 | New — preferred for external integrations |
+| `get_maintenance_history_page(asset_id, offset, limit)` | 100 | Existing — suitable for internal/admin tooling |
+
+### Pagination behaviour
+
+Both paginated functions follow the same contract:
+
+- `offset` is zero-based.  An `offset` ≥ history length returns an empty vec
+  (no panic).
+- `limit = 0` returns an empty vec.
+- `limit` values above the respective cap are silently clamped.
+- The returned slice may be shorter than `limit` when the end of history is
+  reached (partial last page).
+
+### Recommended migration
+
+```rust
+// Before (deprecated — full unbounded read)
+let history = lifecycle.get_maintenance_history(&asset_id);
+
+// After (paginated — reads at most 50 records per call)
+let page = lifecycle.get_maintenance_history_paginated(&asset_id, &0, &50);
+```
+
+For UI components that display all records, iterate pages until an empty vec is
+returned:
+
+```rust
+let mut offset: u32 = 0;
+let limit: u32 = 50;
+loop {
+    let page = lifecycle.get_maintenance_history_paginated(&asset_id, &offset, &limit);
+    if page.is_empty() { break; }
+    // process page …
+    offset += page.len();
+}
+```

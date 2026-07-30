@@ -207,7 +207,7 @@ fn test_multi_asset_portfolio_happy_path() {
     // Create a loan
     let borrower = Address::generate(&env);
     let loan_amount: u64 = 100_000;
-    lending.request_loan(&borrower, &loan_amount);
+    lending.request_loan(&borrower, &loan_amount, &0u64);
     let loan = lending.get_loan(&borrower).unwrap();
     assert_eq!(loan.amount, loan_amount);
     assert_eq!(loan.borrower, borrower);

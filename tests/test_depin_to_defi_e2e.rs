@@ -193,7 +193,7 @@ fn test_depin_to_defi_flow() {
     assert_eq!(vouches.get(0).unwrap().stake, 5000);
 
     // Request loan
-    lending.request_loan(&borrower, &10000);
+    lending.request_loan(&borrower, &10000, &0u64);
 
     // ============================================================================
     // STEP 5: Assert loan is disbursed successfully
@@ -416,4 +416,126 @@ fn test_multiple_assets_independent_scores() {
     let eligible_2 = lifecycle.is_collateral_eligible(&asset_id_2);
     assert!(eligible_1, "Asset 1 with 3 records should be eligible");
     assert!(eligible_2, "Asset 2 with 5 records should be eligible");
+}
+
+/// Full lifecycle test covering the lien lock/release step that the other
+/// e2e tests in this file skip: register asset -> register engineer ->
+/// authorize engineer -> submit maintenance -> reach eligibility ->
+/// lock as collateral (record_lien) -> disburse loan -> repay ->
+/// release lien -> verify asset is transferable again.
+#[test]
+fn test_depin_to_defi_full_lifecycle_with_lien_release() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let asset_registry_id = env.register(AssetRegistry, ());
+    let engineer_registry_id = env.register(EngineerRegistry, ());
+    let lifecycle_id = env.register(Lifecycle, ());
+    let lending_id = env.register(LendingContract, ());
+
+    let asset_registry = AssetRegistryClient::new(&env, &asset_registry_id);
+    let engineer_registry = EngineerRegistryClient::new(&env, &engineer_registry_id);
+    let lifecycle = LifecycleClient::new(&env, &lifecycle_id);
+    let lending = LendingContractClient::new(&env, &lending_id);
+
+    let asset_admin = Address::generate(&env);
+    let eng_admin = Address::generate(&env);
+    let lifecycle_admin = Address::generate(&env);
+    let lending_deployer = Address::generate(&env);
+    let lending_admin = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let issuer = Address::generate(&env);
+
+    let asset_owner = Address::generate(&env);
+    let engineer = Address::generate(&env);
+    let borrower = Address::generate(&env);
+    let voucher = Address::generate(&env);
+    let new_owner = Address::generate(&env);
+    let lender = Address::generate(&env);
+
+    let token_contract_id = env.register(token::Contract, ());
+    let token_client = token::Client::new(&env, &token_contract_id);
+    token_client.initialize(
+        &token_admin,
+        &18,
+        &String::from_str(&env, "Test Token"),
+        &String::from_str(&env, "TEST"),
+    );
+
+    asset_registry.initialize_admin(&asset_admin, &asset_admin);
+    asset_registry.add_asset_type(&asset_admin, &symbol_short!("GENSET"));
+    engineer_registry.initialize_admin(&eng_admin, &eng_admin);
+    engineer_registry.add_trusted_issuer(&eng_admin, &issuer);
+    lifecycle.initialize(
+        &lifecycle_admin,
+        &asset_registry_id,
+        &engineer_registry_id,
+        &lifecycle_admin,
+        &0,
+    );
+    lending.initialize(&lending_deployer, &lending_admin, &token_contract_id, &200);
+
+    // Register asset
+    let asset_id = asset_registry.register_asset(
+        &symbol_short!("GENSET"),
+        &String::from_str(&env, "Lien-cycle generator"),
+        &String::from_str(&env, "SN-LIEN-001"),
+        &asset_owner,
+    );
+
+    // Register + authorize engineer
+    let credential_hash = BytesN::from_array(&env, &[7u8; 32]);
+    engineer_registry.register_engineer(&engineer, &credential_hash, &issuer, &31_536_000, &None);
+    lifecycle.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+    // Submit maintenance until eligible
+    for (task, note) in [
+        ("ENGINE", "Engine overhaul"),
+        ("FILTER", "Filter service"),
+        ("BRAKE", "Brake inspection"),
+    ] {
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!(task),
+            &String::from_str(&env, note),
+            &engineer,
+            &None,
+        );
+        env.ledger().set_timestamp(env.ledger().timestamp() + 1);
+    }
+    assert!(
+        lifecycle.is_collateral_eligible(&asset_id),
+        "asset must be eligible before locking as collateral"
+    );
+
+    // Lock asset as collateral: record a lien tying the loan to the asset
+    token_client.mint(&voucher, &50_000);
+    token_client.mint(&env.current_contract_address(), &50_000);
+    lending.vouch(&borrower, &voucher, &5_000);
+    lending.request_loan(&borrower, &10_000);
+    let loan = lending.get_loan(&borrower).expect("loan must exist");
+
+    lending.record_lien(&lending_admin, &asset_id, &lender, &loan.id, &10_000);
+    let liens = lending.get_liens(&asset_id);
+    assert_eq!(liens.len(), 1, "lien must be recorded while loan is active");
+
+    // Repay the loan
+    lending.repay(&borrower);
+    assert!(
+        lending.get_loan(&borrower).is_none(),
+        "loan should be repaid"
+    );
+
+    // Release the lien now that the loan is settled
+    lending.release_lien(&lending_admin, &asset_id, &lender, &loan.id);
+    let liens_after = lending.get_liens(&asset_id);
+    assert!(liens_after.is_empty(), "lien must be released after repayment");
+
+    // Verify final state: asset transferable again
+    asset_registry.transfer_asset(&asset_id, &asset_owner, &new_owner);
+    let asset = asset_registry.get_asset(&asset_id);
+    assert_eq!(
+        asset.owner, new_owner,
+        "asset must be transferable again once loan is repaid and lien released"
+    );
 }

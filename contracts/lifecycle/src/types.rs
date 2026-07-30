@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contracttype, Address, String, Symbol, Map, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, String, Symbol, Map, Vec};
 
 /// A single ownership-transfer event recorded in the on-chain transfer history.
 #[contracttype]
@@ -11,17 +11,59 @@ pub struct TransferRecord {
     pub timestamp: u64,
 }
 
+/// Priority level of a maintenance task.
+///
+/// Used to triage which records are most critical for asset health scoring
+/// and DeFi collateral purposes.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Priority level for a maintenance record.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Priority {
+    Low = 0,
+    Medium = 1,
+    High = 2,
+    Critical = 3,
+/// Urgency/severity of a maintenance task.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Priority {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaintenanceRecord {
     pub asset_id: u64,
     pub task_type: Symbol,
+    /// Priority level of this maintenance task.
+    /// Maintenance priority level.
+    pub priority: Priority,
     pub notes: String,
     pub engineer: Address,
     pub timestamp: u64,
     /// Maintenance cost in stroops (1 stroop = 10^-7 XLM).
     /// `None` indicates no cost was recorded for this maintenance event.
     pub cost: Option<u64>,
+    /// The ledger sequence number at which the current ownership period started.
+    ///
+    /// Set to `Some(ledger)` on the first maintenance record submitted after an
+    /// ownership transfer (and propagated to all subsequent records in that
+    /// ownership period).  `None` for records created before any transfer has
+    /// occurred or for the XFER sentinel records themselves.
+    ///
+    /// DeFi lenders can use this field together with
+    /// [`LifecycleContract::get_maintenance_history_since_transfer`] to isolate
+    /// the maintenance history that belongs to the current owner's tenure.
+    pub ownership_start_ledger: Option<u64>,
+    /// Sha256 hash of the previous record in this asset's history, forming a
+    /// tamper-evident hash chain over the (possibly TTL/cap-pruned) history.
+    /// `None` for the oldest record currently visible for this asset.
+    pub previous_record_hash: Option<Bytes>,
 }
 
 /// A point-in-time snapshot of the collateral score, recorded at each maintenance event.
@@ -36,6 +78,8 @@ pub struct ScoreEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BatchRecord {
     pub task_type: Symbol,
+    /// Priority level of this maintenance task.
+    pub priority: Priority,
     pub notes: String,
 }
 
@@ -54,6 +98,8 @@ pub struct Config {
     pub decay_rate: u32,
     pub decay_interval: u64,
     pub eligibility_threshold: u32,
+    /// Minimum collateral score required for an asset to be considered eligible.
+    pub min_collateral_score: u32,
     pub max_notes_length: u32,
     pub task_weights: Map<Symbol, u32>,
 }
@@ -70,10 +116,29 @@ pub struct TimelockProposal {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HealthSnapshot {
-    pub timestamp: u64,
+    pub snapshot_timestamp: u64,
     pub score: u32,
     pub maintenance_count: u32,
     pub last_service_date: u64,
+    /// Whether this snapshot was used as an anchor for reconstructed history.
+    /// Set to `true` by `anchor_history_to_snapshot` to mark that lost or pruned
+    /// maintenance records have been partially recovered via this snapshot.
+    pub reconstructed: bool,
+}
+
+/// An on-chain governance proposal to change a task-type score weight.
+///
+/// Created by `propose_weight_change`; consumed (executed) by `execute_weight_change`
+/// after the `TIMELOCK_DELAY_SECS` delay has elapsed.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WeightProposal {
+    /// The new weight value proposed for the task type.
+    pub new_weight: u32,
+    /// Ledger timestamp at which the proposal was created.
+    pub proposed_at: u64,
+    /// Whether this proposal has already been executed.
+    pub executed: bool,
 }
 
 /// A recurring maintenance task definition.
@@ -114,4 +179,15 @@ pub enum DataKey {
     RecurringTasks(u64),
     /// Stores duplicate maintenance record IDs per asset.
     DuplicateRecords(u64),
+    /// Stores `Vec<(timestamp, value)>` collateral valuation snapshots for an asset.
+    CollateralValuationHistory(u64),
+    /// Stores `Option<u64>` ledger sequence number of the most recent ownership transfer
+    /// for an asset. `None` means the asset has never been transferred.  Set by
+    /// `record_transfer` and read by `submit_maintenance` / `batch_submit_maintenance`
+    /// to stamp the `ownership_start_ledger` field on new records.
+    OwnershipStartLedger(u64),
+    /// Stores a `WeightProposal` for the given task-type symbol.
+    WeightProposal(Symbol),
+    /// Stores `Vec<(timestamp: u64, value: u64)>` collateral-valuation history for an asset.
+    CollateralValuationHistory(u64),
 }

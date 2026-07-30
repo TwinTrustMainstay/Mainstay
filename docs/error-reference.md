@@ -190,6 +190,11 @@ This document lists every `ContractError` variant across the three core contract
 | 13 | `ContractPaused` | The contract is paused; all mutating calls are blocked. |
 | 14 | `TooManyVouchers` | The borrower's loan already has 100 vouchers (the DoS protection cap). |
 | 15 | `VouchWithdrawNotAllowed` | The voucher attempted to withdraw their stake while an active loan is in progress. |
+| 16 | `UnauthorizedBorrower` | The caller is not the authorized borrower for this loan. |
+
+### Known bugs
+
+- `record_lien` and `release_lien` in `contracts/lending/src/lib.rs` panic with `ContractError::LienAlreadyExists` and `ContractError::LienNotFound` respectively, but neither variant is defined in the `ContractError` enum above. This is a pre-existing latent bug (undefined-variant reference, not a duplicate discriminant) that will surface as a compile error the first time those code paths are exercised in a build. Tracked for a follow-up fix.
 
 ### Resolution guidance
 
@@ -210,6 +215,7 @@ This document lists every `ContractError` variant across the three core contract
 | `ContractPaused` | Wait for the admin to call `unpause`. |
 | `TooManyVouchers` | A single loan accepts at most 100 vouchers. Split the vouching pool across multiple borrowers or reduce the voucher count. |
 | `VouchWithdrawNotAllowed` | Vouchers can only withdraw their stake when no active loan exists for the borrower. Wait for the loan to be repaid or defaulted. |
+| `UnauthorizedBorrower` | Only the borrower on record for the loan may call loan-mutating functions (e.g. `repay`). |
 
 ---
 

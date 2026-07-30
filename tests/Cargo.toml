@@ -60,8 +60,36 @@ name = "test_decay_clamps_at_zero"
 path = "test_decay_clamps_at_zero.rs"
 
 [[test]]
+name = "test_engineer_credential_expiry"
+path = "test_engineer_credential_expiry.rs"
+
+[[test]]
+name = "test_depin_to_defi_e2e"
+path = "test_depin_to_defi_e2e.rs"
+
+[[test]]
+name = "test_lending_view_functions"
+path = "test_lending_view_functions.rs"
+
+[[test]]
+name = "test_submit_maintenance_fuzz"
+path = "test_submit_maintenance_fuzz.rs"
+
+[[test]]
+name = "test_expired_credential_submit_maintenance"
+path = "test_expired_credential_submit_maintenance.rs"
+
+[[test]]
 name = "test_decommissioned_asset_maintenance"
 path = "test_decommissioned_asset_maintenance.rs"
+
+[[test]]
+name = "test_collateral_eligible_after_decay"
+path = "test_collateral_eligible_after_decay.rs"
+
+[[test]]
+name = "test_asset_dedup_cross_owner"
+path = "test_asset_dedup_cross_owner.rs"
 
 [[test]]
 name = "test_collateral_score_decay_intervals"
@@ -86,3 +114,73 @@ path = "test_update_config.rs"
 [[test]]
 name = "test_deprecation_warning"
 path = "test_deprecation_warning.rs"
+name = "test_issues_1010_1013"
+path = "test_issues_1010_1013.rs"
+
+[[test]]
+name = "test_asset_lien_blocks_transfer_1043"
+path = "test_asset_lien_blocks_transfer_1043.rs"
+
+[[test]]
+name = "test_backup_verify"
+path = "test_backup_verify.rs"
+
+[[test]]
+name = "test_batch_submit_max_batch_size"
+path = "test_batch_submit_max_batch_size.rs"
+
+[[test]]
+name = "test_contract_error_discriminants"
+path = "test_contract_error_discriminants.rs"
+
+[[test]]
+name = "test_credential_renewal_extends_expiry"
+path = "test_credential_renewal_extends_expiry.rs"
+
+[[test]]
+name = "test_decommission_blocks_maintenance"
+path = "test_decommission_blocks_maintenance.rs"
+
+[[test]]
+name = "test_health_snapshot_accuracy"
+path = "test_health_snapshot_accuracy.rs"
+
+[[test]]
+name = "test_lifecycle_paused_rejects_writes"
+path = "test_lifecycle_paused_rejects_writes.rs"
+
+[[test]]
+name = "test_multisig_admin_quorum_1042"
+path = "test_multisig_admin_quorum_1042.rs"
+
+[[test]]
+name = "test_predictive_alerts"
+path = "test_predictive_alerts.rs"
+
+[[test]]
+name = "test_ttl_extension"
+path = "test_ttl_extension.rs"
+
+[[test]]
+name = "test_upgrade_compatibility"
+path = "test_upgrade_compatibility.rs"
+
+# Issue #996: get_maintenance_history_paginated
+[[test]]
+name = "test_maintenance_history_paginated"
+path = "test_maintenance_history_paginated.rs"
+
+# Issue #995: lien release after slash
+[[test]]
+name = "test_lien_released_after_slash"
+path = "test_lien_released_after_slash.rs"
+
+# Issue #994: decay applied before eligibility check
+[[test]]
+name = "test_is_collateral_eligible_decay_applied"
+path = "test_is_collateral_eligible_decay_applied.rs"
+
+# Issue #993: dedicated error variants in lending contract
+[[test]]
+name = "test_lending_error_variants"
+path = "test_lending_error_variants.rs"
