@@ -11,6 +11,12 @@ pub struct TransferRecord {
     pub timestamp: u64,
 }
 
+/// Priority level of a maintenance task.
+///
+/// Used to triage which records are most critical for asset health scoring
+/// and DeFi collateral purposes.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Priority level for a maintenance record.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -18,6 +24,7 @@ pub enum Priority {
     Low = 0,
     Medium = 1,
     High = 2,
+    Critical = 3,
 /// Urgency/severity of a maintenance task.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,6 +40,7 @@ pub enum Priority {
 pub struct MaintenanceRecord {
     pub asset_id: u64,
     pub task_type: Symbol,
+    /// Priority level of this maintenance task.
     /// Maintenance priority level.
     pub priority: Priority,
     pub notes: String,
@@ -41,6 +49,17 @@ pub struct MaintenanceRecord {
     /// Maintenance cost in stroops (1 stroop = 10^-7 XLM).
     /// `None` indicates no cost was recorded for this maintenance event.
     pub cost: Option<u64>,
+    /// The ledger sequence number at which the current ownership period started.
+    ///
+    /// Set to `Some(ledger)` on the first maintenance record submitted after an
+    /// ownership transfer (and propagated to all subsequent records in that
+    /// ownership period).  `None` for records created before any transfer has
+    /// occurred or for the XFER sentinel records themselves.
+    ///
+    /// DeFi lenders can use this field together with
+    /// [`LifecycleContract::get_maintenance_history_since_transfer`] to isolate
+    /// the maintenance history that belongs to the current owner's tenure.
+    pub ownership_start_ledger: Option<u64>,
     /// Sha256 hash of the previous record in this asset's history, forming a
     /// tamper-evident hash chain over the (possibly TTL/cap-pruned) history.
     /// `None` for the oldest record currently visible for this asset.
@@ -59,6 +78,7 @@ pub struct ScoreEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BatchRecord {
     pub task_type: Symbol,
+    /// Priority level of this maintenance task.
     pub priority: Priority,
     pub notes: String,
 }
@@ -159,6 +179,13 @@ pub enum DataKey {
     RecurringTasks(u64),
     /// Stores duplicate maintenance record IDs per asset.
     DuplicateRecords(u64),
+    /// Stores `Vec<(timestamp, value)>` collateral valuation snapshots for an asset.
+    CollateralValuationHistory(u64),
+    /// Stores `Option<u64>` ledger sequence number of the most recent ownership transfer
+    /// for an asset. `None` means the asset has never been transferred.  Set by
+    /// `record_transfer` and read by `submit_maintenance` / `batch_submit_maintenance`
+    /// to stamp the `ownership_start_ledger` field on new records.
+    OwnershipStartLedger(u64),
     /// Stores a `WeightProposal` for the given task-type symbol.
     WeightProposal(Symbol),
     /// Stores `Vec<(timestamp: u64, value: u64)>` collateral-valuation history for an asset.

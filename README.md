@@ -158,6 +158,7 @@ revoke_credential(engineer_address)
 ```rust
 submit_maintenance(asset_id, task_type, notes, engineer_signature)
 get_maintenance_history(asset_id) -> Vec<MaintenanceRecord>
+get_maintenance_history_since_transfer(asset_id) -> Vec<MaintenanceRecord>
 get_last_service(asset_id) -> Option<MaintenanceRecord>
 ```
 
@@ -190,8 +191,6 @@ cargo test
 ## ⚠️ Known Limitations
 
 Mainstay v1 is a strong foundation, but there are several intentional constraints and current limitations that contributors and integrators should be aware of before filing issues or building integrations.
-
-- **No lifecycle transfer reconciliation**: When an asset is transferred between owners via `asset_registry::transfer_asset`, the lifecycle contract records a sentinel `XFER` entry but does not perform a full on-chain reconciliation of the maintenance history against the new ownership. DeFi lenders must treat records before the sentinel as belonging to the previous owner's tenure. Full reconciliation is a planned v1.1 feature. See issue [#843](https://github.com/TwinTrustMainstay/Mainstay/issues/843).
 
 - **No partial history recovery path**: If maintenance history is pruned (via `max_history` cap or `prune_asset_history`) or partially lost due to TTL expiry, there is currently no mechanism to reconstruct or recover the missing entries. Health snapshots (`take_health_snapshot`) mitigate data loss for scoring purposes, but the raw record detail is unrecoverable once pruned. See issue [#849](https://github.com/TwinTrustMainstay/Mainstay/issues/849).
 

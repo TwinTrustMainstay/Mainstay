@@ -930,6 +930,7 @@ impl Lifecycle {
     /// # Panics
     /// - [`ContractError::AlreadyInitialized`] if contract has already been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if deployer is not the transaction invoker
+    /// - [`ContractError::InvalidConfig`] if max_history exceeds 10,000, if registries are the same address, or if the compiled default decay_interval is 0
     pub fn initialize(
         env: Env,
         deployer: Address,
@@ -954,6 +955,13 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
         if asset_registry == engineer_registry {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+        // Guard: the baked-in default decay_interval must never be 0; if it
+        // somehow is (e.g. a misconfigured build constant), reject immediately
+        // instead of silently deploying a contract that will panic on the first
+        // `apply_decay` call with a division-by-zero.
+        if DEFAULT_DECAY_INTERVAL == 0 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
 
@@ -1552,6 +1560,15 @@ impl Lifecycle {
         let timestamp = env.ledger().timestamp();
         let previous_record_hash = next_chain_link(&env, &history);
 
+        // Propagate ownership_start_ledger: if this asset has had a transfer, all
+        // new maintenance records carry the ledger sequence number at which that
+        // transfer was recorded.  This lets DeFi lenders filter history to only
+        // the current owner's tenure via get_maintenance_history_since_transfer.
+        let ownership_start_ledger: Option<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnershipStartLedger(asset_id));
+
         let record = MaintenanceRecord {
             asset_id,
             task_type: task_type.clone(),
@@ -1560,6 +1577,7 @@ impl Lifecycle {
             engineer: engineer.clone(),
             timestamp,
             cost,
+            ownership_start_ledger,
             previous_record_hash,
         };
 
@@ -1664,6 +1682,18 @@ impl Lifecycle {
         }
 
         let timestamp = env.ledger().timestamp();
+        let sentinel = MaintenanceRecord {
+            asset_id,
+            task_type: symbol_short!("XFER"),
+            priority: Priority::Low,
+            notes: String::from_str(&env, "Ownership transferred"),
+            engineer: new_owner.clone(),
+            timestamp,
+            cost: None,
+            // XFER sentinel records are ownership boundary markers, not maintenance
+            // events; ownership_start_ledger is not meaningful for them.
+            ownership_start_ledger: None,
+        };
 
         let mut history: Vec<MaintenanceRecord> = env
             .storage()
@@ -1692,6 +1722,15 @@ impl Lifecycle {
             .persistent()
             .set(&history_key(asset_id), &history);
         extend_persistent_ttl(&env, &history_key(asset_id));
+
+        // Record the current ledger sequence as the ownership_start_ledger for this
+        // asset. All subsequent maintenance records will carry this value so lenders
+        // can determine which records belong to the current owner's tenure.
+        let current_ledger = env.ledger().sequence();
+        env.storage()
+            .persistent()
+            .set(&DataKey::OwnershipStartLedger(asset_id), &current_ledger);
+        extend_persistent_ttl(&env, &DataKey::OwnershipStartLedger(asset_id));
 
         // Append to the dedicated transfer history for provenance verification.
         let xfer_key = transfer_hist_key(asset_id);
@@ -1868,6 +1907,14 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
 
+        // Propagate ownership_start_ledger for post-transfer records (same as
+        // submit_maintenance; batches must carry the same field so lenders get
+        // consistent results from get_maintenance_history_since_transfer).
+        let ownership_start_ledger: Option<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnershipStartLedger(asset_id));
+
         // Build all records and compute final score before any write.
         let reputation = engineer_registry_client.get_reputation(&engineer);
         let weighted_increment = ((config.score_increment as u64) * (500 + reputation as u64) / 1000) as u32;
@@ -1898,6 +1945,8 @@ impl Lifecycle {
                 engineer: engineer.clone(),
                 timestamp,
                 cost: rec_cost,
+                ownership_start_ledger,
+            });
                 previous_record_hash: chain_link,
             };
             chain_link = Some(hash_maintenance_record(&env, &new_record));
@@ -2151,6 +2200,65 @@ impl Lifecycle {
                 .get(&history_key(asset_id))
                 .unwrap_or(Vec::new(&env)),
         )
+    }
+
+    /// Return all maintenance records that belong to the current owner's tenure,
+    /// i.e. records submitted after the most recent ownership transfer.
+    ///
+    /// DeFi lenders that only want to see what maintenance the *current* owner has
+    /// done should use this function instead of [`get_maintenance_history`].  All
+    /// returned records will have `ownership_start_ledger == Some(ledger)` where
+    /// `ledger` is the sequence number at which the most recent transfer was
+    /// recorded.
+    ///
+    /// If the asset has never been transferred, this function returns the full
+    /// maintenance history (excluding any future XFER sentinels, of which there
+    /// would be none).
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    ///
+    /// # Returns
+    /// Vec of [`MaintenanceRecord`] containing only post-transfer records in
+    /// chronological order.  Returns an empty Vec if no maintenance has been
+    /// submitted since the last transfer (or if the asset has no history at all).
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    pub fn get_maintenance_history_since_transfer(
+        env: Env,
+        asset_id: u64,
+    ) -> Vec<MaintenanceRecord> {
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        // Find the index of the last XFER sentinel.  All records *after* it
+        // (excluding the sentinel itself) belong to the current owner's tenure.
+        let mut last_xfer_idx: Option<u32> = None;
+        for i in 0..history.len() {
+            let record = history.get(i).unwrap();
+            if record.task_type == symbol_short!("XFER") {
+                last_xfer_idx = Some(i);
+            }
+        }
+
+        let start = match last_xfer_idx {
+            Some(idx) => idx + 1,
+            // No transfer has ever occurred — all records belong to the original owner.
+            None => 0,
+        };
+
+        let mut result = Vec::new(&env);
+        for i in start..history.len() {
+            result.push_back(history.get(i).unwrap());
+        }
+        result
     }
 
     /// Get a paginated slice of the maintenance history for an asset.
@@ -2513,6 +2621,23 @@ impl Lifecycle {
         // Create the maintenance record with no cost (auto-generated)
         let timestamp = env.ledger().timestamp();
         let notes = String::from_str(&env, "Auto-created from recurring schedule");
+
+        // Propagate ownership_start_ledger so recurring tasks are also correctly
+        // associated with the current ownership period.
+        let ownership_start_ledger: Option<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OwnershipStartLedger(asset_id));
+
+        let record = MaintenanceRecord {
+            asset_id,
+            task_type: task_type.clone(),
+            notes,
+            engineer: engineer.clone(),
+            timestamp,
+            cost: None,
+            ownership_start_ledger,
+        };
 
         let mut history: Vec<MaintenanceRecord> = env
             .storage()
@@ -5809,6 +5934,26 @@ mod tests {
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::InvalidConfig as u32,
             ))),
+        );
+    }
+
+    /// Verify that `initialize` stores a non-zero `decay_interval` in the config.
+    ///
+    /// This is the runtime counterpart of the compile-time guard added inside
+    /// `initialize` that rejects a zero `DEFAULT_DECAY_INTERVAL` constant.
+    /// If that constant were ever accidentally zeroed out in a build, both this
+    /// test and the guard itself would catch it before the contract is deployed
+    /// (preventing a division-by-zero in `apply_decay`).
+    #[test]
+    fn test_initialize_decay_interval_is_non_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, _) = setup(&env, 0);
+        let config = client.get_config();
+        assert!(
+            config.decay_interval > 0,
+            "initialize must set a non-zero decay_interval to prevent division-by-zero in apply_decay"
         );
     }
 
@@ -10254,6 +10399,281 @@ mod tests {
         assert!(
             history.get(0).unwrap().timestamp <= history.get(1).unwrap().timestamp,
             "transfer history must be in chronological order"
+        );
+    }
+
+    // ── #1001: get_maintenance_history_since_transfer tests ─────────────────
+
+    /// Helper: register an engineer via the already-initialised engineer-registry
+    /// that comes out of `setup`.  Unlike the standalone `register_engineer`
+    /// helper this one does NOT call `initialize_admin` again, avoiding a
+    /// panic on the second call.
+    fn register_engineer_for_transfer_tests(
+        env: &Env,
+        registry: &EngineerRegistryClient,
+    ) -> Address {
+        let engineer = Address::generate(env);
+        let issuer = Address::generate(env);
+        let admin = Address::generate(env);
+        let hash = BytesN::from_array(env, &[7u8; 32]);
+        // The engineer registry used in `setup` is a fresh, uninitialised instance
+        // that hasn't had initialize_admin called on it yet.  We piggy-back on the
+        // first call here; any subsequent helper call would conflict, so each test
+        // that needs an engineer uses a fresh setup().
+        registry.initialize_admin(&admin, &admin);
+        registry.add_trusted_issuer(&admin, &issuer);
+        registry.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+        registry.update_reputation(&engineer, &500);
+        engineer
+    }
+
+    /// get_maintenance_history_since_transfer returns the full history when
+    /// the asset has never been transferred (no XFER sentinel present).
+    #[test]
+    fn test_history_since_transfer_no_transfer_returns_all() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, engineer_registry, _) = setup(&env, 0);
+
+        let owner = Address::generate(&env);
+        let asset_id = register_asset_for_owner(&env, &asset_registry, &owner);
+        let engineer = register_engineer_for_transfer_tests(&env, &engineer_registry);
+        lifecycle.authorize_engineer(&owner, &asset_id, &engineer);
+
+        // Submit 3 records without any transfer.
+        for _ in 0..3 {
+            lifecycle.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &Priority::Low,
+                &String::from_str(&env, "Routine oil change"),
+                &engineer,
+            );
+            env.ledger().with_mut(|li| li.timestamp += 1);
+        }
+
+        // All 3 records belong to the single (original) owner.
+        let since = lifecycle.get_maintenance_history_since_transfer(&asset_id);
+        let full = lifecycle.get_maintenance_history(&asset_id);
+        assert_eq!(
+            since.len(),
+            full.len(),
+            "without a transfer, since_transfer must equal full history"
+        );
+        assert_eq!(since.len(), 3);
+    }
+
+    /// get_maintenance_history_since_transfer returns an empty Vec when a
+    /// transfer has occurred but no maintenance has been submitted yet under
+    /// the new owner.
+    #[test]
+    fn test_history_since_transfer_empty_after_fresh_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, engineer_registry, _) = setup(&env, 0);
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let asset_id = register_asset_for_owner(&env, &asset_registry, &owner);
+        let engineer = register_engineer_for_transfer_tests(&env, &engineer_registry);
+        lifecycle.authorize_engineer(&owner, &asset_id, &engineer);
+
+        // Submit one record under the original owner, then transfer.
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("INSPECT"),
+            &Priority::Low,
+            &String::from_str(&env, "Pre-transfer inspection"),
+            &engineer,
+        );
+
+        asset_registry.transfer_asset(&asset_id, &owner, &new_owner);
+        lifecycle.record_transfer(&asset_id, &owner, &new_owner);
+
+        // No maintenance submitted post-transfer yet.
+        let since = lifecycle.get_maintenance_history_since_transfer(&asset_id);
+        assert_eq!(
+            since.len(),
+            0,
+            "no post-transfer maintenance means since_transfer must be empty"
+        );
+    }
+
+    /// Pre-transfer records are excluded; post-transfer records are included.
+    /// This is the core reconciliation contract for DeFi lenders.
+    #[test]
+    fn test_history_since_transfer_separates_pre_and_post_records() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, engineer_registry, _) = setup(&env, 0);
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let asset_id = register_asset_for_owner(&env, &asset_registry, &owner);
+        let engineer = register_engineer_for_transfer_tests(&env, &engineer_registry);
+        lifecycle.authorize_engineer(&owner, &asset_id, &engineer);
+
+        // ── Phase 1: pre-transfer maintenance (2 records) ────────────────────
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("INSPECT"),
+            &Priority::Low,
+            &String::from_str(&env, "Pre-transfer inspection 1"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "Pre-transfer oil change"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+
+        // ── Phase 2: transfer ────────────────────────────────────────────────
+        asset_registry.transfer_asset(&asset_id, &owner, &new_owner);
+        lifecycle.record_transfer(&asset_id, &owner, &new_owner);
+
+        // Re-authorise engineer under new owner and submit post-transfer maintenance.
+        lifecycle.authorize_engineer(&new_owner, &asset_id, &engineer);
+        env.ledger().with_mut(|li| li.timestamp += 1);
+
+        // ── Phase 3: post-transfer maintenance (2 records) ───────────────────
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("FILTER"),
+            &Priority::Low,
+            &String::from_str(&env, "Post-transfer filter replacement"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("TUNE_UP"),
+            &Priority::Low,
+            &String::from_str(&env, "Post-transfer tune-up"),
+            &engineer,
+        );
+
+        // Full history: 2 pre + 1 XFER sentinel + 2 post = 5 total.
+        let full = lifecycle.get_maintenance_history(&asset_id);
+        assert_eq!(full.len(), 5, "full history must have 5 entries");
+
+        // Since-transfer: only the 2 post-transfer records, no sentinel.
+        let since = lifecycle.get_maintenance_history_since_transfer(&asset_id);
+        assert_eq!(
+            since.len(),
+            2,
+            "since_transfer must return exactly the 2 post-transfer records"
+        );
+
+        // Post-transfer records carry ownership_start_ledger == Some(_).
+        for record in since.iter() {
+            assert!(
+                record.ownership_start_ledger.is_some(),
+                "post-transfer records must carry ownership_start_ledger"
+            );
+        }
+
+        // Pre-transfer records (indices 0 and 1 in full history) must NOT carry ownership_start_ledger.
+        assert!(
+            full.get(0).unwrap().ownership_start_ledger.is_none(),
+            "pre-transfer record 0 must have ownership_start_ledger == None"
+        );
+        assert!(
+            full.get(1).unwrap().ownership_start_ledger.is_none(),
+            "pre-transfer record 1 must have ownership_start_ledger == None"
+        );
+
+        // The XFER sentinel itself (index 2) must also be None.
+        let sentinel = full.get(2).unwrap();
+        assert_eq!(sentinel.task_type, symbol_short!("XFER"));
+        assert!(
+            sentinel.ownership_start_ledger.is_none(),
+            "XFER sentinel must have ownership_start_ledger == None"
+        );
+
+        // Verify task types of the returned post-transfer records.
+        assert_eq!(since.get(0).unwrap().task_type, symbol_short!("FILTER"));
+        assert_eq!(since.get(1).unwrap().task_type, symbol_short!("TUNE_UP"));
+    }
+
+    /// After two successive transfers (A → B → C), since_transfer returns only
+    /// records submitted under owner C, not those from B's tenure.
+    #[test]
+    fn test_history_since_transfer_respects_latest_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, engineer_registry, _) = setup(&env, 0);
+
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+        let owner_c = Address::generate(&env);
+        let asset_id = register_asset_for_owner(&env, &asset_registry, &owner_a);
+        let engineer = register_engineer_for_transfer_tests(&env, &engineer_registry);
+        lifecycle.authorize_engineer(&owner_a, &asset_id, &engineer);
+
+        // Owner A submits 1 record.
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("INSPECT"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner A inspection"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+
+        // Transfer A → B.
+        asset_registry.transfer_asset(&asset_id, &owner_a, &owner_b);
+        lifecycle.record_transfer(&asset_id, &owner_a, &owner_b);
+        lifecycle.authorize_engineer(&owner_b, &asset_id, &engineer);
+        env.ledger().with_mut(|li| li.timestamp += 1);
+
+        // Owner B submits 1 record.
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner B oil change"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+
+        // Transfer B → C.
+        asset_registry.transfer_asset(&asset_id, &owner_b, &owner_c);
+        lifecycle.record_transfer(&asset_id, &owner_b, &owner_c);
+        lifecycle.authorize_engineer(&owner_c, &asset_id, &engineer);
+        env.ledger().with_mut(|li| li.timestamp += 1);
+
+        // Owner C submits 1 record.
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner C engine overhaul"),
+            &engineer,
+        );
+
+        // Full: A-record + XFER(A→B) + B-record + XFER(B→C) + C-record = 5.
+        let full = lifecycle.get_maintenance_history(&asset_id);
+        assert_eq!(full.len(), 5);
+
+        // Since transfer: only owner C's record.
+        let since = lifecycle.get_maintenance_history_since_transfer(&asset_id);
+        assert_eq!(
+            since.len(),
+            1,
+            "since_transfer after second transfer must return only owner C's records"
+        );
+        assert_eq!(since.get(0).unwrap().task_type, symbol_short!("ENGINE"));
+        assert!(
+            since.get(0).unwrap().ownership_start_ledger.is_some(),
+            "owner C's record must carry ownership_start_ledger"
         );
     }
 
