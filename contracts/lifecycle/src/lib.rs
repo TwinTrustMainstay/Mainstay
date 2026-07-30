@@ -3952,7 +3952,7 @@ pub fn accept_admin(env: Env) {
             .fold(0u64, |acc, t| if t > acc { t } else { acc });
 
         let snapshot = HealthSnapshot {
-            timestamp: env.ledger().timestamp(),
+            snapshot_timestamp: env.ledger().timestamp(),
             score,
             maintenance_count,
             last_service_date,
@@ -11164,7 +11164,7 @@ mod tests {
         assert_eq!(snapshot.score, 0);
         assert_eq!(snapshot.maintenance_count, 0);
         assert_eq!(snapshot.last_service_date, 0);
-        assert_eq!(snapshot.timestamp, env.ledger().timestamp());
+        assert_eq!(snapshot.snapshot_timestamp, env.ledger().timestamp());
     }
 
     #[test]
@@ -11218,7 +11218,7 @@ mod tests {
         let snapshots = client.get_health_snapshots(&asset_id);
         assert_eq!(snapshots.len(), 2, "should have one snapshot per take_health_snapshot call");
         assert!(
-            snapshots.get(1).unwrap().timestamp > snapshots.get(0).unwrap().timestamp,
+            snapshots.get(1).unwrap().snapshot_timestamp > snapshots.get(0).unwrap().snapshot_timestamp,
             "snapshots should be in chronological order"
         );
         assert_eq!(snapshots.get(1).unwrap().maintenance_count, 2);
@@ -11381,7 +11381,7 @@ mod tests {
         let snapshots = client.get_health_snapshots(&asset_id);
         assert!(snapshots.len() >= 2, "should accumulate snapshots");
         assert!(
-            snapshots.get(1).unwrap().timestamp >= snapshots.get(0).unwrap().timestamp,
+            snapshots.get(1).unwrap().snapshot_timestamp >= snapshots.get(0).unwrap().snapshot_timestamp,
             "snapshots should be in chronological order"
         );
         assert_eq!(snapshots.get(1).unwrap().maintenance_count, 2);

@@ -70,7 +70,7 @@ pub struct TimelockProposal {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HealthSnapshot {
-    pub timestamp: u64,
+    pub snapshot_timestamp: u64,
     pub score: u32,
     pub maintenance_count: u32,
     pub last_service_date: u64,
