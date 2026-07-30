@@ -3212,6 +3212,151 @@ impl Lifecycle {
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     pub fn prune_asset_history(env: Env, admin: Address, asset_id: u64) {
         crate::admin::prune_asset_history(env, admin, asset_id);
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        // Prune maintenance history if it exceeds max_history
+        let history_key = history_key(asset_id);
+        if let Some(history) = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<MaintenanceRecord>>(&history_key)
+        {
+            if history.len() > config.max_history {
+                // Keep only the last max_history entries
+                let start_idx = history.len() - config.max_history;
+                let pruned_count = start_idx as u32;
+                let oldest_pruned_timestamp = history.get(0).unwrap().timestamp;
+                let mut pruned = Vec::new(&env);
+                for i in start_idx..history.len() {
+                    pruned.push_back(history.get(i).unwrap());
+                }
+                env.storage().persistent().set(&history_key, &pruned);
+                extend_persistent_ttl(&env, &history_key);
+                env.events().publish(
+                    (EVENT_PRUNED,),
+                    (asset_id, pruned_count, oldest_pruned_timestamp),
+                );
+
+                // Remove asset from engineer index for engineers whose records were
+                // entirely dropped (i.e. they appear only in the pruned prefix).
+                let mut retained_engs: Vec<Address> = Vec::new(&env);
+                for i in start_idx..history.len() {
+                    let eng = history.get(i).unwrap().engineer;
+                    let mut found = false;
+                    for existing in retained_engs.iter() {
+                        if existing == eng {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        retained_engs.push_back(eng);
+                    }
+                }
+                let mut removed_engs: Vec<Address> = Vec::new(&env);
+                for i in 0..start_idx {
+                    let eng = history.get(i).unwrap().engineer;
+                    let mut in_retained = false;
+                    for existing in retained_engs.iter() {
+                        if existing == eng {
+                            in_retained = true;
+                            break;
+                        }
+                    }
+                    if in_retained {
+                        continue;
+                    }
+                    let mut already_removed = false;
+                    for existing in removed_engs.iter() {
+                        if existing == eng {
+                            already_removed = true;
+                            break;
+                        }
+                    }
+                    if !already_removed {
+                        removed_engs.push_back(eng.clone());
+                        engineer_history_remove(&env, &eng, asset_id);
+                    }
+                }
+
+                // Issue #1072: the collateral score is derived from maintenance
+                // history, so it must be recalculated and persisted here —
+                // otherwise a stale, pre-prune score (potentially inflated by
+                // the records just removed) would keep being served.
+                let asset_registry = get_asset_registry_addr(&env);
+                let asset = asset_registry::AssetRegistryClient::new(&env, &asset_registry)
+                    .get_asset(&asset_id);
+                let new_score =
+                    compute_read_only_collateral_score(&env, asset_id, &asset.asset_type, &config);
+                env.storage()
+                    .persistent()
+                    .set(&score_key(asset_id), &new_score);
+                extend_persistent_ttl(&env, &score_key(asset_id));
+                env.storage()
+                    .persistent()
+                    .set(&last_update_key(asset_id), &env.ledger().timestamp());
+                extend_persistent_ttl(&env, &last_update_key(asset_id));
+            }
+        }
+
+        // Prune score history if it exceeds max_history
+        let score_history_key_val = score_history_key(asset_id);
+        if let Some(score_history) = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<ScoreEntry>>(&score_history_key_val)
+        {
+            if score_history.len() > config.max_history {
+                // Keep only the last max_history entries
+                let start_idx = score_history.len() - config.max_history;
+                let mut pruned = Vec::new(&env);
+                for i in start_idx..score_history.len() {
+                    pruned.push_back(score_history.get(i).unwrap());
+                }
+                env.storage()
+                    .persistent()
+                    .set(&score_history_key_val, &pruned);
+                extend_persistent_ttl(&env, &score_history_key_val);
+            }
+        }
+
+        let valuation_history_key = DataKey::CollateralValuationHistory(asset_id);
+        if let Some(valuation_history) = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<(u64, u64)>>(&valuation_history_key)
+        {
+            if valuation_history.len() > config.max_history {
+                let start_idx = valuation_history.len() - config.max_history;
+                let mut pruned = Vec::new(&env);
+                for i in start_idx..valuation_history.len() {
+                    pruned.push_back(valuation_history.get(i).unwrap());
+                }
+                env.storage().persistent().set(&valuation_history_key, &pruned);
+                env.storage().persistent().extend_ttl(
+                    &valuation_history_key,
+                    TTL_THRESHOLD,
+                    TTL_TARGET,
+                );
+            }
+        }
+
+        env.events()
+            .publish((symbol_short!("PRUNE"), admin.clone()), asset_id);
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("PRUNE")),
+            (admin, env.ledger().timestamp(), asset_id),
+        );
     }
 
     /// Remove all lifecycle data for a deregistered asset.
@@ -4000,6 +4145,7 @@ mod tests {
             &Priority::Low,
             &String::from_str(&env, "Should fail"),
             &engineer,
+            &None,
         );
 
         assert_eq!(
@@ -5064,6 +5210,47 @@ mod tests {
         assert_eq!(
             last_before.timestamp, last_after.timestamp,
             "Most recent entries should be kept"
+        );
+    }
+
+    /// Issue #1072: pruning must recalculate and persist the collateral score
+    /// immediately, otherwise readers of the raw stored score (e.g.
+    /// `take_health_snapshot`, which does not recompute from live history)
+    /// keep seeing the stale, pre-prune value.
+    #[test]
+    fn test_prune_asset_history_updates_stale_score_snapshot() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 10);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // 10 records at the default OIL_CHG weight (5) each = score 50.
+        for _ in 0..10 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &Priority::Low,
+                &String::from_str(&env, "Routine oil change"),
+                &engineer,
+                &None,
+            );
+        }
+        let score_before = client.take_health_snapshot(&asset_id).score;
+        assert_eq!(score_before, 50);
+
+        // Shrink max_history and prune — most of the scoring history is dropped.
+        client.update_max_history(&admin, &2);
+        client.prune_asset_history(&admin, &asset_id);
+
+        let score_after = client.take_health_snapshot(&asset_id).score;
+        assert!(
+            score_after < score_before,
+            "collateral score must be recalculated immediately after pruning, got {} (was {})",
+            score_after,
+            score_before
         );
     }
 
