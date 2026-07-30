@@ -7,12 +7,13 @@ mod types;
 use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
-    BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, RecurringTask, ScoreEntry,
-    TimelockProposal, TransferRecord,
+    BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
+    ScoreEntry, TimelockProposal, TransferRecord,
 };
 use shared::extend_persistent_ttl;
 use shared::validation::require_non_empty_vec;
-use shared::{TIMELOCK_DELAY_SECS, DEFAULT_DECAY_INTERVAL_SECS, DEFAULT_TTL_LEDGERS};
+use shared::TTL_THRESHOLD;
+use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contractimpl, panic_with_error, symbol_short, Address, Bytes, BytesN, Env, Map,
     String, Symbol, Vec,
@@ -25,10 +26,12 @@ const ENG_REGISTRY: Symbol = symbol_short!("ENG_REG");
 const CONFIG: Symbol = symbol_short!("CONFIG");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 const PENDING_ADMIN_KEY: Symbol = symbol_short!("PADMIN");
+const DEPLOYER_KEY: Symbol = symbol_short!("DEPLOYER");
 const DEFAULT_MAX_HISTORY: u32 = 200;
 const DEFAULT_SCORE_INCREMENT: u32 = 5;
 const DEFAULT_DECAY_RATE: u32 = 5;
-const DEFAULT_DECAY_INTERVAL: u64 = DEFAULT_DECAY_INTERVAL_SECS;
+/// 30 days in seconds — the default length of one decay interval.
+const DEFAULT_DECAY_INTERVAL: u64 = 2_592_000;
 const DEFAULT_ELIGIBILITY_THRESHOLD: u32 = 50;
 const DEFAULT_MAX_NOTES_LENGTH: u32 = 256;
 
@@ -39,6 +42,17 @@ fn effective_min_collateral_score(config: &Config) -> u32 {
         config.eligibility_threshold
     }
 }
+/// Maximum collateral score exposed by the lifecycle contract.
+///
+/// With the highest built-in task weight (`10`), a maximum-size batch can
+/// contribute at most `MAX_BATCH_SIZE * 10 = 500` raw points. A retained
+/// history has a theoretical raw maximum of `max_history * 10`; at the
+/// default `max_history` of 200 that is 2,000 points. Recency can only reduce
+/// those values, and `compute_decay` caps the externally visible score at 100
+/// before summing another contribution.
+const MAX_COLLATERAL_SCORE: u32 = 100;
+/// Highest score weight among the built-in maintenance task types.
+const MAX_BUILT_IN_TASK_WEIGHT: u32 = 10;
 /// Hard cap on the number of records accepted in a single
 /// `batch_submit_maintenance` call.
 ///
@@ -60,7 +74,7 @@ const MIN_SCORE_WITH_HISTORY: u32 = 1;
 /// Records older than this contribute zero to the collateral score.
 /// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
 /// Older records still contribute nothing, newer records are weighted linearly.
-const MAX_AGE_LEDGERS: u64 = DEFAULT_TTL_LEDGERS as u64;
+const MAX_AGE_LEDGERS: u64 = TTL_THRESHOLD as u64;
 
 const EVENT_INIT: Symbol = symbol_short!("INIT");
 const EVENT_MAINT: Symbol = symbol_short!("MAINT");
@@ -124,6 +138,26 @@ fn standard_key(asset_type: &Symbol) -> (Symbol, Symbol) {
     (symbol_short!("MSTD"), asset_type.clone())
 }
 
+/// Computes the sha256 hash of a [`MaintenanceRecord`] as it will be stored on-chain
+/// (including whatever `previous_record_hash` it already carries), so that the result
+/// can be embedded as the `previous_record_hash` of the *next* record in the chain.
+fn hash_maintenance_record(env: &Env, record: &MaintenanceRecord) -> Bytes {
+    let digest: BytesN<32> = env.crypto().sha256(&record.clone().to_xdr(env)).into();
+    digest.into()
+}
+
+/// Returns the hash-chain link (`previous_record_hash`) for the next record to be
+/// appended to `history`: the hash of the current last record, or `None` when
+/// `history` is empty (i.e. the next record will be the first visible one).
+fn next_chain_link(env: &Env, history: &Vec<MaintenanceRecord>) -> Option<Bytes> {
+    if history.is_empty() {
+        None
+    } else {
+        let last = history.get(history.len() - 1).unwrap();
+        Some(hash_maintenance_record(env, &last))
+    }
+}
+
 /// Enforce M-of-N admin quorum for critical lifecycle operations.
 ///
 /// When `config.admins` is empty or `admin_threshold <= 1`, only the single
@@ -174,14 +208,16 @@ fn require_quorum(env: &Env, config: &Config, caller: &Address) {
 }
 
 fn require_engineer_authorized(env: &Env, asset_id: u64, engineer: &Address) {
+    let key = engineer_auth_key(asset_id, engineer);
     let authorized: bool = env
         .storage()
         .persistent()
-        .get(&engineer_auth_key(asset_id, engineer))
+        .get(&key)
         .unwrap_or(false);
     if !authorized {
         panic_with_error!(env, ContractError::EngineerNotAuthorized);
     }
+    extend_persistent_ttl(env, &key);
 }
 
 fn engineer_history_add(env: &Env, engineer: &Address, asset_id: u64, max_history: u32) {
@@ -603,6 +639,14 @@ pub struct Lifecycle;
 
 #[contractimpl]
 impl Lifecycle {
+    /// Store the deployer address at deploy time.
+    pub fn __constructor(env: Env, deployer: Address) {
+        env.storage().instance().set(&DEPLOYER_KEY, &deployer);
+        env.storage()
+            .instance()
+            .extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
+    }
+
     /// Propose a configuration change to the Lifecycle contract using the admin timelock.
     ///
     /// # Arguments
@@ -877,10 +921,15 @@ impl Lifecycle {
         admin: Address,
         max_history: u32,
     ) {
-        // Soroban SDK removed `env.invoker()`; `require_auth` enforces the
-        // deployer's signature instead, matching the standard pattern used
-        // elsewhere in this contract.
         deployer.require_auth();
+        let stored_deployer: Address = env
+            .storage()
+            .instance()
+            .get(&DEPLOYER_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if deployer != stored_deployer {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
         if env.storage().persistent().has(&CONFIG) {
             panic_with_error!(&env, ContractError::AlreadyInitialized);
         }
@@ -1753,6 +1802,7 @@ pub fn accept_admin(env: Env) {
         }
 
         let timestamp = env.ledger().timestamp();
+        let previous_record_hash = next_chain_link(&env, &history);
 
         let record = MaintenanceRecord {
             asset_id,
@@ -1762,6 +1812,7 @@ pub fn accept_admin(env: Env) {
             engineer: engineer.clone(),
             timestamp,
             cost,
+            previous_record_hash,
         };
 
         history.push_back(record);
@@ -1865,15 +1916,6 @@ pub fn accept_admin(env: Env) {
         }
 
         let timestamp = env.ledger().timestamp();
-        let sentinel = MaintenanceRecord {
-            asset_id,
-            task_type: symbol_short!("XFER"),
-            priority: Priority::Low,
-            notes: String::from_str(&env, "Ownership transferred"),
-            engineer: new_owner.clone(),
-            timestamp,
-            cost: None,
-        };
 
         let mut history: Vec<MaintenanceRecord> = env
             .storage()
@@ -1884,6 +1926,18 @@ pub fn accept_admin(env: Env) {
         if config.max_history > 0 && history.len() >= config.max_history {
             history.remove(0);
         }
+
+        let previous_record_hash = next_chain_link(&env, &history);
+        let sentinel = MaintenanceRecord {
+            asset_id,
+            task_type: symbol_short!("XFER"),
+            priority: Priority::Low,
+            notes: String::from_str(&env, "Ownership transferred"),
+            engineer: new_owner.clone(),
+            timestamp,
+            cost: None,
+            previous_record_hash,
+        };
         history.push_back(sentinel);
         let sentinel_index = history.len() - 1;
         env.storage()
@@ -2025,7 +2079,9 @@ pub fn accept_admin(env: Env) {
         let engineer_registry_client =
             engineer_registry::EngineerRegistryClient::new(&env, &engineer_registry);
         let status = engineer_registry_client.get_credential_status(&engineer);
-        if status != CredentialStatus::Valid && status != CredentialStatus::GracePeriod {
+        if status != engineer_registry::CredentialStatus::Valid
+            && status != engineer_registry::CredentialStatus::GracePeriod
+        {
             panic_with_error!(&env, ContractError::UnauthorizedEngineer);
         }
 
@@ -2076,6 +2132,7 @@ pub fn accept_admin(env: Env) {
         let mut new_records: Vec<MaintenanceRecord> = Vec::new(&env);
         let mut score_entries: Vec<ScoreEntry> = Vec::new(&env);
         let mut rec_idx: u32 = 0;
+        let mut chain_link = next_chain_link(&env, &history);
         for record in records.iter() {
             score = score
                 .checked_add(weighted_increment)
@@ -2085,7 +2142,7 @@ pub fn accept_admin(env: Env) {
                 .as_ref()
                 .and_then(|c| c.get(rec_idx))
                 .and_then(|o| o);
-            new_records.push_back(MaintenanceRecord {
+            let new_record = MaintenanceRecord {
                 asset_id,
                 task_type: record.task_type.clone(),
                 priority: record.priority,
@@ -2093,7 +2150,10 @@ pub fn accept_admin(env: Env) {
                 engineer: engineer.clone(),
                 timestamp,
                 cost: rec_cost,
-            });
+                previous_record_hash: chain_link,
+            };
+            chain_link = Some(hash_maintenance_record(&env, &new_record));
+            new_records.push_back(new_record);
             score_entries.push_back(ScoreEntry { timestamp, score });
             rec_idx += 1;
         }
@@ -2258,7 +2318,13 @@ pub fn accept_admin(env: Env) {
     }
 
     /// Decommission notify for lifecycle contract.
-
+    ///
+    /// Called by the asset registry (via cross-contract call) when an asset is
+    /// decommissioned, to freeze its collateral score. The internal frozen score
+    /// preserves the last computed value, but the emitted `DECOMM` event always
+    /// reports `0` so off-chain indexers/lenders immediately treat the asset as
+    /// having zero collateral value once decommissioned (see issue #794).
+    pub fn decommission_notify(env: Env, asset_id: u64) {
         let asset_registry = get_asset_registry_addr(&env);
         asset_registry.require_auth();
         env.storage()
@@ -2276,6 +2342,7 @@ pub fn accept_admin(env: Env) {
             .set(&frozen_key(asset_id), &true);
         extend_persistent_ttl(&env, &frozen_key(asset_id));
 
+        let zero_score: u32 = 0;
         env.events()
             .publish((symbol_short!("DECOMM"), asset_id), zero_score);
     }
@@ -2379,6 +2446,59 @@ pub fn accept_admin(env: Env) {
             page.push_back(history.get(i).unwrap());
         }
         page
+    }
+
+    // ---------------------------------------------------------------------------
+    //  Hash Chain Tamper Detection
+    // ---------------------------------------------------------------------------
+
+    /// Returns the zero-based indices of records in an asset's maintenance history
+    /// whose `previous_record_hash` does not match the actual hash of the preceding
+    /// record, i.e. the points at which the tamper-evident hash chain is broken.
+    ///
+    /// The chain is only checked over the currently visible (non-pruned) history:
+    /// index `0`'s `previous_record_hash` is never checked, since it may legitimately
+    /// point at a record that has since aged out of `max_history`.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    ///
+    /// # Returns
+    /// A `Vec<u32>` of indices `i` (into `get_maintenance_history`) where
+    /// `history[i].previous_record_hash != hash(history[i - 1])`. Empty if the
+    /// chain is intact (or the asset has fewer than two records).
+    pub fn get_broken_chain_links(env: Env, asset_id: u64) -> Vec<u32> {
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut broken = Vec::new(&env);
+        for i in 1..history.len() {
+            let previous = history.get(i - 1).unwrap();
+            let current = history.get(i).unwrap();
+            let expected = hash_maintenance_record(&env, &previous);
+            if current.previous_record_hash != Some(expected) {
+                broken.push_back(i);
+            }
+        }
+        broken
+    }
+
+    /// Verifies that an asset's maintenance history hash chain is intact, i.e. that
+    /// off-chain data has not been tampered with since submission.
+    ///
+    /// Equivalent to `get_broken_chain_links(asset_id).is_empty()`.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    ///
+    /// # Returns
+    /// `true` if every record's `previous_record_hash` matches the hash of the record
+    /// before it (or the asset has fewer than two records); `false` if any link is broken.
+    pub fn verify_maintenance_chain_integrity(env: Env, asset_id: u64) -> bool {
+        Self::get_broken_chain_links(env, asset_id).is_empty()
     }
 
     /// Get the most recent maintenance record for an asset, determined by the highest timestamp.
@@ -2643,15 +2763,6 @@ pub fn accept_admin(env: Env) {
         let timestamp = env.ledger().timestamp();
         let notes = String::from_str(&env, "Auto-created from recurring schedule");
 
-        let record = MaintenanceRecord {
-            asset_id,
-            task_type: task_type.clone(),
-            notes,
-            engineer: engineer.clone(),
-            timestamp,
-            cost: None,
-        };
-
         let mut history: Vec<MaintenanceRecord> = env
             .storage()
             .persistent()
@@ -2667,6 +2778,18 @@ pub fn accept_admin(env: Env) {
         if config.max_history > 0 && history.len() >= config.max_history {
             history.remove(0);
         }
+
+        let previous_record_hash = next_chain_link(&env, &history);
+        let record = MaintenanceRecord {
+            asset_id,
+            task_type: task_type.clone(),
+            priority: Priority::Low,
+            notes,
+            engineer: engineer.clone(),
+            timestamp,
+            cost: None,
+            previous_record_hash,
+        };
         history.push_back(record);
         env.storage()
             .persistent()
@@ -4240,6 +4363,191 @@ mod tests {
         // Set reputation to 500 (neutral 1.0× multiplier) so existing score assertions hold
         registry_client.update_reputation(&engineer, &500);
         engineer
+    }
+
+    // ---------------------------------------------------------------------------
+    //  Hash Chain Tamper Detection (issue #1088)
+    // ---------------------------------------------------------------------------
+
+    /// Self-contained setup for hash-chain tests: registers an asset type/engineer
+    /// specialization pair that actually match (`diesel_ge`), independent of the
+    /// generic `setup()`/`register_asset()` helpers above, since those hardcode the
+    /// "GENSET" asset type which does not appear in the engineer registry's allowed
+    /// specialization list and so can never pass `submit_maintenance`'s specialization check.
+    fn setup_chain_test(env: &Env) -> (LifecycleClient<'_>, u64, Address, Address) {
+        let asset_registry_id = env.register(AssetRegistry, ());
+        let engineer_registry_id = env.register(EngineerRegistry, ());
+        let lifecycle_id = env.register(Lifecycle, ());
+        let admin = Address::generate(env);
+        let asset_admin = Address::generate(env);
+
+        let client = LifecycleClient::new(env, &lifecycle_id);
+        client.initialize(&admin, &asset_registry_id, &engineer_registry_id, &admin, &0);
+
+        let asset_registry_client = AssetRegistryClient::new(env, &asset_registry_id);
+        asset_registry_client.initialize_admin(&asset_admin, &asset_admin);
+        asset_registry_client.add_asset_type(&asset_admin, &symbol_short!("diesel_ge"));
+
+        let engineer_registry_client = EngineerRegistryClient::new(env, &engineer_registry_id);
+        let eng_admin = Address::generate(env);
+        let issuer = Address::generate(env);
+        engineer_registry_client.initialize_admin(&eng_admin, &eng_admin);
+        engineer_registry_client.add_trusted_issuer(&eng_admin, &issuer);
+
+        let engineer = Address::generate(env);
+        let hash = BytesN::from_array(env, &[9u8; 32]);
+        engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+        engineer_registry_client.update_reputation(&engineer, &500);
+        engineer_registry_client.add_specialization(&issuer, &engineer, &symbol_short!("diesel_ge"));
+
+        let owner = Address::generate(env);
+        let asset_id = asset_registry_client.register_asset(
+            &symbol_short!("diesel_ge"),
+            &String::from_str(env, "Chain Test Genset"),
+            &unique_serial(env),
+            &owner,
+        );
+        client.authorize_engineer(&owner, &asset_id, &engineer);
+
+        (client, asset_id, owner, engineer)
+    }
+
+    #[test]
+    fn test_chain_integrity_true_for_empty_history() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_id, _owner, _engineer) = setup_chain_test(&env);
+
+        assert!(client.verify_maintenance_chain_integrity(&asset_id));
+        assert_eq!(client.get_broken_chain_links(&asset_id).len(), 0);
+    }
+
+    #[test]
+    fn test_first_record_has_no_previous_hash() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_id, _owner, engineer) = setup_chain_test(&env);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "Routine oil change"),
+            &engineer,
+            &None,
+        );
+
+        let history = client.get_maintenance_history(&asset_id);
+        assert_eq!(history.get(0).unwrap().previous_record_hash, None);
+        assert!(client.verify_maintenance_chain_integrity(&asset_id));
+    }
+
+    #[test]
+    fn test_hash_chain_intact_across_multiple_submissions() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_id, _owner, engineer) = setup_chain_test(&env);
+
+        for _ in 0..5 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &Priority::Low,
+                &String::from_str(&env, "Routine oil change"),
+                &engineer,
+                &None,
+            );
+        }
+
+        assert!(client.verify_maintenance_chain_integrity(&asset_id));
+        assert_eq!(client.get_broken_chain_links(&asset_id).len(), 0);
+
+        let history = client.get_maintenance_history(&asset_id);
+        for i in 1..history.len() {
+            let expected = hash_maintenance_record(&env, &history.get(i - 1).unwrap());
+            assert_eq!(history.get(i).unwrap().previous_record_hash, Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_hash_chain_intact_across_batch_submit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_id, _owner, engineer) = setup_chain_test(&env);
+
+        // One pre-existing record submitted individually, then a batch of three.
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "Routine oil change"),
+            &engineer,
+            &None,
+        );
+
+        let batch = soroban_sdk::vec![
+            &env,
+            BatchRecord {
+                task_type: symbol_short!("OIL_CHG"),
+                priority: Priority::Low,
+                notes: String::from_str(&env, "Batch 1"),
+            },
+            BatchRecord {
+                task_type: symbol_short!("OIL_CHG"),
+                priority: Priority::Low,
+                notes: String::from_str(&env, "Batch 2"),
+            },
+            BatchRecord {
+                task_type: symbol_short!("OIL_CHG"),
+                priority: Priority::Low,
+                notes: String::from_str(&env, "Batch 3"),
+            },
+        ];
+        client.batch_submit_maintenance(&asset_id, &batch, &engineer, &None);
+
+        assert_eq!(client.get_maintenance_history(&asset_id).len(), 4);
+        assert!(client.verify_maintenance_chain_integrity(&asset_id));
+        assert_eq!(client.get_broken_chain_links(&asset_id).len(), 0);
+    }
+
+    #[test]
+    fn test_verify_maintenance_chain_integrity_detects_tampered_record() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_id, _owner, engineer) = setup_chain_test(&env);
+
+        for _ in 0..3 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &Priority::Low,
+                &String::from_str(&env, "Routine oil change"),
+                &engineer,
+                &None,
+            );
+        }
+        assert!(client.verify_maintenance_chain_integrity(&asset_id));
+
+        // Simulate off-chain tampering: directly overwrite record index 1's notes
+        // in persistent storage, without recomputing the hash chain, the way a
+        // storage-level exploit or buggy migration might.
+        let contract_id = client.address.clone();
+        env.as_contract(&contract_id, || {
+            let mut history: Vec<MaintenanceRecord> = env
+                .storage()
+                .persistent()
+                .get(&history_key(asset_id))
+                .unwrap();
+            let mut tampered = history.get(1).unwrap();
+            tampered.notes = String::from_str(&env, "Tampered notes");
+            history.set(1, tampered);
+            env.storage().persistent().set(&history_key(asset_id), &history);
+        });
+
+        assert!(!client.verify_maintenance_chain_integrity(&asset_id));
+        let broken = client.get_broken_chain_links(&asset_id);
+        assert_eq!(broken.len(), 1);
+        assert_eq!(broken.get(0).unwrap(), 2);
     }
 
     #[test]
@@ -7791,6 +8099,35 @@ mod tests {
         }
 
         assert_eq!(client.get_collateral_score(&asset_id), 100);
+    }
+
+    #[test]
+    fn test_decay_score_sums_maximum_default_history_inputs() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry, engineer_registry, admin) =
+            setup(&env, DEFAULT_MAX_HISTORY);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry);
+        let engineer = register_engineer(&env, &engineer_registry);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+        client.update_score_increment(&admin, &MAX_BUILT_IN_TASK_WEIGHT);
+
+        for _ in 0..DEFAULT_MAX_HISTORY {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("ENGINE"),
+                &Priority::High,
+                &String::from_str(&env, "Maximum-weight history entry"),
+                &engineer,
+            );
+        }
+
+        assert_eq!(
+            client.get_maintenance_history(&asset_id).len(),
+            DEFAULT_MAX_HISTORY
+        );
+        assert_eq!(client.get_collateral_score(&asset_id), MAX_COLLATERAL_SCORE);
     }
 
     #[test]
