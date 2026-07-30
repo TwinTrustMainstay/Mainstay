@@ -1,10 +1,10 @@
 use asset_registry::{AssetRegistry, AssetRegistryClient};
-use engineer_registry::{EngineerRegistry, EngineerRegistryClient, EngineerStatus};
+use engineer_registry::{EngineerRegistry, EngineerRegistryClient, EngineerStatus, CredentialStatus};
 use lifecycle::{Lifecycle, LifecycleClient};
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Ledger},
-    Address, BytesN, Env, String,
+    Address, BytesN, Env, String, Symbol,
 };
 
 #[test]
@@ -54,7 +54,10 @@ fn test_full_lifecycle_e2e() {
     assert_eq!(engineer_record.issuer, issuer);
     assert!(engineer_record.active);
 
-    assert!(engineer_registry.verify_engineer(&engineer));
+    assert_eq!(
+        engineer_registry.verify_engineer(&engineer, &None::<Symbol>),
+        engineer_registry::CredentialStatus::Valid
+    );
     assert_eq!(
         engineer_registry.get_engineer_status(&engineer),
         EngineerStatus::Active

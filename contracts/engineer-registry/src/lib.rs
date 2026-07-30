@@ -34,6 +34,10 @@ pub enum ContractError {
     InvalidSuspensionPeriod = 19,
     BatchRevokeTooLarge = 20,
     CredentialExpired = 21,
+    /// Grace period seconds out of the 1-day to 90-day bounds.
+    InvalidGracePeriod = 22,
+    /// Engineer's specializations do not cover the required task type.
+    SpecializationNotCovered = 23,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -125,6 +129,8 @@ const EVENT_PROP_ADMIN: Symbol = symbol_short!("PROP_ADM");
 const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
 /// Grace period allowing engineers to work after credential expiry (7 days).
 const GRACE_PERIOD_SECS: u64 = 7 * 86_400;
+/// Alias used by get_grace_period fallback.
+const DEFAULT_GRACE_PERIOD_SECS: u64 = GRACE_PERIOD_SECS;
 const GRACE_PERIOD_KEY: Symbol = symbol_short!("GRACE_P");
 const MAX_BATCH_REVOKE: u32 = 50;
 
@@ -386,15 +392,25 @@ impl EngineerRegistry {
     /// Write operations (register, revoke, renew) remain blocked while paused.
     ///
     /// # Arguments
-    /// * `engineer` - The address of the engineer to verify
+    /// * `engineer`               - The address of the engineer to verify
+    /// * `required_specialization` - Optional task-type symbol that the engineer
+    ///                               must hold a specialization for. Pass `None`
+    ///                               to skip the specialization check.
     ///
     /// # Returns
     /// A CredentialStatus enum:
     /// - `CredentialStatus::Valid` if the engineer has active, non-expired credentials
+    ///   (and, when specified, the required specialization)
     /// - `CredentialStatus::HardExpired` if the engineer exists but credentials are expired
     /// - `CredentialStatus::Revoked` if the engineer exists but credentials are revoked
     /// - `CredentialStatus::NotFound` if the engineer was never registered
-    pub fn verify_engineer(env: Env, engineer: Address) -> CredentialStatus {
+    /// - Panics with [`ContractError::SpecializationNotCovered`] if the engineer is
+    ///   otherwise valid but lacks the required specialization
+    pub fn verify_engineer(
+        env: Env,
+        engineer: Address,
+        required_specialization: Option<Symbol>,
+    ) -> CredentialStatus {
         match env
             .storage()
             .persistent()
@@ -409,6 +425,19 @@ impl EngineerRegistry {
                     // The issuer that credentialed this engineer is no longer trusted.
                     CredentialStatus::Revoked
                 } else if env.ledger().timestamp() < e.expires_at {
+                    // Credential is valid — now check specialization if requested.
+                    if let Some(required) = required_specialization {
+                        let mut covered = false;
+                        for spec in e.specializations.iter() {
+                            if spec == required {
+                                covered = true;
+                                break;
+                            }
+                        }
+                        if !covered {
+                            panic_with_error!(&env, ContractError::SpecializationNotCovered);
+                        }
+                    }
                     CredentialStatus::Valid
                 } else {
                     CredentialStatus::HardExpired
@@ -855,22 +884,35 @@ impl EngineerRegistry {
     ///
     /// # Arguments
     /// * `admin` - The current admin address
-    /// * `secs` - Grace period in seconds (0 disables the grace window entirely)
+    /// * `secs`  - Grace period in seconds (must be between 1 day and 90 days)
     ///
     /// # Panics
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
+    /// - [`ContractError::InvalidGracePeriod`] if `secs` is outside the valid range
     pub fn set_grace_period(env: Env, admin: Address, secs: u64) {
+        ensure_not_paused(&env);
         let stored_admin: Address = Self::get_admin(env.clone());
         if require_admin(&admin, &stored_admin).is_err() {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
+
+        // Validate: 1 day ≤ secs ≤ 90 days
+        const MIN_GRACE: u64 = 86_400;       // 1 day
+        const MAX_GRACE: u64 = 7_776_000;    // 90 days
+        if secs < MIN_GRACE || secs > MAX_GRACE {
+            panic_with_error!(&env, ContractError::InvalidGracePeriod);
+        }
+
         env.storage().persistent().set(&GRACE_PERIOD_KEY, &secs);
         extend_persistent_ttl(&env, &GRACE_PERIOD_KEY);
-        env.events()
-            .publish((symbol_short!("ADM_AUD"), symbol_short!("SET_GRACE")), (admin, secs));
         env.storage()
             .persistent()
             .extend_ttl(&GRACE_PERIOD_KEY, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (symbol_short!("GRACE_P"), admin.clone()),
+            (secs, env.ledger().timestamp()),
+        );
         env.events().publish(
             (symbol_short!("ADM_AUD"), symbol_short!("SET_GRACE")),
             (admin, secs),
@@ -1588,7 +1630,7 @@ mod tests {
         testutils::storage::Persistent,
         testutils::Address as _,
         testutils::{Events, Ledger},
-        BytesN, Env, IntoVal,
+        BytesN, Env, IntoVal, Symbol,
     };
 
     fn setup<'a>(env: &'a Env) -> (EngineerRegistryClient<'a>, Address) {
@@ -1630,15 +1672,15 @@ mod tests {
 
         client.add_trusted_issuer(&admin, &issuer);
         client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
-        assert!(client.verify_engineer(&engineer) == CredentialStatus::Valid);
+        assert!(client.verify_engineer(&engineer, &None::<Symbol>) == CredentialStatus::Valid);
 
         client.revoke_credential(&engineer);
-        assert!(client.verify_engineer(&engineer) != CredentialStatus::Valid);
+        assert!(client.verify_engineer(&engineer, &None::<Symbol>) != CredentialStatus::Valid);
         client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
-        assert_eq!(client.verify_engineer(&engineer), CredentialStatus::Valid);
+        assert_eq!(client.verify_engineer(&engineer, &None::<Symbol>), CredentialStatus::Valid);
 
         client.revoke_credential(&engineer);
-        assert_ne!(client.verify_engineer(&engineer), CredentialStatus::Valid);
+        assert_ne!(client.verify_engineer(&engineer, &None::<Symbol>), CredentialStatus::Valid);
     }
 
     #[test]
@@ -1655,16 +1697,16 @@ mod tests {
         client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
 
         // Sanity: engineer is initially verified
-        assert!(client.verify_engineer(&engineer) == CredentialStatus::Valid);
+        assert!(client.verify_engineer(&engineer, &None::<Symbol>) == CredentialStatus::Valid);
 
         // Revoke credentials and verify immediately returns false
         client.revoke_credential(&engineer);
-        assert!(client.verify_engineer(&engineer) != CredentialStatus::Valid);
-        assert_eq!(client.verify_engineer(&engineer), CredentialStatus::Valid);
+        assert!(client.verify_engineer(&engineer, &None::<Symbol>) != CredentialStatus::Valid);
+        assert_eq!(client.verify_engineer(&engineer, &None::<Symbol>), CredentialStatus::Valid);
 
         // Revoke credentials and verify immediately returns false
         client.revoke_credential(&engineer);
-        assert_ne!(client.verify_engineer(&engineer), CredentialStatus::Valid);
+        assert_ne!(client.verify_engineer(&engineer, &None::<Symbol>), CredentialStatus::Valid);
     }
 
     #[test]
@@ -2230,9 +2272,9 @@ mod tests {
         client.unpause(&admin);
         client.add_trusted_issuer(&admin, &issuer);
         client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
-        assert!(client.verify_engineer(&engineer) == CredentialStatus::Valid);
+        assert!(client.verify_engineer(&engineer, &None::<Symbol>) == CredentialStatus::Valid);
         client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
-        assert_eq!(client.verify_engineer(&engineer), CredentialStatus::Valid);
+        assert_eq!(client.verify_engineer(&engineer, &None::<Symbol>), CredentialStatus::Valid);
     }
 
     #[test]
@@ -2305,15 +2347,15 @@ mod tests {
         client.add_trusted_issuer(&admin, &issuer);
         // validity_period of 86_400 seconds (minimum)
         client.register_engineer(&engineer, &hash, &issuer, &86_400, &None);
-        assert!(client.verify_engineer(&engineer) == CredentialStatus::Valid);
+        assert!(client.verify_engineer(&engineer, &None::<Symbol>) == CredentialStatus::Valid);
         client.register_engineer(&engineer, &hash, &issuer, &86_400, &None);
-        assert_eq!(client.verify_engineer(&engineer), CredentialStatus::Valid);
+        assert_eq!(client.verify_engineer(&engineer, &None::<Symbol>), CredentialStatus::Valid);
 
         // Advance ledger past expiry
         env.ledger()
             .with_mut(|li| li.timestamp = li.timestamp + 86_401);
-        assert!(client.verify_engineer(&engineer) != CredentialStatus::Valid);
-        assert_ne!(client.verify_engineer(&engineer), CredentialStatus::Valid);
+        assert!(client.verify_engineer(&engineer, &None::<Symbol>) != CredentialStatus::Valid);
+        assert_ne!(client.verify_engineer(&engineer, &None::<Symbol>), CredentialStatus::Valid);
     }
 
     #[test]
@@ -2332,8 +2374,8 @@ mod tests {
         // Advance to just before expiry
         env.ledger()
             .with_mut(|li| li.timestamp = li.timestamp + 86_399);
-        assert!(client.verify_engineer(&engineer) == CredentialStatus::Valid);
-        assert_eq!(client.verify_engineer(&engineer), CredentialStatus::Valid);
+        assert!(client.verify_engineer(&engineer, &None::<Symbol>) == CredentialStatus::Valid);
+        assert_eq!(client.verify_engineer(&engineer, &None::<Symbol>), CredentialStatus::Valid);
     }
 
     #[test]
@@ -2587,8 +2629,8 @@ mod tests {
         client.pause(&admin);
 
         // Read-only access should still work while paused
-        assert!(client.verify_engineer(&engineer) == CredentialStatus::Valid);
-        assert_eq!(client.verify_engineer(&engineer), CredentialStatus::Valid);
+        assert!(client.verify_engineer(&engineer, &None::<Symbol>) == CredentialStatus::Valid);
+        assert_eq!(client.verify_engineer(&engineer, &None::<Symbol>), CredentialStatus::Valid);
         let fetched_engineer = client.get_engineer(&engineer);
         assert_eq!(fetched_engineer.address, engineer);
         assert!(fetched_engineer.active);
@@ -2688,16 +2730,16 @@ mod tests {
         // Advance past original expiry
         env.ledger()
             .with_mut(|li| li.timestamp = li.timestamp + 86_401);
-        assert!(client.verify_engineer(&engineer) != CredentialStatus::Valid);
+        assert!(client.verify_engineer(&engineer, &None::<Symbol>) != CredentialStatus::Valid);
 
         // Renew for another 86_400 seconds from now
         client.renew_credential(&engineer, &86_400);
-        assert!(client.verify_engineer(&engineer) == CredentialStatus::Valid);
-        assert_ne!(client.verify_engineer(&engineer), CredentialStatus::Valid);
+        assert!(client.verify_engineer(&engineer, &None::<Symbol>) == CredentialStatus::Valid);
+        assert_ne!(client.verify_engineer(&engineer, &None::<Symbol>), CredentialStatus::Valid);
 
         // Renew for another 86_400 seconds from now
         client.renew_credential(&engineer, &86_400);
-        assert_eq!(client.verify_engineer(&engineer), CredentialStatus::Valid);
+        assert_eq!(client.verify_engineer(&engineer, &None::<Symbol>), CredentialStatus::Valid);
 
         let record = client.get_engineer(&engineer);
         assert_eq!(record.expires_at, env.ledger().timestamp() + 86_400);
@@ -2795,8 +2837,8 @@ mod tests {
         assert_eq!(renewed.issuer, original.issuer);
         assert_eq!(renewed.expires_at, original.expires_at + 86_400);
         assert!(renewed.expires_at > original.expires_at);
-        assert!(client.verify_engineer(&engineer) == CredentialStatus::Valid);
-        assert_eq!(client.verify_engineer(&engineer), CredentialStatus::Valid);
+        assert!(client.verify_engineer(&engineer, &None::<Symbol>) == CredentialStatus::Valid);
+        assert_eq!(client.verify_engineer(&engineer, &None::<Symbol>), CredentialStatus::Valid);
     }
 
     #[test]
@@ -3181,18 +3223,18 @@ mod tests {
 
         // Revoke the credential
         client.revoke_credential(&engineer);
-        assert!(client.verify_engineer(&engineer) != CredentialStatus::Valid);
+        assert!(client.verify_engineer(&engineer, &None::<Symbol>) != CredentialStatus::Valid);
 
         // Should be able to re-register after revocation
         let new_hash = BytesN::from_array(&env, &[2u8; 32]);
         client.register_engineer(&engineer, &new_hash, &issuer, &31_536_000, &None);
-        assert!(client.verify_engineer(&engineer) == CredentialStatus::Valid);
-        assert_ne!(client.verify_engineer(&engineer), CredentialStatus::Valid);
+        assert!(client.verify_engineer(&engineer, &None::<Symbol>) == CredentialStatus::Valid);
+        assert_ne!(client.verify_engineer(&engineer, &None::<Symbol>), CredentialStatus::Valid);
 
         // Should be able to re-register after revocation
         let new_hash = BytesN::from_array(&env, &[2u8; 32]);
         client.register_engineer(&engineer, &new_hash, &issuer, &31_536_000, &None);
-        assert_eq!(client.verify_engineer(&engineer), CredentialStatus::Valid);
+        assert_eq!(client.verify_engineer(&engineer, &None::<Symbol>), CredentialStatus::Valid);
     }
 
     #[test]
@@ -3210,9 +3252,9 @@ mod tests {
 
         // First registration succeeds
         client.register_engineer(&engineer, &hash1, &issuer, &31_536_000, &None);
-        assert!(client.verify_engineer(&engineer) == CredentialStatus::Valid);
+        assert!(client.verify_engineer(&engineer, &None::<Symbol>) == CredentialStatus::Valid);
         client.register_engineer(&engineer, &hash1, &issuer, &31_536_000, &None);
-        assert_eq!(client.verify_engineer(&engineer), CredentialStatus::Valid);
+        assert_eq!(client.verify_engineer(&engineer, &None::<Symbol>), CredentialStatus::Valid);
 
         // Second registration with same engineer (still active) must panic
         let result = client.try_register_engineer(&engineer, &hash2, &issuer, &31_536_000, &None);
@@ -3706,7 +3748,7 @@ mod tests {
 
         // Never-registered engineer returns NotFound
         assert_eq!(
-            client.verify_engineer(&never_registered),
+            client.verify_engineer(&never_registered, &None::<Symbol>),
             CredentialStatus::NotFound,
             "never-registered engineer should return NotFound"
         );
@@ -3722,7 +3764,7 @@ mod tests {
 
         // Active engineer returns Valid
         assert_eq!(
-            client.verify_engineer(&engineer),
+            client.verify_engineer(&engineer, &None::<Symbol>),
             CredentialStatus::Valid,
             "active engineer should return Valid"
         );
@@ -3732,14 +3774,14 @@ mod tests {
 
         // Revoked engineer returns Revoked
         assert_eq!(
-            client.verify_engineer(&engineer),
+            client.verify_engineer(&engineer, &None::<Symbol>),
             CredentialStatus::Revoked,
             "revoked engineer should return Revoked"
         );
 
         // Never-registered still returns NotFound
         assert_eq!(
-            client.verify_engineer(&never_registered),
+            client.verify_engineer(&never_registered, &None::<Symbol>),
             CredentialStatus::NotFound,
             "never-registered engineer should still return NotFound after other operations"
         );
@@ -3762,7 +3804,7 @@ mod tests {
         assert!(client.is_paused());
 
         // reads must still work while paused so the lifecycle contract isn't blocked
-        assert_eq!(client.verify_engineer(&engineer), CredentialStatus::Valid);
+        assert_eq!(client.verify_engineer(&engineer, &None::<Symbol>), CredentialStatus::Valid);
         assert_eq!(client.verify_engineer(&Address::generate(&env)), CredentialStatus::NotFound);
     }
 
@@ -4887,7 +4929,7 @@ mod tests {
         );
 
         assert_eq!(
-            client.verify_engineer(&engineer),
+            client.verify_engineer(&engineer, &None::<Symbol>),
             CredentialStatus::Suspended,
             "suspended engineer should return Suspended"
     fn test_batch_revoke_emits_event_per_engineer() {
@@ -5145,13 +5187,13 @@ mod tests {
         client.register_engineer(&eng_asme, &hash1, &asme, &31_536_000, &None);
         client.register_engineer(&eng_ieee, &hash2, &ieee, &31_536_000, &None);
 
-        assert_eq!(client.verify_engineer(&eng_asme), CredentialStatus::Valid);
-        assert_eq!(client.verify_engineer(&eng_ieee), CredentialStatus::Valid);
+        assert_eq!(client.verify_engineer(&eng_asme, &None::<Symbol>), CredentialStatus::Valid);
+        assert_eq!(client.verify_engineer(&eng_ieee, &None::<Symbol>), CredentialStatus::Valid);
 
         // Revoking one issuer must only affect that issuer's engineer.
         client.revoke_issuer(&asme);
-        assert_eq!(client.verify_engineer(&eng_asme), CredentialStatus::Revoked);
-        assert_eq!(client.verify_engineer(&eng_ieee), CredentialStatus::Valid);
+        assert_eq!(client.verify_engineer(&eng_asme, &None::<Symbol>), CredentialStatus::Revoked);
+        assert_eq!(client.verify_engineer(&eng_ieee, &None::<Symbol>), CredentialStatus::Valid);
     }
 
     #[test]
@@ -5166,11 +5208,11 @@ mod tests {
         let engineer = Address::generate(&env);
         let hash = BytesN::from_array(&env, &[9u8; 32]);
         client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
-        assert_eq!(client.verify_engineer(&engineer), CredentialStatus::Valid);
+        assert_eq!(client.verify_engineer(&engineer, &None::<Symbol>), CredentialStatus::Valid);
 
         // Once the issuer is no longer trusted, verification must not be Valid.
         client.revoke_issuer(&issuer);
-        assert_eq!(client.verify_engineer(&engineer), CredentialStatus::Revoked);
+        assert_eq!(client.verify_engineer(&engineer, &None::<Symbol>), CredentialStatus::Revoked);
     }
 
     // --- Training record tests ---
