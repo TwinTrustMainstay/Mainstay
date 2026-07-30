@@ -14,5 +14,5 @@ pub const TTL_TARGET: u32 = 518_400;
 pub fn extend_persistent_ttl<K: IntoVal<Env, Val>>(env: &Env, key: K) {
     env.storage()
         .persistent()
-        .extend_ttl(key, TTL_THRESHOLD, TTL_TARGET);
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 }
