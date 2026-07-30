@@ -31,6 +31,14 @@ const DEFAULT_DECAY_RATE: u32 = 5;
 const DEFAULT_DECAY_INTERVAL: u64 = DEFAULT_DECAY_INTERVAL_SECS;
 const DEFAULT_ELIGIBILITY_THRESHOLD: u32 = 50;
 const DEFAULT_MAX_NOTES_LENGTH: u32 = 256;
+
+fn effective_min_collateral_score(config: &Config) -> u32 {
+    if config.min_collateral_score > 0 {
+        config.min_collateral_score
+    } else {
+        config.eligibility_threshold
+    }
+}
 /// Hard cap on the number of records accepted in a single
 /// `batch_submit_maintenance` call.
 ///
@@ -899,6 +907,7 @@ impl Lifecycle {
             decay_rate: DEFAULT_DECAY_RATE,
             decay_interval: DEFAULT_DECAY_INTERVAL,
             eligibility_threshold: DEFAULT_ELIGIBILITY_THRESHOLD,
+            min_collateral_score: DEFAULT_ELIGIBILITY_THRESHOLD,
             max_notes_length: DEFAULT_MAX_NOTES_LENGTH,
             task_weights: Map::new(&env),
         };
@@ -1309,6 +1318,7 @@ pub fn accept_admin(env: Env) {
 
         let old_threshold = config.eligibility_threshold;
         config.eligibility_threshold = threshold;
+        config.min_collateral_score = threshold;
         env.storage().persistent().set(&CONFIG, &config);
         extend_persistent_ttl(&env, &CONFIG);
         env.events()
@@ -1320,6 +1330,54 @@ pub fn accept_admin(env: Env) {
                 env.ledger().timestamp(),
                 symbol_short!("ELIG"),
                 threshold,
+            ),
+        );
+    }
+
+    /// Admin-only function to update the minimum collateral score required for eligibility.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored config admin
+    /// * `min_collateral_score` - New minimum collateral score value (must be > 0)
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::InvalidConfig`] if `min_collateral_score` is 0
+    pub fn update_config(env: Env, admin: Address, min_collateral_score: u32) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        if min_collateral_score == 0 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+
+        let mut config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        let old_min = config.min_collateral_score;
+        config.min_collateral_score = min_collateral_score;
+        config.eligibility_threshold = min_collateral_score;
+        env.storage().persistent().set(&CONFIG, &config);
+        extend_persistent_ttl(&env, &CONFIG);
+
+        env.events().publish(
+            (symbol_short!("CFG_UPD"),),
+            (old_min, min_collateral_score),
+        );
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
+            (
+                admin,
+                env.ledger().timestamp(),
+                symbol_short!("MIN_COLL"),
+                min_collateral_score,
             ),
         );
     }
@@ -3169,7 +3227,7 @@ pub fn accept_admin(env: Env) {
         } else {
             compute_read_only_collateral_score(&env, asset_id, &asset.asset_type, &config)
         };
-        score >= config.eligibility_threshold
+        effective_score >= effective_min_collateral_score(&config)
     }
 
     /// Returns the timestamp of the most recent maintenance event, or None if no maintenance has been submitted.
@@ -3656,7 +3714,7 @@ pub fn accept_admin(env: Env) {
             } else {
                 compute_read_only_collateral_score(&env, asset_id, &asset.asset_type, &config)
             };
-            results.push_back(score >= config.eligibility_threshold);
+            results.push_back(score >= effective_min_collateral_score(&config));
         }
         results
     }
@@ -6197,6 +6255,54 @@ mod tests {
         client.update_eligibility_threshold(&admin, &score);
 
         assert!(client.is_collateral_eligible(&asset_id));
+    }
+
+    #[test]
+    fn test_is_collateral_eligible_uses_custom_min_collateral_score() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        for _ in 0..5 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("FILTER"),
+                &Priority::Low,
+                &String::from_str(&env, "notes"),
+                &engineer,
+            );
+        }
+
+        client.update_config(&admin, &25);
+        assert!(client.is_collateral_eligible(&asset_id));
+    }
+
+    #[test]
+    fn test_is_collateral_eligible_respects_higher_custom_min_collateral_score() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        for _ in 0..6 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("FILTER"),
+                &Priority::Low,
+                &String::from_str(&env, "notes"),
+                &engineer,
+            );
+        }
+
+        client.update_config(&admin, &35);
+        assert!(!client.is_collateral_eligible(&asset_id));
     }
 
     #[test]
