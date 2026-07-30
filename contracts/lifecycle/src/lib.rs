@@ -34,6 +34,17 @@ const DEFAULT_DECAY_RATE: u32 = 5;
 const DEFAULT_DECAY_INTERVAL: u64 = 2_592_000;
 const DEFAULT_ELIGIBILITY_THRESHOLD: u32 = 50;
 const DEFAULT_MAX_NOTES_LENGTH: u32 = 256;
+/// Maximum collateral score exposed by the lifecycle contract.
+///
+/// With the highest built-in task weight (`10`), a maximum-size batch can
+/// contribute at most `MAX_BATCH_SIZE * 10 = 500` raw points. A retained
+/// history has a theoretical raw maximum of `max_history * 10`; at the
+/// default `max_history` of 200 that is 2,000 points. Recency can only reduce
+/// those values, and `compute_decay` caps the externally visible score at 100
+/// before summing another contribution.
+const MAX_COLLATERAL_SCORE: u32 = 100;
+/// Highest score weight among the built-in maintenance task types.
+const MAX_BUILT_IN_TASK_WEIGHT: u32 = 10;
 /// Hard cap on the number of records accepted in a single
 /// `batch_submit_maintenance` call.
 ///
@@ -7960,6 +7971,35 @@ mod tests {
         }
 
         assert_eq!(client.get_collateral_score(&asset_id), 100);
+    }
+
+    #[test]
+    fn test_decay_score_sums_maximum_default_history_inputs() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry, engineer_registry, admin) =
+            setup(&env, DEFAULT_MAX_HISTORY);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry);
+        let engineer = register_engineer(&env, &engineer_registry);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+        client.update_score_increment(&admin, &MAX_BUILT_IN_TASK_WEIGHT);
+
+        for _ in 0..DEFAULT_MAX_HISTORY {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("ENGINE"),
+                &Priority::High,
+                &String::from_str(&env, "Maximum-weight history entry"),
+                &engineer,
+            );
+        }
+
+        assert_eq!(
+            client.get_maintenance_history(&asset_id).len(),
+            DEFAULT_MAX_HISTORY
+        );
+        assert_eq!(client.get_collateral_score(&asset_id), MAX_COLLATERAL_SCORE);
     }
 
     #[test]
