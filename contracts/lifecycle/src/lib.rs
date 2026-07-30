@@ -64,6 +64,9 @@ const EVENT_XFER: Symbol = symbol_short!("XFER");
 const EVENT_PROP_ADMIN: Symbol = symbol_short!("PROP_ADM");
 const EVENT_ADMIN_SET: Symbol = symbol_short!("ADMIN_SET");
 const EVENT_PRUNED: Symbol = symbol_short!("PRUNED");
+/// Emitted by `set_task_weight` to produce an immutable audit trail for every
+/// scoring-model change.  Data: `(task_type, old_weight, new_weight, admin, timestamp)`.
+const EVENT_WEIGHT_SET: Symbol = symbol_short!("WEIGHT_SET");
 
 fn history_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("HIST"), asset_id)
@@ -876,6 +879,12 @@ impl Lifecycle {
         if env.storage().persistent().has(&CONFIG) {
             panic_with_error!(&env, ContractError::AlreadyInitialized);
         }
+        if is_zero_address(&env, &asset_registry) {
+            panic_with_error!(&env, ContractError::ZeroAddress);
+        }
+        if is_zero_address(&env, &engineer_registry) {
+            panic_with_error!(&env, ContractError::ZeroAddress);
+        }
         if max_history > 10_000 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
@@ -1544,15 +1553,23 @@ pub fn accept_admin(env: Env) {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
 
+        let old_weight: u32 = config.task_weights.get(task_type.clone()).unwrap_or(0);
         config.task_weights.set(task_type.clone(), weight);
         env.storage().persistent().set(&CONFIG, &config);
         extend_persistent_ttl(&env, &CONFIG);
 
+        let now = env.ledger().timestamp();
+        // Primary structured event: full weight-change record for off-chain indexers.
+        env.events().publish(
+            (EVENT_WEIGHT_SET,),
+            (task_type.clone(), old_weight, weight, admin.clone(), now),
+        );
+        // Legacy events kept for backward compatibility.
         env.events()
             .publish((symbol_short!("TSK_WT"),), (task_type.clone(), weight));
         env.events().publish(
             (symbol_short!("ADM_AUD"), symbol_short!("TSK_WT")),
-            (admin, env.ledger().timestamp(), task_type, weight),
+            (admin, now, task_type, weight),
         );
     }
 
@@ -5261,6 +5278,95 @@ mod tests {
         assert_eq!(client.get_collateral_score(&asset_id2), 50);
     }
 
+    // --- #1029: WEIGHT_SET audit event ---
+
+    /// `set_task_weight` must emit a `WEIGHT_SET` event whose data tuple is
+    /// `(task_type, old_weight, new_weight, admin, timestamp)`.
+    /// On first set the old_weight must be 0 (key not yet present in map).
+    #[test]
+    fn test_set_task_weight_emits_weight_set_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+        let task_type = symbol_short!("OIL_CHG");
+        let new_weight: u32 = 25;
+
+        // First call: no existing weight, so old_weight must be 0.
+        client.set_task_weight(&admin, &task_type, &new_weight);
+
+        let events = env.events().all();
+        let weight_set_event = events.iter().find(|(_, topics, _)| {
+            topics.len() == 1
+                && topics
+                    .get(0)
+                    .and_then(|v| TryIntoVal::<_, Symbol>::try_into_val(&v, &env).ok())
+                    .map(|s| s == symbol_short!("WEIGHT_SET"))
+                    .unwrap_or(false)
+        });
+
+        assert!(weight_set_event.is_some(), "expected WEIGHT_SET event to be emitted");
+
+        let (_, _, data) = weight_set_event.unwrap();
+        let (emitted_task_type, old_weight, emitted_new_weight, emitted_admin, _timestamp): (
+            Symbol,
+            u32,
+            u32,
+            Address,
+            u64,
+        ) = data.try_into_val(&env).unwrap();
+
+        assert_eq!(emitted_task_type, task_type);
+        assert_eq!(old_weight, 0u32, "first set must report old_weight = 0");
+        assert_eq!(emitted_new_weight, new_weight);
+        assert_eq!(emitted_admin, admin);
+    }
+
+    /// On a subsequent `set_task_weight` call the event must carry the
+    /// previously stored weight as `old_weight`.
+    #[test]
+    fn test_set_task_weight_event_reports_previous_weight() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+        let task_type = symbol_short!("ENGINE");
+
+        // Establish initial weight.
+        client.set_task_weight(&admin, &task_type, &10);
+
+        // Advance ledger timestamp so we can distinguish the two event sets.
+        env.ledger().set_timestamp(env.ledger().timestamp() + 1);
+
+        // Update to a new weight.
+        client.set_task_weight(&admin, &task_type, &30);
+
+        // The last WEIGHT_SET event must reflect the update: old=10, new=30.
+        let events = env.events().all();
+        let last_weight_set = events.iter().rev().find(|(_, topics, _)| {
+            topics.len() == 1
+                && topics
+                    .get(0)
+                    .and_then(|v| TryIntoVal::<_, Symbol>::try_into_val(&v, &env).ok())
+                    .map(|s| s == symbol_short!("WEIGHT_SET"))
+                    .unwrap_or(false)
+        });
+
+        assert!(last_weight_set.is_some(), "expected WEIGHT_SET event on second call");
+
+        let (_, _, data) = last_weight_set.unwrap();
+        let (_emitted_task_type, old_weight, new_weight, _emitted_admin, _timestamp): (
+            Symbol,
+            u32,
+            u32,
+            Address,
+            u64,
+        ) = data.try_into_val(&env).unwrap();
+
+        assert_eq!(old_weight, 10u32, "old_weight must reflect the previous value");
+        assert_eq!(new_weight, 30u32);
+    }
+
     #[test]
     fn test_update_scoring_weights_admin_only() {
         let env = Env::default();
@@ -6121,6 +6227,60 @@ mod tests {
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::InvalidConfig as u32,
+            ))),
+        );
+    }
+
+    // --- #1028: zero-address validation in initialize ---
+
+    /// Passing the Stellar zero address as `asset_registry` must be rejected
+    /// with `ContractError::ZeroAddress` before any state is written.
+    #[test]
+    fn test_initialize_rejects_zero_asset_registry() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let engineer_registry_id = env.register(EngineerRegistry, ());
+        let lifecycle_id = env.register(Lifecycle, ());
+        let admin = Address::generate(&env);
+        let zero = Address::from_str(
+            &env,
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+        );
+
+        let lifecycle = LifecycleClient::new(&env, &lifecycle_id);
+        let result =
+            lifecycle.try_initialize(&admin, &zero, &engineer_registry_id, &admin, &0u32);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::ZeroAddress as u32,
+            ))),
+        );
+    }
+
+    /// Passing the Stellar zero address as `engineer_registry` must be rejected
+    /// with `ContractError::ZeroAddress` before any state is written.
+    #[test]
+    fn test_initialize_rejects_zero_engineer_registry() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let asset_registry_id = env.register(AssetRegistry, ());
+        let lifecycle_id = env.register(Lifecycle, ());
+        let admin = Address::generate(&env);
+        let zero = Address::from_str(
+            &env,
+            "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
+        );
+
+        let lifecycle = LifecycleClient::new(&env, &lifecycle_id);
+        let result =
+            lifecycle.try_initialize(&admin, &asset_registry_id, &zero, &admin, &0u32);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::ZeroAddress as u32,
             ))),
         );
     }
