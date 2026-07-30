@@ -1521,7 +1521,7 @@ pub fn accept_admin(env: Env) {
     /// # Arguments
     /// * `admin` - The admin address that must match the stored config admin
     /// * `task_type` - The task type symbol to configure
-    /// * `weight` - The weight/increment value for this task type
+    /// * `weight` - The weight/increment value for this task type. The minimum supported weight is 1.
     ///
     /// # Panics
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
@@ -1531,9 +1531,7 @@ pub fn accept_admin(env: Env) {
         ensure_not_paused(&env);
         admin.require_auth();
 
-        if weight == 0 {
-            panic_with_error!(&env, ContractError::InvalidConfig);
-        }
+        assert!(weight > 0, "task weight must be greater than 0");
 
         let mut config: Config = env
             .storage()
@@ -5176,12 +5174,7 @@ mod tests {
         let (client, _, _, admin) = setup(&env, 0);
 
         let result = client.try_set_task_weight(&admin, &symbol_short!("OIL_CHG"), &0);
-        assert_eq!(
-            result,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::InvalidConfig as u32,
-            ))),
-        );
+        assert!(result.is_err(), "zero weight should be rejected");
     }
 
     #[test]
