@@ -38,6 +38,11 @@ pub enum ContractError {
     AssetAlreadyDeprecated = 17,
     /// The batch exceeds the maximum allowed size.
     BatchTooLarge = 18,
+    AssetLocked = 19,
+    LendingContractNotSet = 20,
+    UnauthorizedLender = 21,
+    LoanIdMismatch = 22,
+    AssetNotLocked = 23,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -212,6 +217,8 @@ const ASSET_TYPE_PREFIX: Symbol = symbol_short!("AST_TYPE");
 const PENDING_ADMIN_KEY: Symbol = symbol_short!("PADMIN");
 const DECOMM_PREFIX: Symbol = symbol_short!("DECOMM");
 const LIFECYCLE_KEY: Symbol = symbol_short!("LIFECYCLE");
+const DEPLOYER_KEY: Symbol = symbol_short!("DEPLOYER");
+const ALLOWED_ASSET_TYPES_KEY: Symbol = symbol_short!("A_TYPES");
 
 /// Storage key for the authorized lending contract address.
 /// Only the contract stored under this key may call `lock_asset_as_collateral`
@@ -224,6 +231,12 @@ const MAX_BATCH_SIZE: u32 = 50;
 pub const DEREG_TOPIC: Symbol = symbol_short!("DEREG");
 pub const ADD_TYPE_TOPIC: Symbol = symbol_short!("ADD_TYPE");
 pub const RM_TYPE_TOPIC: Symbol = symbol_short!("RM_TYPE");
+
+/// Sentinel score returned by [`AssetRegistry::get_lifecycle_score`] for assets that
+/// have never had a maintenance record submitted. Distinguishes a brand-new asset
+/// from one with an actual score of 0 (e.g. deprecated or decommissioned), so DeFi
+/// lenders don't mistake "no history yet" for "poor maintenance record".
+pub const NO_LIFECYCLE_HISTORY_SCORE: u32 = u32::MAX;
 
 fn asset_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("ASSET"), id)
@@ -284,7 +297,6 @@ fn require_global_timelock_ready(env: &Env, op: Symbol) {
     // TIMELOCK_DELAY_SECS is expressed in seconds; env.ledger().timestamp() returns
     // Unix epoch seconds — they are directly comparable.  env.ledger().sequence()
     // returns the ledger number and must NOT be used here.
-    if env.ledger().timestamp().saturating_sub(proposal.proposed_at) < TIMELOCK_DELAY_SECS {
     if env
         .ledger()
         .timestamp()
@@ -324,6 +336,17 @@ fn serial_dedup_key(hash: &BytesN<32>) -> (Symbol, BytesN<32>) {
     (symbol_short!("SN_DEDUP"), hash.clone())
 }
 
+/// Serial-number lookup key for `get_asset_by_serial_number`.
+///
+/// This is the same underlying storage slot as `serial_dedup_key` — the
+/// deduplication map written during `register_asset` doubles as the reverse
+/// lookup index.  The helper is kept separate so call-sites are self-documenting.
+fn serial_number_lookup_key(env: &Env, serial: &String) -> (Symbol, BytesN<32>) {
+    let sn_bytes = serial.clone().to_xdr(env);
+    let hash: BytesN<32> = env.crypto().sha256(&sn_bytes).into();
+    serial_dedup_key(&hash)
+}
+
 /// Owner index key: owner → Vec<u64> of asset IDs.
 fn owner_index_key(owner: &Address) -> DataKey {
     DataKey::AssetsByOwner(owner.clone())
@@ -332,6 +355,18 @@ fn owner_index_key(owner: &Address) -> DataKey {
 /// Asset type allowlist key: asset_type → bool.
 fn asset_type_key(asset_type: &Symbol) -> (Symbol, Symbol) {
     (ASSET_TYPE_PREFIX, asset_type.clone())
+}
+
+fn allowed_asset_types(env: &Env) -> Vec<Symbol> {
+    env.storage()
+        .persistent()
+        .get(&ALLOWED_ASSET_TYPES_KEY)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+fn set_allowed_asset_types(env: &Env, asset_types: &Vec<Symbol>) {
+    env.storage().persistent().set(&ALLOWED_ASSET_TYPES_KEY, asset_types);
+    extend_persistent_ttl(&env, &ALLOWED_ASSET_TYPES_KEY);
 }
 
 /// Asset type count key: asset_type → u64 (number of registered assets of this type).
@@ -435,10 +470,6 @@ fn owner_index_remove(env: &Env, owner: &Address, asset_id: u64) {
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
     }
-        extend_persistent_ttl(&env, &key);
-    }
-    env.storage().persistent().set(&key, &updated);
-    extend_persistent_ttl(&env, &key);
 }
 
 /// Category index key: category bytes → Vec<u64> of asset IDs.
@@ -564,6 +595,14 @@ pub struct AssetRegistry;
 
 #[contractimpl]
 impl AssetRegistry {
+    /// Store the deployer address at deploy time.
+    pub fn __constructor(env: Env, deployer: Address) {
+        env.storage().instance().set(&DEPLOYER_KEY, &deployer);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_TARGET);
+    }
+
     /// Propose a timelocked deregistration for an asset.
     /// This is the first step in removing an asset from the registry.
     ///
@@ -896,6 +935,45 @@ impl AssetRegistry {
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
         asset
+    }
+
+    /// Look up an asset by its physical serial number.
+    ///
+    /// Field engineers and auditors who know a machine's manufacturer plate number
+    /// can use this function to retrieve the full on-chain record without needing
+    /// to know the numeric `asset_id` in advance.
+    ///
+    /// The lookup is O(1): during `register_asset` a mapping of
+    /// `sha256(serial_number) → asset_id` is written to persistent storage under
+    /// the same key used for serial-number deduplication, so no additional storage
+    /// is required.
+    ///
+    /// # Arguments
+    /// * `serial` - The physical serial number string (case-sensitive, as registered)
+    ///
+    /// # Returns
+    /// `Some(Asset)` if an asset with that serial number exists; `None` otherwise.
+    pub fn get_asset_by_serial_number(env: Env, serial: String) -> Option<Asset> {
+        let key = serial_number_lookup_key(&env, &serial);
+        // Resolve serial → asset_id using the dedup index written at registration time.
+        let asset_id: u64 = match env.storage().persistent().get(&key) {
+            Some(id) => id,
+            None => return None,
+        };
+        // Fetch the full Asset record.
+        let asset_key = asset_key(asset_id);
+        let asset: Asset = match env.storage().persistent().get(&asset_key) {
+            Some(a) => a,
+            None => return None,
+        };
+        // Extend TTL on both entries on read to keep the index alive.
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        env.storage()
+            .persistent()
+            .extend_ttl(&asset_key, TTL_THRESHOLD, TTL_TARGET);
+        Some(asset)
     }
 
     /// Check whether an asset with the given ID is present in the registry.
@@ -1317,9 +1395,15 @@ impl AssetRegistry {
     /// - [`ContractError::AdminAlreadyInitialized`] if admin has already been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if deployer is not the transaction invoker
     pub fn initialize_admin(env: Env, deployer: Address, admin: Address) {
-        // Soroban SDK removed `env.invoker()`; rely on `require_auth` to enforce
-        // the deployer's signature instead, which is the standard pattern.
         deployer.require_auth();
+        let stored_deployer: Address = env
+            .storage()
+            .instance()
+            .get(&DEPLOYER_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if deployer != stored_deployer {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
         if env.storage().instance().has(&ADMIN_KEY) {
             panic_with_error!(&env, ContractError::AdminAlreadyInitialized);
         }
@@ -1659,6 +1743,64 @@ impl AssetRegistry {
                 .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
         }
         history
+    }
+
+    /// Retrieve a paginated slice of the metadata change history for an asset.
+    ///
+    /// Issue #1021 — auditors need to trace metadata evolution without querying
+    /// raw storage. This view function returns a bounded slice of
+    /// [`MetadataHistoryEntry`] records, ordered oldest-first, allowing callers
+    /// to page through the full history in chunks.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `offset`   - Zero-based index of the first entry to return
+    /// * `limit`    - Maximum number of entries to return (capped at 100)
+    ///
+    /// # Returns
+    /// `Vec<MetadataHistoryEntry>` — the requested slice, possibly shorter than
+    /// `limit` if fewer entries remain after `offset`.  Returns an empty vector
+    /// when `offset` ≥ total history length or no history exists.
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    pub fn get_asset_metadata_history(
+        env: Env,
+        asset_id: u64,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<MetadataHistoryEntry> {
+        if !Self::asset_exists(env.clone(), asset_id) {
+            panic_with_error!(&env, ContractError::AssetNotFound);
+        }
+
+        let key = metadata_history_key(asset_id);
+        let history: Vec<MetadataHistoryEntry> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        }
+
+        // Cap the page size to 100 to prevent excessive per-call compute cost.
+        let capped_limit = limit.min(100);
+
+        let total = history.len();
+        if offset >= total || capped_limit == 0 {
+            return Vec::new(&env);
+        }
+
+        let end = (offset + capped_limit).min(total);
+        let mut page: Vec<MetadataHistoryEntry> = Vec::new(&env);
+        for i in offset..end {
+            page.push_back(history.get(i).unwrap());
+        }
+        page
     }
 
     /// Transfer ownership of an asset from the current owner to a new owner.
@@ -2055,6 +2197,20 @@ impl AssetRegistry {
         if require_admin(&admin, &stored_admin).is_err() {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
+
+        let mut allowed_types = allowed_asset_types(&env);
+        let mut already_present = false;
+        for existing in allowed_types.iter() {
+            if existing == asset_type {
+                already_present = true;
+                break;
+            }
+        }
+        if !already_present {
+            allowed_types.push_back(asset_type.clone());
+            set_allowed_asset_types(&env, &allowed_types);
+        }
+
         env.storage()
             .persistent()
             .set(&asset_type_key(&asset_type), &true);
@@ -2088,6 +2244,16 @@ impl AssetRegistry {
         if count > 0 {
             panic_with_error!(&env, ContractError::TypeInUse);
         }
+
+        let mut allowed_types = allowed_asset_types(&env);
+        let mut updated_types = Vec::new(&env);
+        for existing in allowed_types.iter() {
+            if existing != asset_type {
+                updated_types.push_back(existing);
+            }
+        }
+        set_allowed_asset_types(&env, &updated_types);
+
         env.storage()
             .persistent()
             .remove(&asset_type_key(&asset_type));
@@ -2106,10 +2272,12 @@ impl AssetRegistry {
     /// # Returns
     /// `true` if valid; `false` otherwise
     pub fn is_valid_asset_type(env: Env, asset_type: Symbol) -> bool {
-        env.storage()
-            .persistent()
-            .get(&asset_type_key(&asset_type))
-            .unwrap_or(false)
+        for allowed_type in allowed_asset_types(&env).iter() {
+            if allowed_type == asset_type {
+                return true;
+            }
+        }
+        false
     }
 
     /// Get the lifecycle score for an asset by cross-calling the Lifecycle contract.
@@ -2119,7 +2287,9 @@ impl AssetRegistry {
     /// * `lifecycle_contract` - The address of the Lifecycle contract
     ///
     /// # Returns
-    /// The collateral score (u32) for the asset
+    /// The collateral score (u32) for the asset, or [`NO_LIFECYCLE_HISTORY_SCORE`]
+    /// if the asset has never had a maintenance record submitted. This sentinel lets
+    /// callers distinguish a brand-new asset from one with an actual score of 0.
     ///
     /// # Panics
     /// - [`ContractError::AssetNotFound`] if the asset does not exist
@@ -2135,6 +2305,19 @@ impl AssetRegistry {
             &env,
             soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(&asset_id, &env)
         ];
+
+        // A fresh asset with no maintenance history at all must be reported with the
+        // sentinel rather than the raw score, which would otherwise read as 0 and be
+        // indistinguishable from a poorly-maintained (also-0) asset.
+        let last_service: Option<u64> = env.invoke_contract(
+            &lifecycle_contract,
+            &Symbol::new(&env, "get_last_service_timestamp"),
+            args.clone(),
+        );
+        if last_service.is_none() {
+            return NO_LIFECYCLE_HISTORY_SCORE;
+        }
+
         let score: u32 = env.invoke_contract(
             &lifecycle_contract,
             &Symbol::new(&env, "get_collateral_score"),
@@ -2195,6 +2378,96 @@ impl AssetRegistry {
             &lifecycle_contract,
             &Symbol::new(&env, "decommission_notify"),
             args,
+        );
+    }
+
+    /// Set the lending contract address that is authorized to lock and unlock assets.
+    pub fn set_lending_contract(env: Env, admin: Address, lending_addr: Address) {
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if require_admin(&admin, &stored_admin).is_err() {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        env.storage().instance().set(&LENDING_CONTRACT_KEY, &lending_addr);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
+    }
+
+    /// Return the currently configured lending contract, if one has been set.
+    pub fn get_lending_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&LENDING_CONTRACT_KEY)
+    }
+
+    /// Lock an asset as collateral under the configured lending contract.
+    pub fn lock_asset_as_collateral(env: Env, lender: Address, asset_id: u64, loan_id: u64) {
+        ensure_not_paused(&env);
+        lender.require_auth();
+
+        let registered_lender: Address = env
+            .storage()
+            .instance()
+            .get(&LENDING_CONTRACT_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::LendingContractNotSet));
+        if lender != registered_lender {
+            panic_with_error!(&env, ContractError::UnauthorizedLender);
+        }
+
+        let mut asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+        if asset.is_locked {
+            panic_with_error!(&env, ContractError::AssetLocked);
+        }
+
+        asset.is_locked = true;
+        asset.lender = Some(lender.clone());
+        asset.loan_id = Some(loan_id);
+
+        env.storage().persistent().set(&asset_key(asset_id), &asset);
+        extend_persistent_ttl(&env, &asset_key(asset_id));
+
+        env.events().publish(
+            (symbol_short!("LOCK"), asset_id),
+            (lender, loan_id, env.ledger().timestamp()),
+        );
+    }
+
+    /// Unlock an asset from collateral after the loan is repaid.
+    pub fn unlock_asset_from_collateral(env: Env, lender: Address, asset_id: u64, loan_id: u64) {
+        ensure_not_paused(&env);
+        lender.require_auth();
+
+        let registered_lender: Address = env
+            .storage()
+            .instance()
+            .get(&LENDING_CONTRACT_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::LendingContractNotSet));
+        if lender != registered_lender {
+            panic_with_error!(&env, ContractError::UnauthorizedLender);
+        }
+
+        let mut asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+        if !asset.is_locked {
+            panic_with_error!(&env, ContractError::AssetNotLocked);
+        }
+        if asset.loan_id != Some(loan_id) {
+            panic_with_error!(&env, ContractError::LoanIdMismatch);
+        }
+
+        asset.is_locked = false;
+        asset.lender = None;
+        asset.loan_id = None;
+
+        env.storage().persistent().set(&asset_key(asset_id), &asset);
+        extend_persistent_ttl(&env, &asset_key(asset_id));
+
+        env.events().publish(
+            (symbol_short!("UNLOCK"), asset_id),
+            (lender, loan_id, env.ledger().timestamp()),
         );
     }
 
@@ -2470,8 +2743,6 @@ mod lifecycle {
 
 #[cfg(test)]
 mod tests {
-    extern crate std;
-    use std::format;
     use super::*;
     use soroban_sdk::testutils::storage::Instance as _;
     use soroban_sdk::testutils::storage::Persistent;
@@ -2674,6 +2945,48 @@ mod tests {
 
         let result =
             client.try_register_asset(&symbol_short!("GENSET"), &metadata, &serial, &owner);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::DuplicateAsset as u32
+            )))
+        );
+    }
+
+    /// Closes #1067 — the owner+metadata dedup key must reject a duplicate even
+    /// when the serial number differs, proving this check is independent from
+    /// (and not merely a side effect of) the serial-number dedup check.
+    #[test]
+    fn test_register_asset_same_owner_metadata_different_serial_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let metadata = String::from_str(&env, "CAT-3516-SAME-METADATA");
+
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &metadata,
+            &String::from_str(&env, "SN-FIRST-001"),
+            &owner,
+        );
+        assert_eq!(id, 1);
+
+        // Same owner + same metadata, but a distinct serial number: the
+        // secondary (owner, asset_type, metadata_hash) dedup key must still
+        // reject this as a duplicate asset.
+        let result = client.try_register_asset(
+            &symbol_short!("GENSET"),
+            &metadata,
+            &String::from_str(&env, "SN-SECOND-002"),
+            &owner,
+        );
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -3125,6 +3438,37 @@ mod tests {
     }
 
     #[test]
+    fn test_update_metadata_restamps_on_every_update() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Spec v1"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        env.ledger().with_mut(|li| li.timestamp += 500);
+        client.update_asset_metadata(&id, &owner, &String::from_str(&env, "Spec v2"));
+        let first = client.get_asset(&id).metadata_updated_at;
+
+        env.ledger().with_mut(|li| li.timestamp += 700);
+        client.update_asset_metadata(&id, &owner, &String::from_str(&env, "Spec v3"));
+        let second = client.get_asset(&id).metadata_updated_at;
+
+        assert_eq!(second, env.ledger().timestamp());
+        assert!(second > first);
+    }
+
+    #[test]
     fn test_update_metadata_emits_event() {
         let env = Env::default();
         env.mock_all_auths();
@@ -3363,6 +3707,130 @@ mod tests {
                 ContractError::AssetNotFound as u32,
             ))),
         );
+    }
+
+    // ── issue #1021: get_asset_metadata_history (paginated) ───────────────
+
+    fn setup_asset_with_history(env: &Env) -> (AssetRegistryClient, u64) {
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(env, &contract_id);
+
+        let admin = Address::generate(env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(env, "Original metadata"),
+            &String::from_str(env, "SN-HIST-001"),
+            &owner,
+        );
+
+        // Add 5 metadata updates to build history
+        for i in 0..5u32 {
+            let new_meta = String::from_str(env, &format!("Updated metadata v{}", i + 1));
+            client.update_asset_metadata(&id, &owner, &new_meta);
+        }
+
+        (client, id)
+    }
+
+    #[test]
+    fn test_get_asset_metadata_history_first_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, id) = setup_asset_with_history(&env);
+
+        // Get first 3 entries
+        let page = client.get_asset_metadata_history(&id, &0u32, &3u32);
+        assert_eq!(page.len(), 3, "First page should have 3 entries");
+    }
+
+    #[test]
+    fn test_get_asset_metadata_history_second_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, id) = setup_asset_with_history(&env);
+
+        // Get entries 3-5 (offset=3, limit=3 → only 2 remain)
+        let page = client.get_asset_metadata_history(&id, &3u32, &3u32);
+        assert_eq!(page.len(), 2, "Second page should have 2 remaining entries");
+    }
+
+    #[test]
+    fn test_get_asset_metadata_history_offset_beyond_end_returns_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, id) = setup_asset_with_history(&env);
+
+        let page = client.get_asset_metadata_history(&id, &100u32, &10u32);
+        assert_eq!(page.len(), 0, "Offset beyond history length returns empty");
+    }
+
+    #[test]
+    fn test_get_asset_metadata_history_zero_limit_returns_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, id) = setup_asset_with_history(&env);
+
+        let page = client.get_asset_metadata_history(&id, &0u32, &0u32);
+        assert_eq!(page.len(), 0, "Zero limit returns empty");
+    }
+
+    #[test]
+    fn test_get_asset_metadata_history_limit_capped_at_100() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, id) = setup_asset_with_history(&env);
+
+        // Limit of 1000 is capped to 100; only 5 entries exist so we get 5
+        let page = client.get_asset_metadata_history(&id, &0u32, &1000u32);
+        assert_eq!(
+            page.len(),
+            5,
+            "Limit is capped to 100, returns all available entries"
+        );
+    }
+
+    #[test]
+    fn test_get_asset_metadata_history_nonexistent_asset_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let result = client.try_get_asset_metadata_history(&999u64, &0u32, &10u32);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetNotFound as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_get_asset_metadata_history_entries_ordered_oldest_first() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, id) = setup_asset_with_history(&env);
+
+        // All 5 entries, check version increments (oldest = version 1)
+        let all = client.get_asset_metadata_history(&id, &0u32, &10u32);
+        assert_eq!(all.len(), 5);
+        // Versions should be monotonically increasing (oldest first)
+        for i in 0..all.len() - 1 {
+            assert!(
+                all.get(i).unwrap().version < all.get(i + 1).unwrap().version,
+                "Entries should be ordered oldest-first by version"
+            );
+        }
     }
 
     #[test]
@@ -5672,8 +6140,8 @@ mod tests {
         // Get lifecycle score via cross-contract call
         let score = asset_client.get_lifecycle_score(&asset_id, &lifecycle_id);
 
-        // Score should be a valid u32 (initially 0 for new asset)
-        assert_eq!(score, 0);
+        // A fresh asset with no maintenance history returns the sentinel, not 0.
+        assert_eq!(score, NO_LIFECYCLE_HISTORY_SCORE);
     }
 
     #[test]
@@ -8170,5 +8638,100 @@ mod tests {
 
         client.mark_maintenance_complete(&admin, &asset_id);
         assert_eq!(client.asset_status(&asset_id), AssetStatus::Active);
+    }
+
+    // ---------------------------------------------------------
+    // #1014 — get_asset_by_serial_number
+    // ---------------------------------------------------------
+
+    /// Happy path: register an asset with a known serial number, then look it
+    /// up via `get_asset_by_serial_number` and verify the returned record
+    /// matches what was registered.
+    #[test]
+    fn test_get_asset_by_serial_number_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let serial = String::from_str(&env, "SN-ABC-001");
+        let metadata = String::from_str(&env, "Caterpillar 3516 Generator");
+
+        let asset_id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &metadata,
+            &serial,
+            &owner,
+        );
+
+        // Look up by serial number — must return the same asset.
+        let result = client.get_asset_by_serial_number(&serial);
+        assert!(result.is_some());
+        let asset = result.unwrap();
+        assert_eq!(asset.asset_id, asset_id);
+        assert_eq!(asset.serial_number, serial);
+        assert_eq!(asset.owner, owner);
+        assert_eq!(asset.asset_type, symbol_short!("GENSET"));
+    }
+
+    /// Unknown serial number must return `None` (no panic).
+    #[test]
+    fn test_get_asset_by_serial_number_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+
+        let unknown = String::from_str(&env, "DOES-NOT-EXIST-9999");
+        let result = client.get_asset_by_serial_number(&unknown);
+        assert!(result.is_none());
+    }
+
+    /// Two distinct assets with different serial numbers must each resolve to
+    /// their own record independently.
+    #[test]
+    fn test_get_asset_by_serial_number_multiple_assets() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("TURBINE"));
+
+        let owner = Address::generate(&env);
+        let serial_a = String::from_str(&env, "SN-TURB-001");
+        let serial_b = String::from_str(&env, "SN-TURB-002");
+
+        let id_a = client.register_asset(
+            &symbol_short!("TURBINE"),
+            &String::from_str(&env, "GE LM2500 unit A"),
+            &serial_a,
+            &owner,
+        );
+        let id_b = client.register_asset(
+            &symbol_short!("TURBINE"),
+            &String::from_str(&env, "GE LM2500 unit B"),
+            &serial_b,
+            &owner,
+        );
+
+        let asset_a = client.get_asset_by_serial_number(&serial_a).unwrap();
+        let asset_b = client.get_asset_by_serial_number(&serial_b).unwrap();
+
+        assert_eq!(asset_a.asset_id, id_a);
+        assert_eq!(asset_b.asset_id, id_b);
+        assert_ne!(asset_a.asset_id, asset_b.asset_id);
+        assert_eq!(asset_a.serial_number, serial_a);
+        assert_eq!(asset_b.serial_number, serial_b);
     }
 }

@@ -85,7 +85,7 @@ pub fn get_task_weight(env: &Env, task_type: &Symbol, config: &Config) -> u32 {
         || task_type == &symbol_short!("OVERHAUL")
         || task_type == &symbol_short!("REBUILD")
     {
-        return 10;
+        return super::MAX_BUILT_IN_TASK_WEIGHT;
     }
     panic_with_error!(env, ContractError::InvalidTaskType);
 }
@@ -140,11 +140,20 @@ pub fn compute_decay(env: &Env, asset_id: u64) -> u32 {
         };
         let base_score = config.score_increment as u64;
         let contribution = (base_score * recency_weight) / super::MAX_AGE_LEDGERS;
+
+        // The externally visible score is capped, so stop before adding a
+        // contribution that reaches or crosses the cap. Besides avoiding work
+        // over the remainder of a large history, this guarantees the summation
+        // cannot overflow even when score_increment is configured near u32::MAX.
+        if contribution >= (super::MAX_COLLATERAL_SCORE - total_score) as u64 {
+            return super::MAX_COLLATERAL_SCORE;
+        }
+
         total_score = total_score
             .checked_add(contribution as u32)
             .unwrap_or_else(|| panic_with_error!(env, ContractError::ScoreOverflow));
     }
-    total_score.min(100)
+    total_score
 }
 
 pub fn apply_decay(

@@ -12,7 +12,7 @@
 use engineer_registry::{
     CredentialStatus, EngineerRegistry, EngineerRegistryClient, EngineerStatus,
 };
-use soroban_sdk::{testutils::Address as _, testutils::Ledger, Address, BytesN, Env};
+use soroban_sdk::{testutils::Address as _, testutils::Ledger, Address, BytesN, Env, Symbol};
 
 #[test]
 fn test_engineer_credential_expiry_states() {
@@ -50,7 +50,7 @@ fn test_engineer_credential_expiry_states() {
         CredentialStatus::Valid
     );
     assert_eq!(
-        client.verify_engineer(&engineer),
+        client.verify_engineer(&engineer, &None::<Symbol>),
         CredentialStatus::Valid
     );
 
@@ -98,7 +98,7 @@ fn test_engineer_credential_expiry_states() {
     // 4. verify_engineer must reflect failure for a HardExpired credential.
     //    The credential is no longer Valid; is_engineer_active is false; the
     //    bounded legacy status (`get_engineer_status`) reports Expired.
-    let status_via_verify = client.verify_engineer(&engineer);
+    let status_via_verify = client.verify_engineer(&engineer, &None::<Symbol>);
     assert_ne!(status_via_verify, CredentialStatus::Valid);
     assert_ne!(status_via_verify, CredentialStatus::GracePeriod);
     assert_eq!(client.is_engineer_active(&engineer), false);

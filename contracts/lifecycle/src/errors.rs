@@ -36,25 +36,30 @@ pub enum ContractError {
     BatchTooLarge = 23,
     /// Fewer valid signers were provided than the configured admin_threshold requires.
     InsufficientSigners = 24,
+    /// A reentrant call was detected: the contract is already executing submit_maintenance.
+    Reentrancy = 25,
+    /// The admins list supplied to set_admin_quorum contains a duplicate address.
+    DuplicateAdmin = 26,
+    /// The requested health snapshot index does not exist for the given asset.
+    SnapshotNotFound = 27,
+    /// Fewer than 2 matching task-type records exist; cannot compute a prediction.
+    InsufficientPredictionData = 28,
+    /// A weight-change proposal already exists and has not been executed yet.
+    WeightProposalAlreadyExists = 29,
     /// Engineer's specialization does not match the asset's type.
-    SpecializationMismatch = 25,
+    SpecializationMismatch = 30,
     /// No recurring task exists with the given task_id for this asset.
-    RecurringTaskNotFound = 26,
+    RecurringTaskNotFound = 31,
     /// The recurring task exists but is not active.
-    RecurringTaskInactive = 27,
+    RecurringTaskInactive = 32,
     /// A recurring task with an equivalent schedule already exists for this asset.
-    DuplicateRecurringTask = 28,
+    DuplicateRecurringTask = 33,
     /// Recurring task interval_type/interval_value combination is invalid.
-    InvalidRecurringSchedule = 29,
+    InvalidRecurringSchedule = 34,
     /// No duplicate maintenance record exists with the given timestamp.
-    DuplicateRecordNotFound = 30,
+    DuplicateRecordNotFound = 35,
     /// A compliance standard is already registered for this asset type.
-    StandardAlreadyRegistered = 31,
-    /// Not enough historical data points to compute a prediction.
-    InsufficientPredictionData = 32,
-    /// Engineer has exceeded `max_submissions_per_hour` maintenance submissions
-    /// in the current rolling-hour window.
-    RateLimitExceeded = 33,
+    StandardAlreadyRegistered = 36,
 }
 
 impl From<SharedContractError> for ContractError {

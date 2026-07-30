@@ -37,7 +37,7 @@ fn test_loan_status_active() {
     let borrower = Address::generate(&env);
 
     client.initialize(&deployer, &admin, &token);
-    client.request_loan(&borrower, &1000u64);
+    client.request_loan(&borrower, &1000u64, &0u64);
 
     let status = client.loan_status(&borrower);
     assert_eq!(status, LoanStatus::Active);
@@ -57,7 +57,7 @@ fn test_loan_status_repaid() {
     let borrower = Address::generate(&env);
 
     client.initialize(&deployer, &admin, &token);
-    client.request_loan(&borrower, &1000u64);
+    client.request_loan(&borrower, &1000u64, &0u64);
 
     let status = client.loan_status(&borrower);
     assert_eq!(status, LoanStatus::Active);
@@ -82,7 +82,7 @@ fn test_loan_status_defaulted() {
     let borrower = Address::generate(&env);
 
     client.initialize(&deployer, &admin, &token);
-    client.request_loan(&borrower, &1000u64);
+    client.request_loan(&borrower, &1000u64, &0u64);
 
     let status = client.loan_status(&borrower);
     assert_eq!(status, LoanStatus::Active);

@@ -32,7 +32,7 @@ fn test_propose_admin_two_step_transfer() {
 
     // Verify new admin is now the admin by calling an admin function
     let borrower = Address::generate(&env);
-    client.request_loan(&borrower, &1000);
+    client.request_loan(&borrower, &1000, &0u64);
     client.pause(&new_admin);
 
     // Old admin should not be able to unpause
@@ -101,7 +101,7 @@ fn test_multiple_admin_transfers() {
 
     // Verify admin2 is now admin
     let borrower = Address::generate(&env);
-    client.request_loan(&borrower, &1000);
+    client.request_loan(&borrower, &1000, &0u64);
     client.pause(&admin2);
     client.unpause(&admin2);
 
