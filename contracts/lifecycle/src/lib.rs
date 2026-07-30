@@ -1160,6 +1160,17 @@ pub fn accept_admin(env: Env) {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
 
+        // Reject any list that contains duplicate addresses.  A duplicate
+        // would let a single admin accumulate multiple quorum votes by
+        // appearing at different positions in the list.  Fix #990.
+        for i in 0..new_admins.len() {
+            for j in (i + 1)..new_admins.len() {
+                if new_admins.get(i).unwrap() == new_admins.get(j).unwrap() {
+                    panic_with_error!(&env, ContractError::DuplicateAdmin);
+                }
+            }
+        }
+
         config.admins = new_admins.clone();
         config.admin_threshold = threshold;
         env.storage().persistent().set(&CONFIG, &config);
@@ -3912,9 +3923,20 @@ pub fn accept_admin(env: Env) {
     /// # Panics
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::AssetNotFound`] if the asset does not exist
+    /// - [`ContractError::AssetDecommissioned`] if the asset has been decommissioned
     pub fn take_health_snapshot(env: Env, asset_id: u64) -> HealthSnapshot {
         let asset_registry = get_asset_registry_addr(&env);
         verify_asset_exists(&env, &asset_registry, &asset_id);
+
+        // Reject snapshots for decommissioned assets: a decommissioned asset's
+        // health data is no longer current and must not appear as a valid health
+        // indicator to DeFi lenders.  Fix #989.
+        let asset_client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
+        let status = asset_client.asset_status(&asset_id);
+        use asset_registry::AssetStatus;
+        if status == AssetStatus::Decommissioned {
+            panic_with_error!(&env, ContractError::AssetDecommissioned);
+        }
 
         let score = {
             let stored: u32 = env.storage().persistent().get(&score_key(asset_id)).unwrap_or(0);
