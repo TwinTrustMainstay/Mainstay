@@ -112,6 +112,20 @@ name = "test_suspended_engineer_rejected"
 path = "test_suspended_engineer_rejected.rs"
 
 [[test]]
+name = "test_reputation_score"
+path = "test_reputation_score.rs"
+
+[[test]]
+name = "test_cancel_admin_proposal"
+path = "test_cancel_admin_proposal.rs"
+
+[[test]]
+name = "test_update_config"
+path = "test_update_config.rs"
+
+[[test]]
+name = "test_deprecation_warning"
+path = "test_deprecation_warning.rs"
 name = "test_issues_1010_1013"
 path = "test_issues_1010_1013.rs"
 

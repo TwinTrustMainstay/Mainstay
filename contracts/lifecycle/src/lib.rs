@@ -696,6 +696,7 @@ mod engineer_registry {
         fn verify_engineer(env: Env, engineer: Address, required_specialization: Option<Symbol>) -> CredentialStatus;
         fn batch_verify_engineers(env: Env, engineers: Vec<Address>) -> Vec<CredentialStatus>;
         fn get_reputation(env: Env, engineer: Address) -> u32;
+        fn update_reputation(env: Env, engineer: Address, delta: i32);
         fn get_credential_status(env: Env, engineer: Address) -> CredentialStatus;
         fn get_specializations(env: Env, engineer: Address) -> Vec<Symbol>;
     }
@@ -799,7 +800,98 @@ impl Lifecycle {
         crate::admin::update_engineer_registry(env, admin, new_registry);
     }
 
-    /// Owner-approved per-asset authorization for maintenance submissions.
+    /// Propose a full config update for the lifecycle contract.
+    /// The new config is stored pending execution after the timelock delay.
+    ///
+    /// # Arguments
+    /// * `admin`      - The current admin address
+    /// * `new_config` - The proposed replacement `Config`
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
+    /// - [`ContractError::InvalidConfig`] if any field in `new_config` is invalid
+    pub fn propose_update_config(env: Env, admin: Address, new_config: Config) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+        let current: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if current.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        // Validate all fields before storing the proposal.
+        if new_config.score_increment == 0 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+        if new_config.decay_interval == 0 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+        if new_config.eligibility_threshold == 0 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+        if new_config.max_notes_length == 0 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+        if new_config.admin_threshold > 0
+            && new_config.admin_threshold as u32 > new_config.admins.len()
+        {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+        // Store proposed config under a dedicated pending key.
+        let pending_key = symbol_short!("PEND_CFG");
+        env.storage().persistent().set(&pending_key, &new_config);
+        extend_persistent_ttl(&env, &pending_key);
+        // Register the timelock.
+        store_timelock(&env, symbol_short!("UPD_CFG"));
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("CFG_PROP")),
+            (admin, env.ledger().timestamp()),
+        );
+    }
+
+    /// Execute a pending full config update after the timelock delay has elapsed.
+    ///
+    /// # Arguments
+    /// * `admin` - The current admin address (must still match `config.admin`)
+    ///
+    /// # Panics
+    /// - [`ContractError::ProposalNotFound`] if no pending config proposal exists
+    /// - [`ContractError::TimelockNotExpired`] if the timelock has not yet elapsed
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
+    pub fn execute_update_config(env: Env, admin: Address) {
+        require_timelock_ready(&env, symbol_short!("UPD_CFG"));
+        admin.require_auth();
+        let current: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if current.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        let pending_key = symbol_short!("PEND_CFG");
+        let new_config: Config = env
+            .storage()
+            .persistent()
+            .get(&pending_key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ProposalNotFound));
+        env.storage().persistent().remove(&pending_key);
+        env.storage().persistent().set(&CONFIG, &new_config);
+        extend_persistent_ttl(&env, &CONFIG);
+        env.events().publish(
+            (symbol_short!("CONFIG_UPD"),),
+            (admin.clone(), env.ledger().timestamp()),
+        );
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("CONFIG_UPD")),
+            (admin, env.ledger().timestamp()),
+        );
+    }
+
+
     ///
     /// A verified engineer must also be explicitly authorized by the current asset owner
     /// before submitting maintenance for that asset.
@@ -1239,7 +1331,44 @@ impl Lifecycle {
         crate::admin::accept_admin(env);
     }
 
-    /// Admin-only function to configure the M-of-N multisig set for critical operations.
+    /// Cancel a pending admin transfer proposal.
+    /// Only the current admin can cancel. Clears the pending admin and its timelock entry.
+    ///
+    /// # Arguments
+    /// * `admin` - The current admin address (must match stored config admin)
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
+    /// - [`ContractError::ProposalNotFound`] if no pending admin proposal exists
+    pub fn cancel_admin_proposal(env: Env, admin: Address) {
+        admin.require_auth();
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if !env.storage().instance().has(&PENDING_ADMIN_KEY) {
+            panic_with_error!(&env, ContractError::ProposalNotFound);
+        }
+        env.storage().instance().remove(&PENDING_ADMIN_KEY);
+        // Also clear the admin-transfer timelock entry so it cannot be replayed.
+        let tl_key = timelock_key(symbol_short!("ADM_XFER"));
+        env.storage().persistent().remove(&tl_key);
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("ADM_CNCL")),
+            (admin.clone(), env.ledger().timestamp()),
+        );
+        env.events().publish(
+            (symbol_short!("ADM_CANCEL"),),
+            (admin,),
+        );
+    }
+
+
     ///
     /// Sets the list of co-signers and the minimum number of signatures required to execute
     /// `reset_score`, `pause`, and other protected admin operations. Passing an empty
@@ -1840,6 +1969,15 @@ impl Lifecycle {
             (asset_id, engineer.clone(), task_type, timestamp),
         );
 
+        // Increment the engineer's reputation score by 1 (clamped at 1000 inside the registry).
+        // We emit REP_UPD with old and new scores so indexers can track progression.
+        let old_rep = registry.get_reputation(&engineer);
+        registry.update_reputation(&engineer, 1);
+        let new_rep = registry.get_reputation(&engineer);
+        env.events().publish(
+            (symbol_short!("REP_UPD"), engineer.clone()),
+            (old_rep, new_rep),
+        );
         // #1022: Release reentrancy lock now that all state mutations and
         // cross-contract calls are complete.
         release_reentrancy_guard(&env);
@@ -2251,6 +2389,16 @@ impl Lifecycle {
             .persistent()
             .set(&last_update_key(asset_id), &timestamp);
         extend_persistent_ttl(&env, &last_update_key(asset_id));
+
+        // Increment the engineer's reputation score by 1 per record submitted in the batch.
+        let batch_len = records.len() as i32;
+        let old_rep = engineer_registry_client.get_reputation(&engineer);
+        engineer_registry_client.update_reputation(&engineer, batch_len);
+        let new_rep = engineer_registry_client.get_reputation(&engineer);
+        env.events().publish(
+            (symbol_short!("REP_UPD"), engineer.clone()),
+            (old_rep, new_rep),
+        );
     }
 
     /// Apply time-based decay to an asset's collateral score.
