@@ -7,15 +7,12 @@ mod types;
 use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
-    BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
-    ScoreEntry, TimelockProposal, TransferRecord,
+    BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, RecurringTask, ScoreEntry,
+    TimelockProposal, TransferRecord,
 };
 use shared::extend_persistent_ttl;
 use shared::validation::require_non_empty_vec;
-use shared::{
-    TIMELOCK_DELAY_SECS, DEFAULT_DECAY_INTERVAL_SECS, DEFAULT_TTL_LEDGERS, TTL_THRESHOLD,
-    TTL_TARGET,
-};
+use shared::{TIMELOCK_DELAY_SECS, DEFAULT_DECAY_INTERVAL_SECS, DEFAULT_TTL_LEDGERS};
 use soroban_sdk::{
     contract, contractimpl, panic_with_error, symbol_short, Address, Bytes, BytesN, Env, Map,
     String, Symbol, Vec,
@@ -34,10 +31,6 @@ const DEFAULT_DECAY_RATE: u32 = 5;
 const DEFAULT_DECAY_INTERVAL: u64 = DEFAULT_DECAY_INTERVAL_SECS;
 const DEFAULT_ELIGIBILITY_THRESHOLD: u32 = 50;
 const DEFAULT_MAX_NOTES_LENGTH: u32 = 256;
-/// Default per-engineer submission rate cap (0 = rate limiting disabled).
-const DEFAULT_MAX_SUBMISSIONS_PER_HOUR: u32 = 0;
-/// Width of the rolling window used by `check_engineer_submission_rate`.
-const SUBMISSION_WINDOW_SECS: u64 = 60 * 60;
 /// Hard cap on the number of records accepted in a single
 /// `batch_submit_maintenance` call.
 ///
@@ -50,6 +43,7 @@ const SUBMISSION_WINDOW_SECS: u64 = 60 * 60;
 /// for the cross-contract calls and per-record validation performed
 /// inside the batch path.
 pub const MAX_BATCH_SIZE: u32 = 50;
+const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
 /// Minimum score returned for an asset that has at least one maintenance record.
 /// Prevents decay from making a legitimately-maintained asset indistinguishable
 /// from one with no history at all.
@@ -70,7 +64,6 @@ const EVENT_XFER: Symbol = symbol_short!("XFER");
 const EVENT_PROP_ADMIN: Symbol = symbol_short!("PROP_ADM");
 const EVENT_ADMIN_SET: Symbol = symbol_short!("ADMIN_SET");
 const EVENT_PRUNED: Symbol = symbol_short!("PRUNED");
-const EVENT_RATE_LIMIT: Symbol = symbol_short!("RATE_LIM");
 
 fn history_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("HIST"), asset_id)
@@ -181,53 +174,6 @@ fn require_engineer_authorized(env: &Env, asset_id: u64, engineer: &Address) {
     if !authorized {
         panic_with_error!(env, ContractError::EngineerNotAuthorized);
     }
-}
-
-fn engineer_submission_window_key(engineer: &Address) -> DataKey {
-    DataKey::EngineerSubmissionWindow(engineer.clone())
-}
-
-/// Returns `true` if one more submission right now would still keep `engineer` within
-/// `max_per_hour` for the current rolling one-hour window. Does not mutate state.
-/// `max_per_hour == 0` means rate limiting is disabled (always `true`).
-fn engineer_within_submission_rate(env: &Env, engineer: &Address, max_per_hour: u32) -> bool {
-    if max_per_hour == 0 {
-        return true;
-    }
-    let now = env.ledger().timestamp();
-    let (window_start, count): (u64, u32) = env
-        .storage()
-        .persistent()
-        .get(&engineer_submission_window_key(engineer))
-        .unwrap_or((now, 0));
-
-    let count_in_window = if now.saturating_sub(window_start) >= SUBMISSION_WINDOW_SECS {
-        0
-    } else {
-        count
-    };
-    count_in_window < max_per_hour
-}
-
-/// Records one submission for `engineer` against its rolling one-hour window,
-/// rolling the window over if the previous one has expired.
-fn record_engineer_submission(env: &Env, engineer: &Address) {
-    let now = env.ledger().timestamp();
-    let key = engineer_submission_window_key(engineer);
-    let (window_start, count): (u64, u32) = env
-        .storage()
-        .persistent()
-        .get(&key)
-        .unwrap_or((now, 0));
-
-    let (new_window_start, new_count) = if now.saturating_sub(window_start) >= SUBMISSION_WINDOW_SECS {
-        (now, 1u32)
-    } else {
-        (window_start, count.saturating_add(1))
-    };
-
-    env.storage().persistent().set(&key, &(new_window_start, new_count));
-    extend_persistent_ttl(env, &key);
 }
 
 fn engineer_history_add(env: &Env, engineer: &Address, asset_id: u64, max_history: u32) {
@@ -955,7 +901,6 @@ impl Lifecycle {
             eligibility_threshold: DEFAULT_ELIGIBILITY_THRESHOLD,
             max_notes_length: DEFAULT_MAX_NOTES_LENGTH,
             task_weights: Map::new(&env),
-            max_submissions_per_hour: DEFAULT_MAX_SUBMISSIONS_PER_HOUR,
         };
         env.storage().persistent().set(&CONFIG, &config);
         extend_persistent_ttl(&env, &CONFIG);
@@ -1570,73 +1515,6 @@ pub fn accept_admin(env: Env) {
         );
     }
 
-    /// Admin-only function to set the maximum maintenance submissions a single engineer
-    /// may make within a rolling one-hour window. A single engineer submitting an
-    /// abnormally large number of records could indicate fraud or a runaway integration;
-    /// this cap lets operators bound that exposure.
-    ///
-    /// # Arguments
-    /// * `admin` - The admin address that must match the stored config admin
-    /// * `value` - Maximum submissions per rolling hour (`0` disables rate limiting)
-    ///
-    /// # Panics
-    /// - [`ContractError::NotInitialized`] if contract has not been initialized
-    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
-    pub fn set_max_submissions_per_hour(env: Env, admin: Address, value: u32) {
-        ensure_not_paused(&env);
-        admin.require_auth();
-
-        let mut config: Config = env
-            .storage()
-            .persistent()
-            .get(&CONFIG)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        if config.admin != admin {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
-
-        let old_value = config.max_submissions_per_hour;
-        config.max_submissions_per_hour = value;
-        env.storage().persistent().set(&CONFIG, &config);
-        extend_persistent_ttl(&env, &CONFIG);
-
-        env.events().publish(
-            (symbol_short!("SET_RLIM"), admin.clone()),
-            (old_value, value),
-        );
-        env.events().publish(
-            (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
-            (
-                admin,
-                env.ledger().timestamp(),
-                symbol_short!("RATE_LIM"),
-                value,
-            ),
-        );
-    }
-
-    /// Returns `true` if `engineer` has not yet reached `max_submissions_per_hour`
-    /// submissions within the current rolling one-hour window (i.e. one more
-    /// submission right now would still be allowed); `false` if they have.
-    ///
-    /// Rate limiting is advisory/detective rather than enforced at the protocol level:
-    /// `submit_maintenance` still records the submission and emits a `RATE_LIM` event
-    /// when this check fails, but does not reject the transaction, since Soroban events
-    /// from a reverted (panicking) call are never persisted — a hard block would make
-    /// the violation itself unobservable. Operators can act on the emitted event (e.g.
-    /// suspending the engineer) using existing admin tooling.
-    ///
-    /// When `max_submissions_per_hour` is `0` (the default), rate limiting is disabled
-    /// and this always returns `true`.
-    pub fn check_engineer_submission_rate(env: Env, engineer: Address) -> bool {
-        let config: Config = env
-            .storage()
-            .persistent()
-            .get(&CONFIG)
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        engineer_within_submission_rate(&env, &engineer, config.max_submissions_per_hour)
-    }
-
     /// Admin-only function to set a custom weight for a specific task type.
     /// Allows per-task-type score increment configuration. Falls back to defaults if not set.
     ///
@@ -1819,19 +1697,6 @@ pub fn accept_admin(env: Env) {
         }
 
         let timestamp = env.ledger().timestamp();
-
-        // Track this engineer's submission rate and flag anomalies (e.g. a compromised
-        // key or a runaway integration flooding the ledger with records). This is
-        // detective, not enforced: see `check_engineer_submission_rate` doc comment.
-        let within_rate_limit =
-            engineer_within_submission_rate(&env, &engineer, config.max_submissions_per_hour);
-        record_engineer_submission(&env, &engineer);
-        if !within_rate_limit {
-            env.events().publish(
-                (EVENT_RATE_LIMIT, engineer.clone()),
-                (asset_id, config.max_submissions_per_hour, timestamp),
-            );
-        }
 
         let record = MaintenanceRecord {
             asset_id,
@@ -12324,267 +12189,5 @@ mod tests {
         // Single admin can pause alone again
         lifecycle.pause(&admin);
         assert!(lifecycle.is_paused());
-    }
-
-    // --- Issue #1129: rate limiting per engineer for maintenance submission ---
-
-    #[test]
-    fn test_max_submissions_per_hour_disabled_by_default() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let (client, _, _, _) = setup(&env, 0);
-        assert_eq!(client.get_config().max_submissions_per_hour, 0);
-    }
-
-    #[test]
-    fn test_check_engineer_submission_rate_disabled_by_default_allows_many_submissions() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
-        let engineer = register_engineer(&env, &engineer_registry_client);
-        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
-
-        for _ in 0..10 {
-            client.submit_maintenance(
-                &asset_id,
-                &symbol_short!("OIL_CHG"),
-                &Priority::Low,
-                &String::from_str(&env, "Routine oil change"),
-                &engineer,
-                &None,
-            );
-        }
-
-        // max_submissions_per_hour is still 0 (disabled) so the engineer is always within rate.
-        assert!(client.check_engineer_submission_rate(&engineer));
-    }
-
-    #[test]
-    fn test_set_max_submissions_per_hour_updates_config() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let (client, _, _, admin) = setup(&env, 0);
-        client.set_max_submissions_per_hour(&admin, &5);
-        assert_eq!(client.get_config().max_submissions_per_hour, 5);
-    }
-
-    #[test]
-    fn test_set_max_submissions_per_hour_non_admin_rejected() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let (client, _, _, _) = setup(&env, 0);
-        let outsider = Address::generate(&env);
-        let result = client.try_set_max_submissions_per_hour(&outsider, &5);
-        assert_eq!(
-            result,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::UnauthorizedAdmin as u32
-            )))
-        );
-    }
-
-    #[test]
-    fn test_check_engineer_submission_rate_true_under_cap() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
-        let engineer = register_engineer(&env, &engineer_registry_client);
-        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
-        client.set_max_submissions_per_hour(&admin, &3);
-
-        for _ in 0..2 {
-            client.submit_maintenance(
-                &asset_id,
-                &symbol_short!("OIL_CHG"),
-                &Priority::Low,
-                &String::from_str(&env, "Routine oil change"),
-                &engineer,
-                &None,
-            );
-        }
-
-        // 2 submissions made, cap is 3 — one more is still allowed.
-        assert!(client.check_engineer_submission_rate(&engineer));
-    }
-
-    #[test]
-    fn test_check_engineer_submission_rate_false_once_cap_reached() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
-        let engineer = register_engineer(&env, &engineer_registry_client);
-        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
-        client.set_max_submissions_per_hour(&admin, &3);
-
-        for _ in 0..3 {
-            client.submit_maintenance(
-                &asset_id,
-                &symbol_short!("OIL_CHG"),
-                &Priority::Low,
-                &String::from_str(&env, "Routine oil change"),
-                &engineer,
-                &None,
-            );
-        }
-
-        // 3 submissions made and the cap is 3 — the engineer has reached the limit.
-        assert!(!client.check_engineer_submission_rate(&engineer));
-    }
-
-    #[test]
-    fn test_submit_maintenance_does_not_reject_once_rate_limit_exceeded() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
-        let engineer = register_engineer(&env, &engineer_registry_client);
-        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
-        client.set_max_submissions_per_hour(&admin, &1);
-
-        // Rate limiting here is detective, not enforced: submissions past the cap
-        // must still succeed so the resulting event is actually observable (a reverted
-        // transaction's events are never persisted).
-        for _ in 0..3 {
-            client.submit_maintenance(
-                &asset_id,
-                &symbol_short!("OIL_CHG"),
-                &Priority::Low,
-                &String::from_str(&env, "Routine oil change"),
-                &engineer,
-                &None,
-            );
-        }
-
-        assert_eq!(client.get_maintenance_history(&asset_id).len(), 3);
-    }
-
-    #[test]
-    fn test_submit_maintenance_emits_rate_limit_event_when_cap_exceeded() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        use soroban_sdk::TryIntoVal;
-
-        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
-        let engineer = register_engineer(&env, &engineer_registry_client);
-        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
-        client.set_max_submissions_per_hour(&admin, &2);
-
-        // First two submissions stay within the cap — no violation event.
-        for _ in 0..2 {
-            client.submit_maintenance(
-                &asset_id,
-                &symbol_short!("OIL_CHG"),
-                &Priority::Low,
-                &String::from_str(&env, "Routine oil change"),
-                &engineer,
-                &None,
-            );
-        }
-        let rate_limit_event_after_two = env.events().all().iter().find(|(_, topics, _)| {
-            topics.len() == 2
-                && topics
-                    .get(0)
-                    .and_then(|v| TryIntoVal::<_, Symbol>::try_into_val(&v, &env).ok())
-                    .map(|s: Symbol| s == EVENT_RATE_LIMIT)
-                    .unwrap_or(false)
-        });
-        assert!(
-            rate_limit_event_after_two.is_none(),
-            "no RATE_LIM event expected while within cap"
-        );
-
-        // Third submission crosses the cap of 2 — a violation event must be emitted.
-        client.submit_maintenance(
-            &asset_id,
-            &symbol_short!("OIL_CHG"),
-            &Priority::Low,
-            &String::from_str(&env, "Routine oil change"),
-            &engineer,
-            &None,
-        );
-        let events = env.events().all();
-        let rate_limit_event = events.iter().find(|(_, topics, _)| {
-            topics.len() == 2
-                && topics
-                    .get(0)
-                    .and_then(|v| TryIntoVal::<_, Symbol>::try_into_val(&v, &env).ok())
-                    .map(|s: Symbol| s == EVENT_RATE_LIMIT)
-                    .unwrap_or(false)
-        });
-        assert!(rate_limit_event.is_some(), "expected RATE_LIM event");
-
-        let (_, topics, data) = rate_limit_event.unwrap();
-        let emitted_engineer: Address = topics.get(1).unwrap().try_into_val(&env).unwrap();
-        assert_eq!(emitted_engineer, engineer);
-
-        let (emitted_asset_id, cap, _timestamp): (u64, u32, u64) =
-            data.try_into_val(&env).unwrap();
-        assert_eq!(emitted_asset_id, asset_id);
-        assert_eq!(cap, 2u32);
-    }
-
-    #[test]
-    fn test_rate_limit_window_resets_after_an_hour() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
-        let engineer = register_engineer(&env, &engineer_registry_client);
-        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
-        client.set_max_submissions_per_hour(&admin, &1);
-
-        client.submit_maintenance(
-            &asset_id,
-            &symbol_short!("OIL_CHG"),
-            &Priority::Low,
-            &String::from_str(&env, "Routine oil change"),
-            &engineer,
-            &None,
-        );
-        assert!(!client.check_engineer_submission_rate(&engineer));
-
-        // Advance past the one-hour window — the cap must roll over.
-        env.ledger().with_mut(|li| li.timestamp += SUBMISSION_WINDOW_SECS + 1);
-        assert!(client.check_engineer_submission_rate(&engineer));
-    }
-
-    #[test]
-    fn test_rate_limit_is_tracked_per_engineer_independently() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
-        let engineer_a = register_engineer(&env, &engineer_registry_client);
-        let engineer_b = register_engineer(&env, &engineer_registry_client);
-        client.authorize_engineer(&asset_owner, &asset_id, &engineer_a);
-        client.authorize_engineer(&asset_owner, &asset_id, &engineer_b);
-        client.set_max_submissions_per_hour(&admin, &1);
-
-        client.submit_maintenance(
-            &asset_id,
-            &symbol_short!("OIL_CHG"),
-            &Priority::Low,
-            &String::from_str(&env, "Routine oil change"),
-            &engineer_a,
-            &None,
-        );
-
-        // engineer_a has hit the cap, but engineer_b's independent window is untouched.
-        assert!(!client.check_engineer_submission_rate(&engineer_a));
-        assert!(client.check_engineer_submission_rate(&engineer_b));
     }
 }

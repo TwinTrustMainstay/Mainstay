@@ -12,20 +12,10 @@ pub struct TransferRecord {
 }
 
 #[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum Priority {
-    Critical = 0,
-    High = 1,
-    Medium = 2,
-    Low = 3,
-}
-
-#[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaintenanceRecord {
     pub asset_id: u64,
     pub task_type: Symbol,
-    pub priority: Priority,
     pub notes: String,
     pub engineer: Address,
     pub timestamp: u64,
@@ -46,7 +36,6 @@ pub struct ScoreEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BatchRecord {
     pub task_type: Symbol,
-    pub priority: Priority,
     pub notes: String,
 }
 
@@ -67,9 +56,6 @@ pub struct Config {
     pub eligibility_threshold: u32,
     pub max_notes_length: u32,
     pub task_weights: Map<Symbol, u32>,
-    /// Maximum maintenance submissions a single engineer may make within a rolling
-    /// one-hour window. `0` disables rate limiting.
-    pub max_submissions_per_hour: u32,
 }
 
 #[contracttype]
@@ -128,9 +114,4 @@ pub enum DataKey {
     RecurringTasks(u64),
     /// Stores duplicate maintenance record IDs per asset.
     DuplicateRecords(u64),
-    /// Stores `Vec<(u64, u64)>` (timestamp, value) collateral valuation history for an asset.
-    CollateralValuationHistory(u64),
-    /// Stores `(u64, u32)` (window_start_timestamp, submission_count) for an engineer's
-    /// current rolling one-hour submission window.
-    EngineerSubmissionWindow(Address),
 }
