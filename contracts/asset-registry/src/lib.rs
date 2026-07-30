@@ -336,6 +336,17 @@ fn serial_dedup_key(hash: &BytesN<32>) -> (Symbol, BytesN<32>) {
     (symbol_short!("SN_DEDUP"), hash.clone())
 }
 
+/// Serial-number lookup key for `get_asset_by_serial_number`.
+///
+/// This is the same underlying storage slot as `serial_dedup_key` — the
+/// deduplication map written during `register_asset` doubles as the reverse
+/// lookup index.  The helper is kept separate so call-sites are self-documenting.
+fn serial_number_lookup_key(env: &Env, serial: &String) -> (Symbol, BytesN<32>) {
+    let sn_bytes = serial.clone().to_xdr(env);
+    let hash: BytesN<32> = env.crypto().sha256(&sn_bytes).into();
+    serial_dedup_key(&hash)
+}
+
 /// Owner index key: owner → Vec<u64> of asset IDs.
 fn owner_index_key(owner: &Address) -> DataKey {
     DataKey::AssetsByOwner(owner.clone())
@@ -924,6 +935,45 @@ impl AssetRegistry {
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
         asset
+    }
+
+    /// Look up an asset by its physical serial number.
+    ///
+    /// Field engineers and auditors who know a machine's manufacturer plate number
+    /// can use this function to retrieve the full on-chain record without needing
+    /// to know the numeric `asset_id` in advance.
+    ///
+    /// The lookup is O(1): during `register_asset` a mapping of
+    /// `sha256(serial_number) → asset_id` is written to persistent storage under
+    /// the same key used for serial-number deduplication, so no additional storage
+    /// is required.
+    ///
+    /// # Arguments
+    /// * `serial` - The physical serial number string (case-sensitive, as registered)
+    ///
+    /// # Returns
+    /// `Some(Asset)` if an asset with that serial number exists; `None` otherwise.
+    pub fn get_asset_by_serial_number(env: Env, serial: String) -> Option<Asset> {
+        let key = serial_number_lookup_key(&env, &serial);
+        // Resolve serial → asset_id using the dedup index written at registration time.
+        let asset_id: u64 = match env.storage().persistent().get(&key) {
+            Some(id) => id,
+            None => return None,
+        };
+        // Fetch the full Asset record.
+        let asset_key = asset_key(asset_id);
+        let asset: Asset = match env.storage().persistent().get(&asset_key) {
+            Some(a) => a,
+            None => return None,
+        };
+        // Extend TTL on both entries on read to keep the index alive.
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        env.storage()
+            .persistent()
+            .extend_ttl(&asset_key, TTL_THRESHOLD, TTL_TARGET);
+        Some(asset)
     }
 
     /// Check whether an asset with the given ID is present in the registry.
@@ -8406,5 +8456,100 @@ mod tests {
 
         client.mark_maintenance_complete(&admin, &asset_id);
         assert_eq!(client.asset_status(&asset_id), AssetStatus::Active);
+    }
+
+    // ---------------------------------------------------------
+    // #1014 — get_asset_by_serial_number
+    // ---------------------------------------------------------
+
+    /// Happy path: register an asset with a known serial number, then look it
+    /// up via `get_asset_by_serial_number` and verify the returned record
+    /// matches what was registered.
+    #[test]
+    fn test_get_asset_by_serial_number_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let serial = String::from_str(&env, "SN-ABC-001");
+        let metadata = String::from_str(&env, "Caterpillar 3516 Generator");
+
+        let asset_id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &metadata,
+            &serial,
+            &owner,
+        );
+
+        // Look up by serial number — must return the same asset.
+        let result = client.get_asset_by_serial_number(&serial);
+        assert!(result.is_some());
+        let asset = result.unwrap();
+        assert_eq!(asset.asset_id, asset_id);
+        assert_eq!(asset.serial_number, serial);
+        assert_eq!(asset.owner, owner);
+        assert_eq!(asset.asset_type, symbol_short!("GENSET"));
+    }
+
+    /// Unknown serial number must return `None` (no panic).
+    #[test]
+    fn test_get_asset_by_serial_number_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+
+        let unknown = String::from_str(&env, "DOES-NOT-EXIST-9999");
+        let result = client.get_asset_by_serial_number(&unknown);
+        assert!(result.is_none());
+    }
+
+    /// Two distinct assets with different serial numbers must each resolve to
+    /// their own record independently.
+    #[test]
+    fn test_get_asset_by_serial_number_multiple_assets() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("TURBINE"));
+
+        let owner = Address::generate(&env);
+        let serial_a = String::from_str(&env, "SN-TURB-001");
+        let serial_b = String::from_str(&env, "SN-TURB-002");
+
+        let id_a = client.register_asset(
+            &symbol_short!("TURBINE"),
+            &String::from_str(&env, "GE LM2500 unit A"),
+            &serial_a,
+            &owner,
+        );
+        let id_b = client.register_asset(
+            &symbol_short!("TURBINE"),
+            &String::from_str(&env, "GE LM2500 unit B"),
+            &serial_b,
+            &owner,
+        );
+
+        let asset_a = client.get_asset_by_serial_number(&serial_a).unwrap();
+        let asset_b = client.get_asset_by_serial_number(&serial_b).unwrap();
+
+        assert_eq!(asset_a.asset_id, id_a);
+        assert_eq!(asset_b.asset_id, id_b);
+        assert_ne!(asset_a.asset_id, asset_b.asset_id);
+        assert_eq!(asset_a.serial_number, serial_a);
+        assert_eq!(asset_b.serial_number, serial_b);
     }
 }
