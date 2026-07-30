@@ -1661,6 +1661,64 @@ impl AssetRegistry {
         history
     }
 
+    /// Retrieve a paginated slice of the metadata change history for an asset.
+    ///
+    /// Issue #1021 — auditors need to trace metadata evolution without querying
+    /// raw storage. This view function returns a bounded slice of
+    /// [`MetadataHistoryEntry`] records, ordered oldest-first, allowing callers
+    /// to page through the full history in chunks.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `offset`   - Zero-based index of the first entry to return
+    /// * `limit`    - Maximum number of entries to return (capped at 100)
+    ///
+    /// # Returns
+    /// `Vec<MetadataHistoryEntry>` — the requested slice, possibly shorter than
+    /// `limit` if fewer entries remain after `offset`.  Returns an empty vector
+    /// when `offset` ≥ total history length or no history exists.
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    pub fn get_asset_metadata_history(
+        env: Env,
+        asset_id: u64,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<MetadataHistoryEntry> {
+        if !Self::asset_exists(env.clone(), asset_id) {
+            panic_with_error!(&env, ContractError::AssetNotFound);
+        }
+
+        let key = metadata_history_key(asset_id);
+        let history: Vec<MetadataHistoryEntry> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        }
+
+        // Cap the page size to 100 to prevent excessive per-call compute cost.
+        let capped_limit = limit.min(100);
+
+        let total = history.len();
+        if offset >= total || capped_limit == 0 {
+            return Vec::new(&env);
+        }
+
+        let end = (offset + capped_limit).min(total);
+        let mut page: Vec<MetadataHistoryEntry> = Vec::new(&env);
+        for i in offset..end {
+            page.push_back(history.get(i).unwrap());
+        }
+        page
+    }
+
     /// Transfer ownership of an asset from the current owner to a new owner.
     /// Only the current owner can initiate the transfer.
     ///
@@ -3363,6 +3421,130 @@ mod tests {
                 ContractError::AssetNotFound as u32,
             ))),
         );
+    }
+
+    // ── issue #1021: get_asset_metadata_history (paginated) ───────────────
+
+    fn setup_asset_with_history(env: &Env) -> (AssetRegistryClient, u64) {
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(env, &contract_id);
+
+        let admin = Address::generate(env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(env, "Original metadata"),
+            &String::from_str(env, "SN-HIST-001"),
+            &owner,
+        );
+
+        // Add 5 metadata updates to build history
+        for i in 0..5u32 {
+            let new_meta = String::from_str(env, &format!("Updated metadata v{}", i + 1));
+            client.update_asset_metadata(&id, &owner, &new_meta);
+        }
+
+        (client, id)
+    }
+
+    #[test]
+    fn test_get_asset_metadata_history_first_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, id) = setup_asset_with_history(&env);
+
+        // Get first 3 entries
+        let page = client.get_asset_metadata_history(&id, &0u32, &3u32);
+        assert_eq!(page.len(), 3, "First page should have 3 entries");
+    }
+
+    #[test]
+    fn test_get_asset_metadata_history_second_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, id) = setup_asset_with_history(&env);
+
+        // Get entries 3-5 (offset=3, limit=3 → only 2 remain)
+        let page = client.get_asset_metadata_history(&id, &3u32, &3u32);
+        assert_eq!(page.len(), 2, "Second page should have 2 remaining entries");
+    }
+
+    #[test]
+    fn test_get_asset_metadata_history_offset_beyond_end_returns_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, id) = setup_asset_with_history(&env);
+
+        let page = client.get_asset_metadata_history(&id, &100u32, &10u32);
+        assert_eq!(page.len(), 0, "Offset beyond history length returns empty");
+    }
+
+    #[test]
+    fn test_get_asset_metadata_history_zero_limit_returns_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, id) = setup_asset_with_history(&env);
+
+        let page = client.get_asset_metadata_history(&id, &0u32, &0u32);
+        assert_eq!(page.len(), 0, "Zero limit returns empty");
+    }
+
+    #[test]
+    fn test_get_asset_metadata_history_limit_capped_at_100() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, id) = setup_asset_with_history(&env);
+
+        // Limit of 1000 is capped to 100; only 5 entries exist so we get 5
+        let page = client.get_asset_metadata_history(&id, &0u32, &1000u32);
+        assert_eq!(
+            page.len(),
+            5,
+            "Limit is capped to 100, returns all available entries"
+        );
+    }
+
+    #[test]
+    fn test_get_asset_metadata_history_nonexistent_asset_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let result = client.try_get_asset_metadata_history(&999u64, &0u32, &10u32);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetNotFound as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_get_asset_metadata_history_entries_ordered_oldest_first() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, id) = setup_asset_with_history(&env);
+
+        // All 5 entries, check version increments (oldest = version 1)
+        let all = client.get_asset_metadata_history(&id, &0u32, &10u32);
+        assert_eq!(all.len(), 5);
+        // Versions should be monotonically increasing (oldest first)
+        for i in 0..all.len() - 1 {
+            assert!(
+                all.get(i).unwrap().version < all.get(i + 1).unwrap().version,
+                "Entries should be ordered oldest-first by version"
+            );
+        }
     }
 
     #[test]

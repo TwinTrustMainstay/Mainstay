@@ -36,6 +36,8 @@ pub enum ContractError {
     BatchTooLarge = 23,
     /// Fewer valid signers were provided than the configured admin_threshold requires.
     InsufficientSigners = 24,
+    /// A reentrant call was detected: the contract is already executing submit_maintenance.
+    Reentrancy = 25,
 }
 
 impl From<SharedContractError> for ContractError {

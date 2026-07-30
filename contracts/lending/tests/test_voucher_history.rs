@@ -41,7 +41,7 @@ fn test_voucher_history_single_vouch() {
     let token_client = token::Client::new(&env, &token_id);
     token_client.mint(&token_admin, &voucher, &1000);
 
-    client.request_loan(&borrower, &100);
+    client.request_loan(&borrower, &100, &0u64);
     client.vouch(&borrower, &voucher, &100);
 
     let history = client.voucher_history(&voucher);
@@ -62,10 +62,10 @@ fn test_voucher_history_multiple_borrowers() {
     let token_client = token::Client::new(&env, &token_id);
     token_client.mint(&token_admin, &voucher, &10000);
 
-    client.request_loan(&borrower1, &100);
+    client.request_loan(&borrower1, &100, &0u64);
     client.vouch(&borrower1, &voucher, &100);
 
-    client.request_loan(&borrower2, &200);
+    client.request_loan(&borrower2, &200, &0u64);
     client.vouch(&borrower2, &voucher, &200);
 
     let history = client.voucher_history(&voucher);
@@ -88,7 +88,7 @@ fn test_voucher_history_multiple_vouchers() {
     token_client.mint(&token_admin, &voucher1, &10000);
     token_client.mint(&token_admin, &voucher2, &10000);
 
-    client.request_loan(&borrower, &100);
+    client.request_loan(&borrower, &100, &0u64);
     client.vouch(&borrower, &voucher1, &100);
     client.vouch(&borrower, &voucher2, &100);
 

@@ -25,6 +25,11 @@ const ENG_REGISTRY: Symbol = symbol_short!("ENG_REG");
 const CONFIG: Symbol = symbol_short!("CONFIG");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 const PENDING_ADMIN_KEY: Symbol = symbol_short!("PADMIN");
+/// Instance-storage key for the reentrancy lock used in `submit_maintenance`.
+/// Stored in *instance* storage so it persists only for the duration of the
+/// transaction and is automatically cleared when the invocation frame exits,
+/// but also explicitly cleared at the end of the guarded function (#1022).
+const REENTRANCY_LOCK: Symbol = symbol_short!("LOCKED");
 const DEFAULT_MAX_HISTORY: u32 = 200;
 const DEFAULT_SCORE_INCREMENT: u32 = 5;
 const DEFAULT_DECAY_RATE: u32 = 5;
@@ -260,6 +265,33 @@ fn ensure_not_paused(env: &Env) {
     if is_paused(env) {
         panic_with_error!(env, ContractError::Paused);
     }
+}
+
+/// Acquire the reentrancy lock for `submit_maintenance`.
+///
+/// Sets the `LOCKED` flag in instance storage. If the flag is already set
+/// (indicating a reentrant call), panics with [`ContractError::Reentrancy`].
+///
+/// # Issue #1022
+/// `submit_maintenance` makes cross-contract calls to the engineer registry and
+/// asset registry. A malicious registry contract could re-enter the lifecycle
+/// contract before state is committed, enabling double-writes to the maintenance
+/// history. This guard prevents that attack vector.
+fn acquire_reentrancy_guard(env: &Env) {
+    if env
+        .storage()
+        .instance()
+        .get::<_, bool>(&REENTRANCY_LOCK)
+        .unwrap_or(false)
+    {
+        panic_with_error!(env, ContractError::Reentrancy);
+    }
+    env.storage().instance().set(&REENTRANCY_LOCK, &true);
+}
+
+/// Release the reentrancy lock acquired by [`acquire_reentrancy_guard`].
+fn release_reentrancy_guard(env: &Env) {
+    env.storage().instance().remove(&REENTRANCY_LOCK);
 }
 
 fn require_admin(env: &Env, admin: &Address) {
@@ -1657,6 +1689,11 @@ pub fn accept_admin(env: Env) {
             env.events().publish((EVENT_PRUNED,), (asset_id, pruned));
         }
 
+        // #1022: Acquire reentrancy lock before cross-contract calls to prevent
+        // a malicious registry contract from re-entering submit_maintenance
+        // mid-execution and causing double-writes to maintenance history.
+        acquire_reentrancy_guard(&env);
+
         // Verify asset exists and is not decommissioned
         let asset_registry = get_asset_registry_addr(&env);
         verify_asset_exists(&env, &asset_registry, &asset_id);
@@ -1754,6 +1791,10 @@ pub fn accept_admin(env: Env) {
             (symbol_short!("maint"),),
             (asset_id, engineer.clone(), task_type, timestamp),
         );
+
+        // #1022: Release reentrancy lock now that all state mutations and
+        // cross-contract calls are complete.
+        release_reentrancy_guard(&env);
     }
 
     /// Record an ownership transfer in the asset's maintenance history.
@@ -12189,5 +12230,167 @@ mod tests {
         // Single admin can pause alone again
         lifecycle.pause(&admin);
         assert!(lifecycle.is_paused());
+    }
+
+    // ── issue #1022: reentrancy guard on submit_maintenance ───────────────
+
+    /// Verify that the reentrancy lock is NOT present before submit_maintenance is called.
+    /// This confirms the guard starts in a clean state.
+    #[test]
+    fn test_reentrancy_lock_not_set_initially() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let lifecycle_id = env.register(Lifecycle, ());
+        let asset_registry_id = env.register(AssetRegistry, ());
+        let engineer_registry_id = env.register(EngineerRegistry, ());
+        let admin = Address::generate(&env);
+
+        let lifecycle = LifecycleClient::new(&env, &lifecycle_id);
+        lifecycle.initialize(
+            &admin,
+            &asset_registry_id,
+            &engineer_registry_id,
+            &admin,
+            &200u32,
+        );
+
+        // The LOCKED instance key must not be set before any submit_maintenance call.
+        env.as_contract(&lifecycle_id, || {
+            let locked: bool = env
+                .storage()
+                .instance()
+                .get(&REENTRANCY_LOCK)
+                .unwrap_or(false);
+            assert!(!locked, "Reentrancy lock must be clear before submit_maintenance");
+        });
+    }
+
+    /// Simulated reentrancy attack: manually set the LOCKED flag (mimicking what a
+    /// malicious cross-contract call would do while submit_maintenance is executing),
+    /// then verify that a subsequent submit_maintenance call is rejected with
+    /// [`ContractError::Reentrancy`].
+    #[test]
+    fn test_reentrancy_attack_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let lifecycle_id = env.register(Lifecycle, ());
+        let asset_registry_id = env.register(AssetRegistry, ());
+        let engineer_registry_id = env.register(EngineerRegistry, ());
+        let admin = Address::generate(&env);
+
+        let lifecycle = LifecycleClient::new(&env, &lifecycle_id);
+        lifecycle.initialize(
+            &admin,
+            &asset_registry_id,
+            &engineer_registry_id,
+            &admin,
+            &200u32,
+        );
+
+        // Set up asset and engineer
+        let asset_registry = AssetRegistryClient::new(&env, &asset_registry_id);
+        let asset_admin = Address::generate(&env);
+        asset_registry.initialize_admin(&asset_admin, &asset_admin);
+        asset_registry.add_asset_type(&asset_admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = asset_registry.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Caterpillar 3516"),
+            &String::from_str(&env, "SN-REENT-001"),
+            &owner,
+        );
+
+        let engineer_registry = EngineerRegistryClient::new(&env, &engineer_registry_id);
+        let engineer = Address::generate(&env);
+        engineer_registry.register_engineer(
+            &engineer,
+            &BytesN::from_array(&env, &[0u8; 32]),
+            &admin,
+        );
+        engineer_registry.add_specialization(&engineer, &symbol_short!("GENSET"));
+        lifecycle.authorize_engineer(&owner, &asset_id, &engineer);
+
+        // Simulate the LOCKED flag being set (as if submit_maintenance is mid-execution
+        // and a malicious registry re-enters the lifecycle contract).
+        env.as_contract(&lifecycle_id, || {
+            env.storage().instance().set(&REENTRANCY_LOCK, &true);
+        });
+
+        // Attempt to call submit_maintenance while the lock is held → must be rejected.
+        let result = lifecycle.try_submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "Simulated reentrant call"),
+            &engineer,
+            &None,
+        );
+
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::Reentrancy as u32
+            ))),
+            "Reentrant submit_maintenance must be rejected with ContractError::Reentrancy"
+        );
+
+        // Clean up: remove the lock so subsequent tests are not affected.
+        env.as_contract(&lifecycle_id, || {
+            env.storage().instance().remove(&REENTRANCY_LOCK);
+        });
+    }
+
+    /// Verify that after a normal (non-reentrant) submit_maintenance call completes,
+    /// the reentrancy lock is cleared so subsequent calls are allowed.
+    #[test]
+    fn test_reentrancy_lock_cleared_after_submit_maintenance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, engineer_registry, admin) = setup(&env, 200);
+
+        let (asset_id, owner) = register_asset(&env, &asset_registry);
+        let engineer = Address::generate(&env);
+        engineer_registry.register_engineer(
+            &engineer,
+            &BytesN::from_array(&env, &[0u8; 32]),
+            &admin,
+        );
+        engineer_registry.add_specialization(&engineer, &symbol_short!("GENSET"));
+        lifecycle.authorize_engineer(&owner, &asset_id, &engineer);
+
+        // First submit_maintenance call
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "First maintenance"),
+            &engineer,
+            &None,
+        );
+
+        // After the call completes, the lock must be cleared.
+        let lifecycle_id = lifecycle.address.clone();
+        env.as_contract(&lifecycle_id, || {
+            let locked: bool = env
+                .storage()
+                .instance()
+                .get(&REENTRANCY_LOCK)
+                .unwrap_or(false);
+            assert!(!locked, "Reentrancy lock must be cleared after submit_maintenance");
+        });
+
+        // Second submit_maintenance call must also succeed (lock was released).
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "Second maintenance"),
+            &engineer,
+            &None,
+        );
     }
 }

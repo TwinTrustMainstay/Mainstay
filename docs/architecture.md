@@ -206,6 +206,40 @@ All three contracts use Soroban persistent storage and extend TTL by 518,400 led
 
 ---
 
+## Security Patterns
+
+### Reentrancy Guard on `submit_maintenance` (#1022)
+
+`submit_maintenance` in the Lifecycle contract makes cross-contract calls to the **Asset Registry** (to verify the asset exists and check its status) and the **Engineer Registry** (to verify the engineer's credential and specialization). A malicious registry contract could theoretically re-enter the Lifecycle contract while `submit_maintenance` is still executing — before state is committed — and write duplicate entries to the maintenance history.
+
+To prevent this, `submit_maintenance` uses a **reentrancy lock** stored in Soroban *instance* storage:
+
+```
+LOCKED key (instance storage) = true
+  ↓
+cross-contract calls (asset-registry, engineer-registry)
+  ↓
+state writes (history, score, last_update)
+  ↓
+LOCKED key removed
+```
+
+**Implementation details:**
+- The lock is stored under the symbol key `"LOCKED"` in **instance storage** (not persistent), so it does not persist across transactions or incur TTL extension costs.
+- `acquire_reentrancy_guard()` checks the flag; if already set, panics with `ContractError::Reentrancy` (discriminant 25).
+- `release_reentrancy_guard()` removes the flag unconditionally at the end of the function.
+- The lock is acquired **before** the first cross-contract call and released **after** all state writes and the final event emission.
+- `batch_submit_maintenance` does not currently apply the per-call guard (each element calls internal logic directly); the guard is intentionally scoped to the public `submit_maintenance` entry point.
+
+**Attack scenario prevented:**
+1. Attacker deploys a malicious contract at the engineer registry address.
+2. Attacker calls `submit_maintenance` on the Lifecycle contract.
+3. During the engineer credential check, the malicious registry re-invokes `submit_maintenance`.
+4. Without the guard, the second invocation would execute against the un-committed first write, allowing double-writes to maintenance history.
+5. With the guard, step 4 panics immediately with `ContractError::Reentrancy`.
+
+---
+
 ## Further Reading
 
 - [Life-Cycle Contract Design](lifecycle-contract.md)

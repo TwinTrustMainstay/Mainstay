@@ -193,7 +193,7 @@ fn test_depin_to_defi_flow() {
     assert_eq!(vouches.get(0).unwrap().stake, 5000);
 
     // Request loan
-    lending.request_loan(&borrower, &10000);
+    lending.request_loan(&borrower, &10000, &0u64);
 
     // ============================================================================
     // STEP 5: Assert loan is disbursed successfully
