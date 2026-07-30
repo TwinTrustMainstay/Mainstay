@@ -108,6 +108,14 @@ fn health_snapshot_key(asset_id: u64) -> (Symbol, u64) {
 fn transfer_hist_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("XFER_HIST"), asset_id)
 }
+
+/// Key for the list of currently-authorized engineer addresses for an asset.
+/// Used by `authorize_engineer`, `revoke_engineer_authorization`, and
+/// `get_authorized_engineers`.
+fn authorized_engineers_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("AUTH_ENGS"), asset_id)
+}
+
 fn revoke_eng_timelock_key(asset_id: u64, engineer: &Address) -> (Symbol, u64, Address) {
     (symbol_short!("RVK_TL"), asset_id, engineer.clone())
 }
@@ -709,6 +717,26 @@ impl Lifecycle {
         let key = engineer_auth_key(asset_id, &engineer);
         env.storage().persistent().set(&key, &true);
         extend_persistent_ttl(&env, &key);
+
+        // Maintain the per-asset authorized-engineers list (#1012).
+        let list_key = authorized_engineers_key(asset_id);
+        let mut list: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&list_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut already_present = false;
+        for addr in list.iter() {
+            if addr == engineer {
+                already_present = true;
+                break;
+            }
+        }
+        if !already_present {
+            list.push_back(engineer);
+            env.storage().persistent().set(&list_key, &list);
+            extend_persistent_ttl(&env, &list_key);
+        }
     }
 
     /// Revoke an engineer's owner-approved authorization for a specific asset.
@@ -846,6 +874,96 @@ impl Lifecycle {
                 }
             }
         }
+    }
+
+    // ─── Issue #1011 ──────────────────────────────────────────────────────────
+
+    /// Immediately revoke a single engineer's authorization for a specific asset.
+    ///
+    /// Unlike `propose_revoke_engineer_auth` / `execute_revoke_engineer_auth` this
+    /// function takes effect instantly — there is no timelock.  The asset owner
+    /// calls this when they need to remove an engineer's access right away (e.g.
+    /// after a trust violation or credential revocation).
+    ///
+    /// The engineer is removed from the per-asset authorized-engineers list so
+    /// that `get_authorized_engineers` reflects the change immediately.
+    ///
+    /// # Arguments
+    /// * `owner`     - The current owner of the asset; must sign this transaction.
+    /// * `asset_id`  - The unique identifier of the asset.
+    /// * `engineer`  - The engineer address whose authorization is being revoked.
+    ///
+    /// # Events
+    /// Emits `(REVOKE_AUTH, owner) → (asset_id, engineer, timestamp)`.
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`]   if the contract has not been initialized.
+    /// - [`ContractError::AssetNotFound`]    if the asset does not exist.
+    /// - [`ContractError::UnauthorizedOwner`] if the caller is not the asset owner.
+    pub fn revoke_engineer_authorization(
+        env: Env,
+        owner: Address,
+        asset_id: u64,
+        engineer: Address,
+    ) {
+        ensure_not_paused(&env);
+        owner.require_auth();
+
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+        let asset =
+            asset_registry::AssetRegistryClient::new(&env, &asset_registry).get_asset(&asset_id);
+        if asset.owner != owner {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        // Remove the per-engineer-per-asset auth flag.
+        env.storage()
+            .persistent()
+            .remove(&engineer_auth_key(asset_id, &engineer));
+
+        // Remove from the per-asset authorized-engineers list (#1012).
+        let list_key = authorized_engineers_key(asset_id);
+        if let Some(list) = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<Address>>(&list_key)
+        {
+            let mut new_list: Vec<Address> = Vec::new(&env);
+            for addr in list.iter() {
+                if addr != engineer {
+                    new_list.push_back(addr);
+                }
+            }
+            env.storage().persistent().set(&list_key, &new_list);
+            extend_persistent_ttl(&env, &list_key);
+        }
+
+        env.events().publish(
+            (symbol_short!("REVOKE_AUTH"), owner.clone()),
+            (asset_id, engineer.clone(), env.ledger().timestamp()),
+        );
+    }
+
+    // ─── Issue #1012 ──────────────────────────────────────────────────────────
+
+    /// Return the list of engineers currently authorized to submit maintenance
+    /// for a specific asset.
+    ///
+    /// The list is maintained by `authorize_engineer` (add) and
+    /// `revoke_engineer_authorization` (remove), and is also cleared by
+    /// `clear_engineer_authorizations` on ownership transfer.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset.
+    ///
+    /// # Returns
+    /// `Vec<Address>` of currently-authorized engineer addresses (may be empty).
+    pub fn get_authorized_engineers(env: Env, asset_id: u64) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&authorized_engineers_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Initialize the lifecycle contract with registry addresses and configuration.
@@ -1666,6 +1784,10 @@ pub fn accept_admin(env: Env) {
         if status == AssetStatus::Decommissioned {
             panic_with_error!(&env, ContractError::AssetDecommissioned);
         }
+        // Also block if the asset was decommissioned via lifecycle's decommission_asset (#1013).
+        if env.storage().persistent().get::<_, bool>(&frozen_key(asset_id)).unwrap_or(false) {
+            panic_with_error!(&env, ContractError::AssetDecommissioned);
+        }
 
         // Verify engineer credential via the engineer registry.
         let registry_id = get_engineer_registry_addr(&env);
@@ -2113,6 +2235,87 @@ pub fn accept_admin(env: Env) {
         // Reuse the standard decay calculation path, including history/last_update
         // updates and DECAY event emission.
         let _new_score = Self::decay_score(env, asset_id);
+    }
+
+    // ─── Issue #1013 ──────────────────────────────────────────────────────────
+
+    /// Permanently decommission an asset, freezing its collateral score and
+    /// blocking any further maintenance submissions or score decay.
+    ///
+    /// This is the owner-facing counterpart to the asset-registry-initiated
+    /// decommission path.  Once called:
+    ///
+    /// * `decay_score` / `apply_decay` become no-ops (returns 0).
+    /// * `submit_maintenance` panics with [`ContractError::AssetDecommissioned`].
+    /// * `get_collateral_score` returns the frozen score (0 after this call).
+    ///
+    /// The function mirrors what `decommission_notify` does when called by the
+    /// asset registry, but is callable directly by the asset owner without
+    /// requiring an on-chain asset-registry admin action.
+    ///
+    /// # Arguments
+    /// * `owner`    - The current owner of the asset; must sign this transaction.
+    /// * `asset_id` - The unique identifier of the asset to decommission.
+    ///
+    /// # Events
+    /// Emits `(DECOMM, asset_id) → 0u32` (frozen score).
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`]    if the contract has not been initialized.
+    /// - [`ContractError::AssetNotFound`]     if the asset does not exist.
+    /// - [`ContractError::UnauthorizedOwner`] if the caller is not the asset owner.
+    /// - [`ContractError::ScoreFrozen`]       if the asset is already decommissioned.
+    pub fn decommission_asset(env: Env, owner: Address, asset_id: u64) {
+        ensure_not_paused(&env);
+        owner.require_auth();
+
+        // Ensure contract is initialized.
+        env.storage()
+            .persistent()
+            .get::<_, Config>(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        // Verify the asset exists and the caller is the owner.
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+        let asset =
+            asset_registry::AssetRegistryClient::new(&env, &asset_registry).get_asset(&asset_id);
+        if asset.owner != owner {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        // Guard against double-decommission.
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&frozen_key(asset_id))
+            .unwrap_or(false)
+        {
+            panic_with_error!(&env, ContractError::ScoreFrozen);
+        }
+
+        // Freeze the score at 0 (decommissioned assets are worthless as collateral).
+        let zero_score: u32 = 0;
+        env.storage()
+            .persistent()
+            .set(&frozen_score_key(asset_id), &zero_score);
+        extend_persistent_ttl(&env, &frozen_score_key(asset_id));
+
+        // Zero out the live score key as well so every read path agrees.
+        env.storage()
+            .persistent()
+            .set(&score_key(asset_id), &zero_score);
+        extend_persistent_ttl(&env, &score_key(asset_id));
+
+        // Set the frozen flag — this is what `decay_score` and `submit_maintenance`
+        // check to bail out early.
+        env.storage()
+            .persistent()
+            .set(&frozen_key(asset_id), &true);
+        extend_persistent_ttl(&env, &frozen_key(asset_id));
+
+        env.events()
+            .publish((symbol_short!("DECOMM"), asset_id), zero_score);
     }
 
     /// Called by the asset registry when an asset is decommissioned.
@@ -3977,6 +4180,52 @@ pub fn accept_admin(env: Env) {
             .persistent()
             .get(&health_snapshot_key(asset_id))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    // ─── Issue #1010 ──────────────────────────────────────────────────────────
+
+    /// Return a paginated slice of the stored health snapshots for an asset.
+    ///
+    /// Snapshots are stored in chronological order (oldest first).  Callers can
+    /// walk through the full history by incrementing `offset` by `limit` on
+    /// each successive call.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The asset to query.
+    /// * `offset`   - Zero-based index of the first snapshot to return.
+    /// * `limit`    - Maximum number of snapshots to return per call.
+    ///               Passing `0` returns an empty `Vec`.
+    ///
+    /// # Returns
+    /// `Vec<HealthSnapshot>` containing at most `limit` entries starting at
+    /// `offset`.  Returns an empty `Vec` when `offset` is beyond the end of
+    /// the stored list or no snapshots exist.
+    pub fn get_health_snapshots_paginated(
+        env: Env,
+        asset_id: u64,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<HealthSnapshot> {
+        if limit == 0 {
+            return Vec::new(&env);
+        }
+        let all: Vec<HealthSnapshot> = env
+            .storage()
+            .persistent()
+            .get(&health_snapshot_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let total = all.len();
+        if offset >= total || total == 0 {
+            return Vec::new(&env);
+        }
+
+        let end = (offset + limit).min(total);
+        let mut page: Vec<HealthSnapshot> = Vec::new(&env);
+        for i in offset..end {
+            page.push_back(all.get(i).unwrap());
+        }
+        page
     }
 
     /// Predict the next service date for a given task type on an asset.

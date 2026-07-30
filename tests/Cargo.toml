@@ -70,3 +70,7 @@ path = "test_collateral_score_decay_intervals.rs"
 [[test]]
 name = "test_suspended_engineer_rejected"
 path = "test_suspended_engineer_rejected.rs"
+
+[[test]]
+name = "test_issues_1010_1013"
+path = "test_issues_1010_1013.rs"
