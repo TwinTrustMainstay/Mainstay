@@ -3203,8 +3203,14 @@ fn setup<'a>(env: &'a Env) -> (EngineerRegistryClient<'a>, Address) {
             batch.push_back(Address::generate(&env));
         }
 
-        let e1 = Address::generate(&env);
-        client.register_engineer(&e1, &BytesN::from_array(&env, &[1u8; 32]), &issuer, &31_536_000, &None);
+        let result = client.try_batch_revoke_credentials(&admin, &batch);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::BatchRevokeTooLarge as u32
+            )))
+        );
+    }
 
     #[test]
     fn test_suspend_with_past_timestamp_fails() {
@@ -3225,12 +3231,29 @@ fn setup<'a>(env: &'a Env) -> (EngineerRegistryClient<'a>, Address) {
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::InvalidSuspensionPeriod as u32
             )))
-    fn test_batch_revoke_credentials_non_admin_fails() {
+        );
+    }
+
+    #[test]
+    fn test_suspend_with_current_timestamp_fails() {
         let env = Env::default();
         env.mock_all_auths();
-        let (client, _admin) = setup(&env);
+        let (client, admin) = setup(&env);
+        let (_, engineer) = setup_suspended_engineer(&env, &client, &admin);
 
-        assert_eq!(client.get_reputation(&e1), 50);
+        env.ledger().set_timestamp(10_000);
+        // A suspension ending exactly now would be a no-op, so it must be rejected
+        let result = client.try_suspend_engineer(
+            &engineer,
+            &10_000,
+            &soroban_sdk::String::from_str(&env, "reason"),
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidSuspensionPeriod as u32
+            )))
+        );
     }
 
     #[test]
