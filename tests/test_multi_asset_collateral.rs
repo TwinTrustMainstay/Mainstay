@@ -135,6 +135,7 @@ fn authorize_and_maintain(
             &task_type,
             &String::from_str(env, "Scheduled maintenance"),
             engineer,
+            &None,
         );
     }
 }
@@ -309,7 +310,7 @@ fn test_collateral_score_decay() {
         &asset_id,
         &symbol_short!("ENGINE"),
         &String::from_str(&env, "Initial"),
-        &engineer,
+        &engineer, &None,
     );
     // Single task with rep=500 → 5 points
     assert_eq!(lifecycle.get_collateral_score(&asset_id), 5);
@@ -368,20 +369,20 @@ fn test_unauthorized_engineer_errors() {
 
     // Unregistered
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        lifecycle.submit_maintenance(&asset_id, &symbol_short!("ENGINE"), &String::from_str(&env, "Rogue"), &rogue);
+        lifecycle.submit_maintenance(&asset_id, &symbol_short!("ENGINE"), &String::from_str(&env, "Rogue"), &rogue, &None);
     })).is_err());
 
     // Registered but unauthorized
     let hash = BytesN::from_array(&env, &[9u8; 32]);
     eng_reg.register_engineer(&rogue, &hash, &issuer, &31_536_000, &None);
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        lifecycle.submit_maintenance(&asset_id, &symbol_short!("ENGINE"), &String::from_str(&env, "Unauth"), &rogue);
+        lifecycle.submit_maintenance(&asset_id, &symbol_short!("ENGINE"), &String::from_str(&env, "Unauth"), &rogue, &None);
     })).is_err());
 
     // Authorized → Ok
     lifecycle.authorize_engineer(&owner, &asset_id, &rogue);
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        lifecycle.submit_maintenance(&asset_id, &symbol_short!("ENGINE"), &String::from_str(&env, "Auth"), &rogue);
+        lifecycle.submit_maintenance(&asset_id, &symbol_short!("ENGINE"), &String::from_str(&env, "Auth"), &rogue, &None);
     })).is_ok());
 }
 
@@ -403,12 +404,12 @@ fn test_paused_contract_errors() {
     assert!(lifecycle.is_paused());
 
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        lifecycle.submit_maintenance(&asset_id, &symbol_short!("ENGINE"), &String::from_str(&env, "Paused"), &engineer);
+        lifecycle.submit_maintenance(&asset_id, &symbol_short!("ENGINE"), &String::from_str(&env, "Paused"), &engineer, &None);
     })).is_err());
 
     lifecycle.unpause(&admin);
     assert!(!lifecycle.is_paused());
-    lifecycle.submit_maintenance(&asset_id, &symbol_short!("ENGINE"), &String::from_str(&env, "Resumed"), &engineer);
+    lifecycle.submit_maintenance(&asset_id, &symbol_short!("ENGINE"), &String::from_str(&env, "Resumed"), &engineer, &None);
     assert_eq!(lifecycle.get_collateral_score(&asset_id), 5);
 }
 
@@ -460,10 +461,10 @@ fn test_multi_engineer_portfolio() {
     let id2 = register_asset(&env, &registry, symbol_short!("SOLAR"), &owner);
 
     lifecycle.authorize_engineer(&owner, &id1, &eng1);
-    lifecycle.submit_maintenance(&id1, &symbol_short!("ENGINE"), &String::from_str(&env, "E1"), &eng1);
+    lifecycle.submit_maintenance(&id1, &symbol_short!("ENGINE"), &String::from_str(&env, "E1"), &eng1, &None);
 
     lifecycle.authorize_engineer(&owner, &id2, &eng2);
-    lifecycle.submit_maintenance(&id2, &symbol_short!("ENGINE"), &String::from_str(&env, "E2"), &eng2);
+    lifecycle.submit_maintenance(&id2, &symbol_short!("ENGINE"), &String::from_str(&env, "E2"), &eng2, &None);
 
     assert_eq!(lifecycle.get_collateral_score(&id1), 5);
     assert_eq!(lifecycle.get_collateral_score(&id2), 5);
@@ -493,7 +494,7 @@ fn test_score_boundary_values() {
     // Score floor (1): single maintenance, deep decay
     let id_one = register_asset(&env, &registry, symbol_short!("WIND"), &owner);
     lifecycle.authorize_engineer(&owner, &id_one, &engineer);
-    lifecycle.submit_maintenance(&id_one, &symbol_short!("INSPECT"), &String::from_str(&env, "Minor"), &engineer);
+    lifecycle.submit_maintenance(&id_one, &symbol_short!("INSPECT"), &String::from_str(&env, "Minor"), &engineer, &None);
     env.ledger().set_timestamp(env.ledger().timestamp() + 2_592_000 * 10);
 
     // Score 50: threshold

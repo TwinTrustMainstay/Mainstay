@@ -1,0 +1,29 @@
+[package]
+name = "lifecycle-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.lifecycle]
+path = "../contracts/lifecycle"
+
+[dependencies.asset-registry]
+path = "../contracts/asset-registry"
+
+[dependencies.engineer-registry]
+path = "../contracts/engineer-registry"
+
+[dependencies.soroban-sdk]
+version = "22.0.0"
+features = ["testutils"]
+
+# Prevent this from being lifted into the parent workspace.
+[workspace]
+members = ["."]

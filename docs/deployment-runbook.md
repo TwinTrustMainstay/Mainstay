@@ -62,6 +62,29 @@ The Stellar Development Foundation (SDF) maintains the **Soroban Security Audit 
 - [ ] Regression tests added for all resolved findings
 
 ---
+### Recommended Audit Firms
+
+See [docs/audit-report.md](audit-report.md) for the full list of SDF-vetted Soroban audit firms, including:
+- **Certora** — Formal verification via *Certora Sunbeam* for Soroban WASM bytecode
+- **OtterSec** — Premier Rust/WASM security ($36B+ TVL secured)
+- **Veridise** — Audited Soroban Core; advanced static analysis via *AuditHub*
+- **Runtime Verification**, **ChainSecurity**, **Halborn**, **Oak Security**, **Zellic**
+
+SDF's **Soroban Security Audit Bank** may cover up to 100% of audit costs for eligible projects.
+
+### Pre-Audit Checklist
+- [ ] Finalize and freeze the contract codebase (tag a release candidate).
+- [ ] Run full test suite with coverage: `./scripts/test.sh`.
+- [ ] Run `cargo clippy` with all lints and resolve warnings.
+- [ ] Run `cargo audit` to check dependency vulnerabilities.
+- [ ] Complete internal threat modeling (STRIDE framework).
+- [ ] Verify deployment runbook initialization on testnet.
+
+### Required Actions
+- Engage a Soroban-specialized audit firm (see `docs/audit-report.md` §Recommended Audit Firms).
+- Address all audit findings before mainnet deployment.
+- Publish the final audit report in `docs/audit-report.md`.
+- Complete this deployment checklist after the audit is finished.
 
 ## 1. Build Contracts
 Compile all contracts to optimized WASM:

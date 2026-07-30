@@ -41,7 +41,7 @@ fn test_decay_score_clamps_at_zero_after_long_elapsed_time() {
     );
 
     let credential_hash = BytesN::from_array(&env, &[2u8; 32]);
-    engineer_registry.register_engineer(&engineer, &credential_hash, &issuer, &31_536_000);
+    engineer_registry.register_engineer(&engineer, &credential_hash, &issuer, &31_536_000, &None);
 
     lifecycle.authorize_engineer(&owner, &asset_id, &engineer);
 
@@ -51,7 +51,7 @@ fn test_decay_score_clamps_at_zero_after_long_elapsed_time() {
             &asset_id,
             &symbol_short!("ENGINE"),
             &String::from_str(&env, "overhaul"),
-            &engineer,
+            &engineer, &None,
         );
         env.ledger().set_timestamp(env.ledger().timestamp() + 1);
     }

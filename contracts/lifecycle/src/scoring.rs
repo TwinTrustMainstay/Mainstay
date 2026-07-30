@@ -24,46 +24,42 @@ pub fn score_history_push(env: &Env, asset_id: u64, entry: ScoreEntry, max_histo
             shared::extend_persistent_ttl(&env, &key);
             return;
         }
-        history.push_back(entry);
-        env.storage().persistent().set(&key, &history);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
     }
 
-    pub fn valuation_history_push(env: &Env, asset_id: u64, timestamp: u64, value: u64, max_history: u32) {
-        let key = DataKey::CollateralValuationHistory(asset_id);
-        let mut history: Vec<(u64, u64)> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| Vec::new(env));
-
-        let last_idx = history.len().saturating_sub(1);
-        if !history.is_empty() {
-            let last = history.get(last_idx).unwrap();
-            if last.0 == timestamp {
-                history.set(last_idx, (timestamp, value));
-                env.storage().persistent().set(&key, &history);
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
-                return;
-            }
-        }
-
-        if max_history > 0 && history.len() >= max_history {
-            history.remove(0);
-        }
-        history.push_back((timestamp, value));
-        env.storage().persistent().set(&key, &history);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
-    }
     history.push_back(entry);
     env.storage().persistent().set(&key, &history);
     shared::extend_persistent_ttl(&env, &key);
+}
+
+pub fn valuation_history_push(env: &Env, asset_id: u64, timestamp: u64, value: u64, max_history: u32) {
+    let key = DataKey::CollateralValuationHistory(asset_id);
+    let mut history: Vec<(u64, u64)> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+
+    let last_idx = history.len().saturating_sub(1);
+    if !history.is_empty() {
+        let last = history.get(last_idx).unwrap();
+        if last.0 == timestamp {
+            history.set(last_idx, (timestamp, value));
+            env.storage().persistent().set(&key, &history);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
+            return;
+        }
+    }
+
+    if max_history > 0 && history.len() >= max_history {
+        history.remove(0);
+    }
+    history.push_back((timestamp, value));
+    env.storage().persistent().set(&key, &history);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
 }
 
 pub fn get_task_weight(env: &Env, task_type: &Symbol, config: &Config) -> u32 {
@@ -89,7 +85,7 @@ pub fn get_task_weight(env: &Env, task_type: &Symbol, config: &Config) -> u32 {
         || task_type == &symbol_short!("OVERHAUL")
         || task_type == &symbol_short!("REBUILD")
     {
-        return 10;
+        return super::MAX_BUILT_IN_TASK_WEIGHT;
     }
     panic_with_error!(env, ContractError::InvalidTaskType);
 }
@@ -115,7 +111,26 @@ pub fn compute_decay(env: &Env, asset_id: u64) -> u32 {
     let current_ledger = current_time_seconds / 5;
     let mut total_score: u32 = 0;
 
+    // Load duplicate record timestamps for this asset and skip them during scoring
+    let duplicates: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::DuplicateRecords(asset_id))
+        .unwrap_or_else(|| Vec::new(env));
+
     for record in history.iter() {
+        // Skip records marked as duplicates
+        let mut is_duplicate = false;
+        for d in 0..duplicates.len() {
+            if duplicates.get(d).unwrap() == record.timestamp {
+                is_duplicate = true;
+                break;
+            }
+        }
+        if is_duplicate {
+            continue;
+        }
+
         let record_ledger = record.timestamp / 5;
         let age_ledgers = current_ledger.saturating_sub(record_ledger);
         let recency_weight = if age_ledgers >= super::MAX_AGE_LEDGERS {
@@ -125,11 +140,20 @@ pub fn compute_decay(env: &Env, asset_id: u64) -> u32 {
         };
         let base_score = config.score_increment as u64;
         let contribution = (base_score * recency_weight) / super::MAX_AGE_LEDGERS;
+
+        // The externally visible score is capped, so stop before adding a
+        // contribution that reaches or crosses the cap. Besides avoiding work
+        // over the remainder of a large history, this guarantees the summation
+        // cannot overflow even when score_increment is configured near u32::MAX.
+        if contribution >= (super::MAX_COLLATERAL_SCORE - total_score) as u64 {
+            return super::MAX_COLLATERAL_SCORE;
+        }
+
         total_score = total_score
             .checked_add(contribution as u32)
             .unwrap_or_else(|| panic_with_error!(env, ContractError::ScoreOverflow));
     }
-    total_score.min(100)
+    total_score
 }
 
 pub fn apply_decay(

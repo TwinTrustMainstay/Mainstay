@@ -2,6 +2,7 @@
 
 use shared::error::SharedContractError;
 use shared::extend_persistent_ttl;
+use shared::{TTL_THRESHOLD, TTL_TARGET};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
     Address, Env, Symbol, Vec,
@@ -45,6 +46,13 @@ pub enum ContractError {
     VouchWithdrawNotAllowed = 15,
     /// Caller is not the authorized borrower for this loan.
     UnauthorizedBorrower = 16,
+    /// An identical lien (same asset + lender + loan_id) already exists.
+    LienAlreadyExists = 17,
+    /// No matching lien exists for the given asset, lender, and loan_id.
+    /// A lien with the same asset, lender, and loan_id already exists.
+    LienAlreadyExists = 17,
+    /// No matching lien found for the given asset, lender, and loan_id.
+    LienNotFound = 18,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -78,6 +86,7 @@ pub struct Loan {
     pub amount: u64,
     pub status: LoanStatus,
     pub deadline: u64,
+    pub id: u64,
 }
 
 #[contracttype]
@@ -91,6 +100,16 @@ pub struct Vouch {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Borrower {
     pub default_count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Liquidation {
+    pub asset_id: u64,
+    pub lender: Address,
+    pub loan_id: u64,
+    pub initiated_at: u64,
+    pub completed: bool,
 }
 
 #[contracttype]
@@ -123,6 +142,7 @@ const MIN_VOUCH_STAKE: u64 = 50;
 const ADMIN_KEY: soroban_sdk::Symbol = symbol_short!("ADMIN");
 const TOKEN_KEY: soroban_sdk::Symbol = symbol_short!("TOKEN");
 const SLASH_BAL: soroban_sdk::Symbol = symbol_short!("SL_BAL");
+#[allow(dead_code)]
 const CONFIG_KEY: soroban_sdk::Symbol = symbol_short!("CONFIG");
 const PAUSED_KEY: soroban_sdk::Symbol = symbol_short!("PAUSED");
 const SLASH_BPS_KEY: soroban_sdk::Symbol = symbol_short!("SL_BPS");
@@ -131,9 +151,11 @@ const MIN_STAKE_KEY: soroban_sdk::Symbol = symbol_short!("MIN_STK");
 const YIELD_BPS_KEY: soroban_sdk::Symbol = symbol_short!("YIELD_BPS");
 const YIELD_NUMERATOR: u64 = DEFAULT_YIELD_NUMERATOR;
 
+#[allow(dead_code)]
 const LOAN_REQUESTED: Symbol = symbol_short!("loan_req");
 const LOAN_REPAID: Symbol = symbol_short!("loan_rep");
 const LOAN_SLASHED: Symbol = symbol_short!("loan_sls");
+#[allow(dead_code)]
 const VOUCH_CREATED: Symbol = symbol_short!("vouch_cr");
 
 fn loan_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
@@ -150,6 +172,22 @@ fn vouches_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
 
 fn voucher_history_key(voucher: &Address) -> (soroban_sdk::Symbol, Address) {
     (symbol_short!("V_HIST"), voucher.clone())
+}
+
+/// A lien record representing a claim against an asset by a lender.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LienRecord {
+    pub lender: Address,
+    pub loan_id: u64,
+    pub amount: u64,
+}
+
+/// Storage key variants for indexed lookups.
+#[contracttype]
+pub enum DataKey {
+    /// Maps an asset_id to its list of lien records.
+    Liens(u64),
 }
 
 fn liens_key(asset_id: u64) -> DataKey {
@@ -170,19 +208,20 @@ fn get_token(env: &Env) -> Address {
         .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized))
 }
 
+#[allow(dead_code)]
 fn get_config(env: &Env) -> Config {
     env.storage()
         .persistent()
         .get(&CONFIG_KEY)
-        .unwrap_or_else(|| Config {
+        .unwrap_or(Config {
             yield_bps: 200,
             slash_bps: 5000,
         })
 }
 
 fn require_admin(env: &Env, caller: &Address) {
-    caller.require_auth();
-    if get_admin(env) != *caller {
+    let stored_admin = get_admin(env);
+    if shared::require_admin(caller, &stored_admin).is_err() {
         panic_with_error!(env, ContractError::UnauthorizedAdmin);
     }
 }
@@ -220,7 +259,7 @@ impl LendingContract {
     /// of the deployment transaction can race to call `initialize` first,
     /// setting themselves as admin (#625). Call this in the same transaction as
     /// contract deployment to eliminate the front-run window entirely.
-    pub fn initialize(env: Env, deployer: Address, admin: Address, token: Address, slash_bps: u32) {
+    pub fn initialize(env: Env, deployer: Address, admin: Address, token: Address, _slash_bps: u32) {
         // #625: Require the deployer's signature to prevent front-running.
         deployer.require_auth();
 
@@ -263,11 +302,17 @@ impl LendingContract {
         }
 
         let deadline = env.ledger().timestamp() + get_loan_duration(&env);
+        let loan_id_counter: u64 = env.storage().persistent().get(&symbol_short!("L_COUNT")).unwrap_or(0);
+        let new_loan_id = loan_id_counter + 1;
+        env.storage().persistent().set(&symbol_short!("L_COUNT"), &new_loan_id);
+        env.storage().persistent().set(&(symbol_short!("L_MAP"), new_loan_id), &borrower);
+
         let loan = Loan {
             borrower: borrower.clone(),
             amount,
             status: LoanStatus::Active,
             deadline,
+            id: new_loan_id,
         };
         env.storage().persistent().set(&key, &loan);
         extend_persistent_ttl(&env, &key);
@@ -478,6 +523,12 @@ impl LendingContract {
         env.storage().persistent().set(&key, &loan);
         extend_persistent_ttl(&env, &key);
 
+        let default_time = env.ledger().timestamp();
+        env.storage().persistent().set(&(symbol_short!("DEF_TIME"), borrower.clone()), &default_time);
+        env.storage()
+            .persistent()
+            .extend_ttl(&(symbol_short!("DEF_TIME"), borrower.clone()), TTL_THRESHOLD, TTL_TARGET);
+
         let borrower_key_val = borrower_key(&borrower);
         if let Some(mut borrower_record) = env
             .storage()
@@ -505,7 +556,7 @@ impl LendingContract {
         let token_addr = get_token(&env);
         let tok = token::Client::new(&env, &token_addr);
 
-        let slash_bps = get_slash_bps(&env);
+        let _slash_bps = get_slash_bps(&env);
         let mut slash_accum: u64 = 0;
         for v in vouches.iter() {
             let slashed = v.stake * SLASH_BPS / 10_000;
@@ -637,11 +688,7 @@ impl LendingContract {
 
     /// Admin-only function to pause the contract.
     pub fn pause(env: Env, admin: Address) {
-        admin.require_auth();
-        let stored_admin: Address = get_admin(&env);
-        if stored_admin != admin {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
+        require_admin(&env, &admin);
         env.storage().persistent().set(&PAUSED_KEY, &true);
         extend_persistent_ttl(&env, &PAUSED_KEY);
         env.events()
@@ -650,11 +697,7 @@ impl LendingContract {
 
     /// Admin-only function to unpause the contract.
     pub fn unpause(env: Env, admin: Address) {
-        admin.require_auth();
-        let stored_admin: Address = get_admin(&env);
-        if stored_admin != admin {
-            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-        }
+        require_admin(&env, &admin);
         env.storage().persistent().set(&PAUSED_KEY, &false);
         extend_persistent_ttl(&env, &PAUSED_KEY);
         env.events()
