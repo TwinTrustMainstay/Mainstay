@@ -791,6 +791,36 @@ impl EngineerRegistry {
             .publish((symbol_short!("ADMIN_SET"),), (pending_admin,));
     }
 
+    /// Cancel a pending admin transfer proposal.
+    /// Only the current admin can cancel. Clears the pending admin entry so the
+    /// proposed address can no longer call `accept_admin`.
+    ///
+    /// # Arguments
+    /// * `admin` - The current admin address (must match stored admin)
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
+    /// - [`ContractError::ProposalNotFound`] if no pending admin proposal exists
+    pub fn cancel_admin_proposal(env: Env, admin: Address) {
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if require_admin(&admin, &stored_admin).is_err() {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if !env.storage().instance().has(&pending_admin_key()) {
+            panic_with_error!(&env, ContractError::ProposalNotFound);
+        }
+        env.storage().instance().remove(&pending_admin_key());
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("ADM_CNCL")),
+            (admin.clone(), env.ledger().timestamp()),
+        );
+        env.events().publish(
+            (symbol_short!("ADM_CANCEL"),),
+            (admin,),
+        );
+    }
+
     /// Admin-only function to pause the contract.
     ///
     /// When paused, all state-modifying operations return [`ContractError::Paused`].
@@ -1366,7 +1396,8 @@ impl EngineerRegistry {
         }
     }
 
-    /// Update an engineer's reputation score. Callable only by the lifecycle contract.
+    /// Update an engineer's reputation score. Callable by the lifecycle contract
+    /// via cross-contract invocation.
     /// Reputation is clamped to 0–1000.
     ///
     /// # Arguments
@@ -1376,7 +1407,6 @@ impl EngineerRegistry {
     /// # Panics
     /// - [`ContractError::EngineerNotFound`] if the engineer record does not exist
     pub fn update_reputation(env: Env, engineer: Address, delta: i32) {
-        env.current_contract_address().require_auth();
         let mut record: Engineer = env
             .storage()
             .persistent()

@@ -70,6 +70,19 @@ pub struct Asset {
     /// Incremented on every successful call to `update_asset_metadata`.
     /// Starts at 0 when the asset is first registered.
     pub metadata_version: u32,
+    /// Soft lifecycle status set by the owner. Defaults to `Active` on registration.
+    pub deprecation_status: DeprecationStatus,
+    /// Whether this asset is currently locked as collateral under a lien.
+    /// While `true`, ownership transfers are blocked.
+    pub is_locked: bool,
+    /// The lending contract address that placed the lien, if any.
+    pub lender: Option<Address>,
+    /// The loan ID associated with the lien, used to verify the correct loan
+    /// releases the lock on repayment.
+    pub loan_id: Option<u64>,
+    /// Unix timestamp when the asset was deprecated. `None` if the asset is still active
+    /// or was decommissioned without going through the `Deprecated` state.
+    pub deprecated_at: Option<u64>,
 }
 
 /// A single entry in the metadata change history for an asset.
@@ -693,6 +706,7 @@ impl AssetRegistry {
             is_locked: false,
             lender: None,
             loan_id: None,
+            deprecated_at: None,
         };
         env.storage().persistent().set(&asset_key(id), &asset);
         extend_persistent_ttl(&env, &asset_key(id));
@@ -809,6 +823,7 @@ impl AssetRegistry {
                 is_locked: false,
                 lender: None,
                 loan_id: None,
+                deprecated_at: None,
             };
 
             env.storage().persistent().set(&asset_key(id), &asset);
@@ -1436,6 +1451,36 @@ impl AssetRegistry {
             .publish((symbol_short!("ADMIN_SET"),), (pending_admin,));
     }
 
+    /// Cancel a pending admin transfer proposal.
+    /// Only the current admin can cancel. Clears the pending admin entry so the
+    /// proposed address can no longer call `accept_admin`.
+    ///
+    /// # Arguments
+    /// * `admin` - The current admin address (must match stored admin)
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
+    /// - [`ContractError::ProposalNotFound`] if no pending admin proposal exists
+    pub fn cancel_admin_proposal(env: Env, admin: Address) {
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if require_admin(&admin, &stored_admin).is_err() {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if !env.storage().instance().has(&PENDING_ADMIN_KEY) {
+            panic_with_error!(&env, ContractError::ProposalNotFound);
+        }
+        env.storage().instance().remove(&PENDING_ADMIN_KEY);
+        env.storage().instance().extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("ADM_CNCL")),
+            (admin.clone(), env.ledger().timestamp()),
+        );
+        env.events().publish(
+            (symbol_short!("ADM_CANCEL"),),
+            (admin,),
+        );
+    }
+
     /// Admin-only function to pause the contract.
     ///
     /// # Arguments
@@ -1927,9 +1972,20 @@ impl AssetRegistry {
             panic_with_error!(&env, ContractError::AssetAlreadyDeprecated);
         }
 
+        let timestamp = env.ledger().timestamp();
         asset.deprecation_status = DeprecationStatus::Deprecated;
+        asset.deprecated_at = Some(timestamp);
         env.storage().persistent().set(&asset_key(asset_id), &asset);
         extend_persistent_ttl(&env, &asset_key(asset_id));
+
+        // If a lien is active on this asset, emit DEPR_WARN so DeFi lenders
+        // holding loans against it receive an on-chain warning.
+        if asset.is_locked {
+            env.events().publish(
+                (symbol_short!("DEPR_WARN"), asset_id),
+                (asset_id, asset.lender.clone(), timestamp),
+            );
+        }
 
         // Store reason separately to avoid bloating the core Asset struct on reads.
         let reason_key = (symbol_short!("DEP_RSN"), asset_id);
@@ -1937,10 +1993,8 @@ impl AssetRegistry {
         extend_persistent_ttl(&env, &reason_key);
 
         env.events().publish(
-            (symbol_short!("DEPRECATD"), asset_id),
-            (symbol_short!("DEPRCATED"), asset_id),
             (symbol_short!("DEPR"), asset_id),
-            (owner, reason, env.ledger().timestamp()),
+            (owner, reason, timestamp),
         );
     }
 
