@@ -297,7 +297,6 @@ fn require_global_timelock_ready(env: &Env, op: Symbol) {
     // TIMELOCK_DELAY_SECS is expressed in seconds; env.ledger().timestamp() returns
     // Unix epoch seconds — they are directly comparable.  env.ledger().sequence()
     // returns the ledger number and must NOT be used here.
-    if env.ledger().timestamp().saturating_sub(proposal.proposed_at) < TIMELOCK_DELAY_SECS {
     if env
         .ledger()
         .timestamp()
@@ -460,10 +459,6 @@ fn owner_index_remove(env: &Env, owner: &Address, asset_id: u64) {
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
     }
-        extend_persistent_ttl(&env, &key);
-    }
-    env.storage().persistent().set(&key, &updated);
-    extend_persistent_ttl(&env, &key);
 }
 
 /// Category index key: category bytes → Vec<u64> of asset IDs.
@@ -2640,8 +2635,6 @@ mod lifecycle {
 
 #[cfg(test)]
 mod tests {
-    extern crate std;
-    use std::format;
     use super::*;
     use soroban_sdk::testutils::storage::Instance as _;
     use soroban_sdk::testutils::storage::Persistent;

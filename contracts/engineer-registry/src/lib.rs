@@ -34,6 +34,8 @@ pub enum ContractError {
     InvalidSuspensionPeriod = 19,
     BatchRevokeTooLarge = 20,
     CredentialExpired = 21,
+    InvalidSpecialization = 22,
+    SpecializationAlreadyExists = 23,
     UnauthorizedRevoker = 22,
 }
 
@@ -125,7 +127,10 @@ const MIN_VALIDITY_PERIOD: u64 = 86_400;
 const EVENT_PROP_ADMIN: Symbol = symbol_short!("PROP_ADM");
 const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
 /// Grace period allowing engineers to work after credential expiry (7 days).
+#[allow(dead_code)]
 const GRACE_PERIOD_SECS: u64 = 7 * 86_400;
+/// Alias for the default grace period constant; used by the public API.
+const DEFAULT_GRACE_PERIOD_SECS: u64 = 7 * 86_400;
 const GRACE_PERIOD_KEY: Symbol = symbol_short!("GRACE_P");
 const MAX_BATCH_REVOKE: u32 = 50;
 const DEPLOYER_KEY: Symbol = symbol_short!("DEPLOYER");
@@ -499,6 +504,7 @@ impl EngineerRegistry {
         if !record.active {
             panic_with_error!(&env, ContractError::CredentialAlreadyRevoked);
         }
+        let timestamp = env.ledger().timestamp();
         let _credential_hash = record.credential_hash.clone();
         let _revoked_by = record.issuer.clone();
         // Extend TTL before write to ensure consistency even on near-expired entries
@@ -890,14 +896,14 @@ impl EngineerRegistry {
         }
         env.storage().persistent().set(&GRACE_PERIOD_KEY, &secs);
         extend_persistent_ttl(&env, &GRACE_PERIOD_KEY);
-        env.events()
-            .publish((symbol_short!("ADM_AUD"), symbol_short!("SET_GRACE")), (admin, secs));
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("SET_GRACE")), (admin.clone(), secs));
         env.storage()
             .persistent()
             .extend_ttl(&GRACE_PERIOD_KEY, TTL_THRESHOLD, TTL_TARGET);
         env.events().publish(
             (symbol_short!("ADM_AUD"), symbol_short!("SET_GRACE")),
-            (admin, secs),
+            (admin.clone(), secs),
         );
     }
 
@@ -4151,6 +4157,23 @@ mod tests {
     }
 
     #[test]
+    fn test_grace_period_within_window() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        let base_time = env.ledger().timestamp();
+        let validity = 86_400u64;
+        client.register_engineer(&engineer, &hash, &issuer, &validity, &None);
+
+        client.set_grace_period(&admin, &3_600u64);
+        assert_eq!(client.get_grace_period(), 3_600u64);
+
         // Within 1h grace period → GracePeriod
         env.ledger().set_timestamp(base_time + validity + 1_800);
         assert_eq!(
@@ -4478,10 +4501,6 @@ mod tests {
 
         assert!(!client.is_engineer_active(&engineer));
     }
-        client.register_engineer(&engineer, &hash, &issuer, &86_400, &None); // minimum validity
-
-        // Set ledger time past expiry
-        env.ledger().set_timestamp(86_401);
 
     // --- Suspension tests (issue #882) ---
 
@@ -4596,11 +4615,25 @@ mod tests {
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::EngineerNotFound as u32
-            )))
+            ))),
+        );
+    }
+
     /// #802: removing a trusted issuer must revoke all credentials issued by that issuer.
     /// verify_engineer for those engineers must return CredentialStatus::Revoked.
     #[test]
     fn test_verify_engineer_revoked_after_issuer_removal() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+        let issuer = Address::generate(&env);
+        let engineer = Address::generate(&env);
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &BytesN::from_array(&env, &[1u8; 32]), &issuer, &31_536_000, &None);
+        client.remove_trusted_issuer(&admin, &issuer);
+        assert_eq!(client.verify_engineer(&engineer), CredentialStatus::Revoked);
+    }
+
     #[test]
     fn test_get_reputation_default_is_zero() {
         let env = Env::default();
@@ -4892,11 +4925,13 @@ mod tests {
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::InvalidSuspensionPeriod as u32
+            ))),
             )))
         );
     }
 
     #[test]
+    fn test_batch_revoke_credentials_non_admin_fails() {
     fn test_suspend_with_current_timestamp_fails() {
         let env = Env::default();
         env.mock_all_auths();
@@ -4985,6 +5020,10 @@ mod tests {
             client.verify_engineer(&engineer),
             CredentialStatus::Suspended,
             "suspended engineer should return Suspended"
+        );
+    }
+
+    #[test]
     fn test_batch_revoke_emits_event_per_engineer() {
         let env = Env::default();
         env.mock_all_auths();
@@ -5223,6 +5262,8 @@ mod tests {
         let results = client.batch_verify_engineers(&soroban_sdk::vec![&env, engineer.clone()]);
         assert_eq!(results.get(0).unwrap(), CredentialStatus::Valid, "suspension should have lifted");
     }
+
+    #[test]
     fn test_engineers_from_different_issuers_verify_independently() {
         let env = Env::default();
         env.mock_all_auths();
@@ -5375,5 +5416,4 @@ mod tests {
         assert_eq!(emitted_date, ts);
         assert_eq!(emitted_hash, cert_hash);
     }
-}
 }

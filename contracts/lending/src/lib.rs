@@ -2,6 +2,7 @@
 
 use shared::error::SharedContractError;
 use shared::extend_persistent_ttl;
+use shared::{TTL_THRESHOLD, TTL_TARGET};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
     Address, Env, Symbol, Vec,
@@ -45,6 +46,10 @@ pub enum ContractError {
     VouchWithdrawNotAllowed = 15,
     /// Caller is not the authorized borrower for this loan.
     UnauthorizedBorrower = 16,
+    /// A lien with the same asset, lender, and loan_id already exists.
+    LienAlreadyExists = 17,
+    /// No matching lien found for the given asset, lender, and loan_id.
+    LienNotFound = 18,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -134,6 +139,7 @@ const MIN_VOUCH_STAKE: u64 = 50;
 const ADMIN_KEY: soroban_sdk::Symbol = symbol_short!("ADMIN");
 const TOKEN_KEY: soroban_sdk::Symbol = symbol_short!("TOKEN");
 const SLASH_BAL: soroban_sdk::Symbol = symbol_short!("SL_BAL");
+#[allow(dead_code)]
 const CONFIG_KEY: soroban_sdk::Symbol = symbol_short!("CONFIG");
 const PAUSED_KEY: soroban_sdk::Symbol = symbol_short!("PAUSED");
 const SLASH_BPS_KEY: soroban_sdk::Symbol = symbol_short!("SL_BPS");
@@ -142,9 +148,11 @@ const MIN_STAKE_KEY: soroban_sdk::Symbol = symbol_short!("MIN_STK");
 const YIELD_BPS_KEY: soroban_sdk::Symbol = symbol_short!("YIELD_BPS");
 const YIELD_NUMERATOR: u64 = DEFAULT_YIELD_NUMERATOR;
 
+#[allow(dead_code)]
 const LOAN_REQUESTED: Symbol = symbol_short!("loan_req");
 const LOAN_REPAID: Symbol = symbol_short!("loan_rep");
 const LOAN_SLASHED: Symbol = symbol_short!("loan_sls");
+#[allow(dead_code)]
 const VOUCH_CREATED: Symbol = symbol_short!("vouch_cr");
 
 fn loan_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
@@ -161,6 +169,22 @@ fn vouches_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
 
 fn voucher_history_key(voucher: &Address) -> (soroban_sdk::Symbol, Address) {
     (symbol_short!("V_HIST"), voucher.clone())
+}
+
+/// A lien record representing a claim against an asset by a lender.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LienRecord {
+    pub lender: Address,
+    pub loan_id: u64,
+    pub amount: u64,
+}
+
+/// Storage key variants for indexed lookups.
+#[contracttype]
+pub enum DataKey {
+    /// Maps an asset_id to its list of lien records.
+    Liens(u64),
 }
 
 fn liens_key(asset_id: u64) -> DataKey {
@@ -181,11 +205,12 @@ fn get_token(env: &Env) -> Address {
         .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized))
 }
 
+#[allow(dead_code)]
 fn get_config(env: &Env) -> Config {
     env.storage()
         .persistent()
         .get(&CONFIG_KEY)
-        .unwrap_or_else(|| Config {
+        .unwrap_or(Config {
             yield_bps: 200,
             slash_bps: 5000,
         })
@@ -231,7 +256,7 @@ impl LendingContract {
     /// of the deployment transaction can race to call `initialize` first,
     /// setting themselves as admin (#625). Call this in the same transaction as
     /// contract deployment to eliminate the front-run window entirely.
-    pub fn initialize(env: Env, deployer: Address, admin: Address, token: Address, slash_bps: u32) {
+    pub fn initialize(env: Env, deployer: Address, admin: Address, token: Address, _slash_bps: u32) {
         // #625: Require the deployer's signature to prevent front-running.
         deployer.require_auth();
 
@@ -528,7 +553,7 @@ impl LendingContract {
         let token_addr = get_token(&env);
         let tok = token::Client::new(&env, &token_addr);
 
-        let slash_bps = get_slash_bps(&env);
+        let _slash_bps = get_slash_bps(&env);
         let mut slash_accum: u64 = 0;
         for v in vouches.iter() {
             let slashed = v.stake * SLASH_BPS / 10_000;
