@@ -3125,6 +3125,37 @@ mod tests {
     }
 
     #[test]
+    fn test_update_metadata_restamps_on_every_update() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Spec v1"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        env.ledger().with_mut(|li| li.timestamp += 500);
+        client.update_asset_metadata(&id, &owner, &String::from_str(&env, "Spec v2"));
+        let first = client.get_asset(&id).metadata_updated_at;
+
+        env.ledger().with_mut(|li| li.timestamp += 700);
+        client.update_asset_metadata(&id, &owner, &String::from_str(&env, "Spec v3"));
+        let second = client.get_asset(&id).metadata_updated_at;
+
+        assert_eq!(second, env.ledger().timestamp());
+        assert!(second > first);
+    }
+
+    #[test]
     fn test_update_metadata_emits_event() {
         let env = Env::default();
         env.mock_all_auths();
