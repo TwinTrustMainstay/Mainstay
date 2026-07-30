@@ -5580,6 +5580,35 @@ mod tests {
     }
 
     #[test]
+    fn test_prune_asset_history_recalculates_score_for_remaining_records() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 1);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        for _ in 0..3 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("ENGINE"),
+                &Priority::High,
+                &String::from_str(&env, "maintenance"),
+                &engineer,
+            );
+        }
+
+        let initial_score = client.get_collateral_score(&asset_id);
+        assert_eq!(initial_score, 15, "initial score should reflect all submitted records");
+
+        client.prune_asset_history(&admin, &asset_id);
+
+        let remaining_score = client.get_collateral_score(&asset_id);
+        assert_eq!(remaining_score, 5, "score should reflect only the single remaining record after pruning");
+    }
+
+    #[test]
     fn test_prune_asset_history_cleans_engineer_index() {
         let env = Env::default();
         env.mock_all_auths();
