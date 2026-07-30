@@ -645,7 +645,7 @@ mod engineer_registry {
     #[allow(dead_code)]
     #[contractclient(name = "EngineerRegistryClient")]
     pub trait EngineerRegistry {
-        fn verify_engineer(env: Env, engineer: Address) -> CredentialStatus;
+        fn verify_engineer(env: Env, engineer: Address, required_specialization: Option<Symbol>) -> CredentialStatus;
         fn batch_verify_engineers(env: Env, engineers: Vec<Address>) -> Vec<CredentialStatus>;
         fn get_reputation(env: Env, engineer: Address) -> u32;
         fn get_credential_status(env: Env, engineer: Address) -> CredentialStatus;
@@ -1813,6 +1813,59 @@ impl Lifecycle {
                 .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
         }
         history
+    }
+
+    /// Return a paginated view of the ownership transfer history for an asset.
+    ///
+    /// DeFi lenders use this to assess collateral risk when an asset has changed
+    /// hands many times. Pagination keeps individual call costs predictable.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset to query
+    /// * `offset`   - Zero-based index of the first record to return
+    /// * `limit`    - Maximum number of records to return (capped at 50; 0 returns empty vec)
+    ///
+    /// # Returns
+    /// Vec of [`TransferRecord`] in chronological order for the requested page.
+    /// Returns an empty vec if `offset` is beyond the end of the history.
+    pub fn get_transfer_history_paginated(
+        env: Env,
+        asset_id: u64,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<TransferRecord> {
+        if limit == 0 {
+            return Vec::new(&env);
+        }
+
+        // Cap at 50 entries per call to bound compute costs.
+        const MAX_PAGE: u32 = 50;
+        let limit = limit.min(MAX_PAGE);
+
+        let key = transfer_hist_key(asset_id);
+        let history: Vec<TransferRecord> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let len = history.len();
+        if offset >= len {
+            return Vec::new(&env);
+        }
+
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        }
+
+        let end = (offset + limit).min(len);
+        let mut page: Vec<TransferRecord> = Vec::new(&env);
+        for i in offset..end {
+            page.push_back(history.get(i).unwrap());
+        }
+        page
     }
 
     /// Submit multiple maintenance records for the same asset in a single transaction.
@@ -3141,6 +3194,10 @@ impl Lifecycle {
         if limit == 0 {
             return Vec::new(&env);
         }
+
+        // Cap at 50 entries per call to bound compute and fees for DeFi integrators.
+        const MAX_PAGE: u32 = 50;
+        let limit = limit.min(MAX_PAGE);
 
         let history: Vec<ScoreEntry> = env
             .storage()
@@ -8052,9 +8109,9 @@ mod tests {
         let engineer = register_engineer(&env, &engineer_registry_client);
         client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
-        assert_eq!(engineer_registry_client.verify_engineer(&engineer), ::engineer_registry::CredentialStatus::Valid);
+        assert_eq!(engineer_registry_client.verify_engineer(&engineer, &None::<Symbol>), ::engineer_registry::CredentialStatus::Valid);
         engineer_registry_client.revoke_credential(&engineer);
-        assert_ne!(engineer_registry_client.verify_engineer(&engineer), ::engineer_registry::CredentialStatus::Valid);
+        assert_ne!(engineer_registry_client.verify_engineer(&engineer, &None::<Symbol>), ::engineer_registry::CredentialStatus::Valid);
 
         let result = client.try_submit_maintenance(
             &asset_id,
@@ -8127,7 +8184,7 @@ mod tests {
 
         // Revoke the credential
         engineer_registry_client.revoke_credential(&engineer);
-        assert_ne!(engineer_registry_client.verify_engineer(&engineer), ::engineer_registry::CredentialStatus::Valid);
+        assert_ne!(engineer_registry_client.verify_engineer(&engineer, &None::<Symbol>), ::engineer_registry::CredentialStatus::Valid);
 
         // Attempt to submit maintenance ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â must fail with UnauthorizedEngineer
         let result = client.try_submit_maintenance(
@@ -8147,7 +8204,7 @@ mod tests {
         // Re-register the same engineer with a new credential hash
         let hash_v2 = BytesN::from_array(&env, &[2u8; 32]);
         engineer_registry_client.register_engineer(&engineer, &hash_v2, &issuer, &31_536_000, &None);
-        assert_eq!(engineer_registry_client.verify_engineer(&engineer), ::engineer_registry::CredentialStatus::Valid);
+        assert_eq!(engineer_registry_client.verify_engineer(&engineer, &None::<Symbol>), ::engineer_registry::CredentialStatus::Valid);
 
         // Submission must now succeed
         client.submit_maintenance(
@@ -8181,14 +8238,14 @@ mod tests {
         engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &86_400, &None);
 
         // Verify engineer is initially valid
-        assert_eq!(engineer_registry_client.verify_engineer(&engineer), ::engineer_registry::CredentialStatus::Valid);
+        assert_eq!(engineer_registry_client.verify_engineer(&engineer, &None::<Symbol>), ::engineer_registry::CredentialStatus::Valid);
 
         // Advance ledger past expiry (86401 seconds)
         env.ledger()
             .with_mut(|li| li.timestamp = li.timestamp + 86_401);
 
         // Verify engineer is now expired
-        assert_ne!(engineer_registry_client.verify_engineer(&engineer), ::engineer_registry::CredentialStatus::Valid);
+        assert_ne!(engineer_registry_client.verify_engineer(&engineer, &None::<Symbol>), ::engineer_registry::CredentialStatus::Valid);
 
         // Attempt submit_maintenance and assert UnauthorizedEngineer is returned
         let result = client.try_submit_maintenance(
@@ -8232,12 +8289,12 @@ mod tests {
         // Register with validity_period = 86400 seconds (minimum)
         engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &86_400, &None);
 
-        assert_eq!(engineer_registry_client.verify_engineer(&engineer), ::engineer_registry::CredentialStatus::Valid);
+        assert_eq!(engineer_registry_client.verify_engineer(&engineer, &None::<Symbol>), ::engineer_registry::CredentialStatus::Valid);
 
         // Advance ledger by 101 seconds ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â credential is now expired
         env.ledger().with_mut(|li| li.timestamp += 86_401);
 
-        assert_ne!(engineer_registry_client.verify_engineer(&engineer), ::engineer_registry::CredentialStatus::Valid);
+        assert_ne!(engineer_registry_client.verify_engineer(&engineer, &None::<Symbol>), ::engineer_registry::CredentialStatus::Valid);
 
         let result = client.try_submit_maintenance(
             &asset_id,
@@ -8280,12 +8337,12 @@ mod tests {
         // Register with validity_period = 86400 seconds (minimum)
         engineer_registry_client.register_engineer(&engineer, &hash, &issuer, &86_400, &None);
 
-        assert_eq!(engineer_registry_client.verify_engineer(&engineer), ::engineer_registry::CredentialStatus::Valid);
+        assert_eq!(engineer_registry_client.verify_engineer(&engineer, &None::<Symbol>), ::engineer_registry::CredentialStatus::Valid);
 
         // Advance ledger by 101 seconds ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â credential is now expired
         env.ledger().with_mut(|li| li.timestamp += 86_401);
 
-        assert_ne!(engineer_registry_client.verify_engineer(&engineer), ::engineer_registry::CredentialStatus::Valid);
+        assert_ne!(engineer_registry_client.verify_engineer(&engineer, &None::<Symbol>), ::engineer_registry::CredentialStatus::Valid);
 
         let mut records = Vec::new(&env);
         records.push_back(BatchRecord {
@@ -8336,7 +8393,7 @@ mod tests {
             &31_536_000,
             &None,
         );
-        assert_eq!(engineer_registry.verify_engineer(&engineer), ::engineer_registry::CredentialStatus::Valid);
+        assert_eq!(engineer_registry.verify_engineer(&engineer, &None::<Symbol>), ::engineer_registry::CredentialStatus::Valid);
 
         // 3. Submit 10 maintenance records (default score_increment = 5pts each)
         for i in 0..10u32 {
@@ -10090,7 +10147,7 @@ mod tests {
             &31_536_000,
             &None,
         );
-        assert_eq!(engineer_registry.verify_engineer(&engineer), ::engineer_registry::CredentialStatus::Valid);
+        assert_eq!(engineer_registry.verify_engineer(&engineer, &None::<Symbol>), ::engineer_registry::CredentialStatus::Valid);
 
         // 4. Submit maintenance ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â 10 ÃƒÆ’Ã¢â‚¬â€ OVERHAUL (5 pts each) = 50, eligible
         for _ in 0..10 {
@@ -12883,6 +12940,55 @@ mod tests {
         assert!(lifecycle.is_paused());
     }
 
+    // ── Issue #1007: get_transfer_history_paginated ────────────────────────
+
+    #[test]
+    fn test_get_transfer_history_empty_before_any_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, asset_registry, _, _) = setup(&env, 0);
+        let (asset_id, _owner) = register_asset(&env, &asset_registry);
+
+        // No transfers yet → both full and paginated should return empty
+        let full = lifecycle.get_transfer_history(&asset_id);
+        assert_eq!(full.len(), 0);
+
+        let page = lifecycle.get_transfer_history_paginated(&asset_id, &0, &10);
+        assert_eq!(page.len(), 0);
+    }
+
+    #[test]
+    fn test_get_transfer_history_paginated_single_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, asset_registry, engineer_registry, _) = setup(&env, 0);
+        let (asset_id, owner) = register_asset(&env, &asset_registry);
+        let engineer = register_engineer(&env, &engineer_registry);
+        lifecycle.authorize_engineer(&owner, &asset_id, &engineer);
+
+        let new_owner = Address::generate(&env);
+
+        asset_registry.transfer_asset(&asset_id, &owner, &new_owner);
+        lifecycle.record_transfer(&asset_id, &owner, &new_owner);
+
+        // Full history has one entry
+        let full = lifecycle.get_transfer_history(&asset_id);
+        assert_eq!(full.len(), 1);
+        assert_eq!(full.get(0).unwrap().from, owner);
+        assert_eq!(full.get(0).unwrap().to, new_owner);
+
+        // Paginated: offset 0, limit 10 → same single entry
+        let page = lifecycle.get_transfer_history_paginated(&asset_id, &0, &10);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page.get(0).unwrap().from, owner);
+        assert_eq!(page.get(0).unwrap().to, new_owner);
+    }
+
+    #[test]
+    fn test_get_transfer_history_paginated_offset_beyond_end() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, asset_registry, engineer_registry, _) = setup(&env, 0);
     // ==================== Issue #1002 Tests ====================
 
     #[test]
@@ -12947,6 +13053,98 @@ mod tests {
         env.mock_all_auths();
 
         let (lifecycle, asset_registry, engineer_registry, admin) = setup(&env, 0);
+        let (asset_id, owner) = register_asset(&env, &asset_registry);
+        let engineer = register_engineer(&env, &engineer_registry);
+        lifecycle.authorize_engineer(&owner, &asset_id, &engineer);
+
+        let new_owner = Address::generate(&env);
+        asset_registry.transfer_asset(&asset_id, &owner, &new_owner);
+        lifecycle.record_transfer(&asset_id, &owner, &new_owner);
+
+        // Offset beyond the single entry → empty vec
+        let page = lifecycle.get_transfer_history_paginated(&asset_id, &1, &10);
+        assert_eq!(page.len(), 0);
+    }
+
+    #[test]
+    fn test_get_transfer_history_paginated_limit_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, asset_registry, engineer_registry, _) = setup(&env, 0);
+        let (asset_id, owner) = register_asset(&env, &asset_registry);
+        let engineer = register_engineer(&env, &engineer_registry);
+        lifecycle.authorize_engineer(&owner, &asset_id, &engineer);
+
+        let new_owner = Address::generate(&env);
+        asset_registry.transfer_asset(&asset_id, &owner, &new_owner);
+        lifecycle.record_transfer(&asset_id, &owner, &new_owner);
+
+        // limit=0 → always empty
+        let page = lifecycle.get_transfer_history_paginated(&asset_id, &0, &0);
+        assert_eq!(page.len(), 0);
+    }
+
+    #[test]
+    fn test_get_transfer_history_paginated_cap_at_50() {
+        let env = Env::default();
+        env.mock_all_auths();
+        // Requesting more than 50 entries should be capped to 50.
+        // We cannot easily create 50+ transfers in a unit test, but we can
+        // verify the limit parameter is clamped by requesting u32::MAX and
+        // checking the result is ≤ 50.
+        let (lifecycle, asset_registry, engineer_registry, _) = setup(&env, 0);
+        let (asset_id, owner) = register_asset(&env, &asset_registry);
+        let engineer = register_engineer(&env, &engineer_registry);
+        lifecycle.authorize_engineer(&owner, &asset_id, &engineer);
+
+        let new_owner = Address::generate(&env);
+        asset_registry.transfer_asset(&asset_id, &owner, &new_owner);
+        lifecycle.record_transfer(&asset_id, &owner, &new_owner);
+
+        // Request with limit far above the cap — result must be ≤ 50
+        let page = lifecycle.get_transfer_history_paginated(&asset_id, &0, &u32::MAX);
+        assert!(page.len() <= 50);
+        assert_eq!(page.len(), 1); // Only 1 actual transfer
+    }
+
+    // ── Issue #1006: get_score_history with 50-entry cap ──────────────────
+
+    #[test]
+    fn test_get_score_history_basic_pagination() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, asset_registry, engineer_registry, _) = setup(&env, 0);
+        let (asset_id, owner) = register_asset(&env, &asset_registry);
+        let engineer = register_engineer(&env, &engineer_registry);
+        lifecycle.authorize_engineer(&owner, &asset_id, &engineer);
+
+        // Submit 3 maintenance records to build score history
+        for i in 0u32..3 {
+            env.ledger().with_mut(|li| li.timestamp += 1000 * (i + 1) as u64);
+            lifecycle.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &Priority::Low,
+                &String::from_str(&env, "Routine oil change"),
+                &engineer,
+            );
+        }
+
+        // offset=0 limit=3 → 3 entries
+        let page = lifecycle.get_score_history(&asset_id, &0, &3);
+        assert_eq!(page.len(), 3);
+
+        // offset=1 limit=2 → 2 entries (entries 1 and 2)
+        let page2 = lifecycle.get_score_history(&asset_id, &1, &2);
+        assert_eq!(page2.len(), 2);
+        assert_eq!(page2.get(0).unwrap(), page.get(1).unwrap());
+    }
+
+    #[test]
+    fn test_get_score_history_limit_zero_returns_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, asset_registry, engineer_registry, _) = setup(&env, 0);
         let (asset_id, owner) = register_asset(&env, &asset_registry);
         let engineer = register_engineer(&env, &engineer_registry);
         lifecycle.authorize_engineer(&owner, &asset_id, &engineer);
@@ -13074,6 +13272,24 @@ mod tests {
             &asset_id,
             &symbol_short!("OIL_CHG"),
             &Priority::Low,
+            &String::from_str(&env, "Test"),
+            &engineer,
+        );
+
+        let page = lifecycle.get_score_history(&asset_id, &0, &0);
+        assert_eq!(page.len(), 0);
+    }
+
+    #[test]
+    fn test_get_score_history_cap_at_50() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, asset_registry, engineer_registry, _) = setup(&env, 0);
+        let (asset_id, owner) = register_asset(&env, &asset_registry);
+        let engineer = register_engineer(&env, &engineer_registry);
+        lifecycle.authorize_engineer(&owner, &asset_id, &engineer);
+
+        // Submit one maintenance record and request limit=u32::MAX — must be capped at 50
             &String::from_str(&env, "Maintenance by engineer1"),
             &engineer1,
             &None,
@@ -13124,6 +13340,25 @@ mod tests {
             &asset_id,
             &symbol_short!("OIL_CHG"),
             &Priority::Low,
+            &String::from_str(&env, "Test"),
+            &engineer,
+        );
+
+        let page = lifecycle.get_score_history(&asset_id, &0, &u32::MAX);
+        // Result must not exceed 50 entries regardless of the requested limit.
+        assert!(page.len() <= 50);
+        assert_eq!(page.len(), 1); // Only 1 score entry so far
+    }
+
+    #[test]
+    fn test_get_score_history_offset_beyond_end() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (lifecycle, asset_registry, engineer_registry, _) = setup(&env, 0);
+        let (asset_id, owner) = register_asset(&env, &asset_registry);
+        let engineer = register_engineer(&env, &engineer_registry);
+        lifecycle.authorize_engineer(&owner, &asset_id, &engineer);
+
             &String::from_str(&env, "Maintenance"),
             &engineer,
             &None,
@@ -13169,6 +13404,13 @@ mod tests {
             &asset_id,
             &symbol_short!("OIL_CHG"),
             &Priority::Low,
+            &String::from_str(&env, "Test"),
+            &engineer,
+        );
+
+        // offset beyond the history length → empty
+        let page = lifecycle.get_score_history(&asset_id, &100, &10);
+        assert_eq!(page.len(), 0);
             &String::from_str(&env, "Before transfer"),
             &engineer1,
             &None,

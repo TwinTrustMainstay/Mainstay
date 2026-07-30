@@ -64,7 +64,7 @@ use lifecycle::{Lifecycle, LifecycleClient};
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Ledger, LedgerInfo},
-    Address, BytesN, Env, String, Vec,
+    Address, BytesN, Env, String, Symbol, Vec,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -166,6 +166,7 @@ fn test_engineer_registry_data_survives_upgrade() {
     assert_eq!(eng.issuer, issuer);
 
     // ── Verify credential verification works ────────────────────────
+    let verified = er.verify_engineer(&engineer, &None::<Symbol>);
     let verified = er.verify_engineer(&engineer);
     assert_eq!(
         verified,
@@ -179,6 +180,7 @@ fn test_engineer_registry_data_survives_upgrade() {
     });
 
     // ── Credential must still be verifiable ──────────────────────────
+    let verified_after = er.verify_engineer(&engineer, &None::<Symbol>);
     let verified_after = er.verify_engineer(&engineer);
     assert_eq!(
         verified_after,
