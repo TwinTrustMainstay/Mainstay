@@ -114,7 +114,7 @@ const MIN_SCORE_WITH_HISTORY: u32 = 1;
 /// Records older than this contribute zero to the collateral score.
 /// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
 /// Older records still contribute nothing, newer records are weighted linearly.
-const MAX_AGE_LEDGERS: u64 = DEFAULT_TTL_LEDGERS as u64;
+const MAX_AGE_LEDGERS: u64 = TTL_THRESHOLD as u64;
 
 const EVENT_INIT: Symbol = symbol_short!("INIT");
 const EVENT_MAINT: Symbol = symbol_short!("MAINT");
@@ -1239,6 +1239,7 @@ impl Lifecycle {
             min_collateral_score: DEFAULT_ELIGIBILITY_THRESHOLD,
             max_notes_length: DEFAULT_MAX_NOTES_LENGTH,
             task_weights: Map::new(&env),
+            max_submissions_per_hour: DEFAULT_MAX_SUBMISSIONS_PER_HOUR,
         };
         env.storage().persistent().set(&CONFIG, &config);
         extend_persistent_ttl(&env, &CONFIG);
@@ -1855,6 +1856,9 @@ impl Lifecycle {
         let _weight = get_task_weight(&env, &task_type, &config);
         validate_notes_length(&env, &notes, config.max_notes_length);
 
+        // Enforce per-engineer submission rate before cross-contract calls / writes.
+        enforce_submission_rate(&env, &engineer, &config, 1);
+
         // Check history cap before cross-contract calls to avoid wasting gas
         let mut history: Vec<MaintenanceRecord> = env
             .storage()
@@ -2288,6 +2292,11 @@ impl Lifecycle {
             // Validate task type is known
             let _ = get_task_weight(&env, &record.task_type, &config);
         }
+
+        // Enforce per-engineer submission rate: each record in the batch counts
+        // individually, since a large batch is just as capable of flooding the
+        // ledger as the same number of individual `submit_maintenance` calls.
+        enforce_submission_rate(&env, &engineer, &config, records.len());
 
         // Validate asset exists
         let asset_registry = get_asset_registry_addr(&env);
@@ -3220,6 +3229,7 @@ impl Lifecycle {
         let record = MaintenanceRecord {
             asset_id,
             task_type: task_type.clone(),
+            priority: Priority::Low,
             notes,
             engineer: engineer.clone(),
             timestamp,
@@ -4115,6 +4125,89 @@ impl Lifecycle {
             .persistent()
             .get(&CONFIG)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized))
+    }
+
+    // ---------------------------------------------------------------------------
+    //  Per-Engineer Submission Rate Limiting
+    // ---------------------------------------------------------------------------
+
+    /// Admin-only function to update the maximum maintenance-record submissions a
+    /// single engineer may make per rolling-hour window.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored config admin
+    /// * `new_max` - New per-hour submission cap (`0` disables rate limiting)
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    pub fn update_max_submissions_per_hour(env: Env, admin: Address, new_max: u32) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        let mut config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        config.max_submissions_per_hour = new_max;
+        env.storage().persistent().set(&CONFIG, &config);
+        extend_persistent_ttl(&env, &CONFIG);
+
+        env.events()
+            .publish((symbol_short!("UPD_RATE"), admin.clone()), new_max);
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
+            (admin, env.ledger().timestamp(), symbol_short!("MAX_RATE"), new_max),
+        );
+    }
+
+    /// Returns whether `engineer` is currently within the configured
+    /// `max_submissions_per_hour` limit, i.e. allowed to submit another
+    /// maintenance record right now without being rejected.
+    ///
+    /// Read-only: does not itself count against the engineer's rate. A single
+    /// engineer submitting far more records than this check allows for is a
+    /// signal of potential fraud or a runaway integration and should be
+    /// investigated (see `RATE_LIM` events emitted by `submit_maintenance` and
+    /// `batch_submit_maintenance` when the limit is actually enforced).
+    ///
+    /// # Arguments
+    /// * `engineer` - The engineer address to check
+    ///
+    /// # Returns
+    /// `true` if the engineer may submit at least one more record in the
+    /// current rolling-hour window (or rate limiting is disabled via
+    /// `max_submissions_per_hour == 0`); `false` if they have reached the cap.
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    pub fn check_engineer_submission_rate(env: Env, engineer: Address) -> bool {
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
+        if config.max_submissions_per_hour == 0 {
+            return true;
+        }
+
+        let (window_start, count): (u64, u32) = env
+            .storage()
+            .persistent()
+            .get(&submission_window_key(&engineer))
+            .unwrap_or((0, 0));
+
+        let now = env.ledger().timestamp();
+        if now.saturating_sub(window_start) >= SUBMISSION_RATE_WINDOW_SECS {
+            return true;
+        }
+        count < config.max_submissions_per_hour
     }
 
     /// Propose a WASM upgrade for the lifecycle contract.

@@ -108,6 +108,11 @@ pub struct Config {
     pub min_collateral_score: u32,
     pub max_notes_length: u32,
     pub task_weights: Map<Symbol, u32>,
+    /// Maximum maintenance-record submissions a single engineer may make in any
+    /// rolling-hour window, across `submit_maintenance` and
+    /// `batch_submit_maintenance` (each record in a batch counts individually).
+    /// `0` disables rate limiting entirely.
+    pub max_submissions_per_hour: u32,
 }
 
 #[contracttype]
