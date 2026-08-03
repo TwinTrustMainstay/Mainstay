@@ -78,7 +78,7 @@ fn test_withdraw_vouch_with_active_loan_fails() {
     token_client.mint(&voucher, &5000);
 
     client.vouch(&borrower, &voucher, &1000);
-    client.request_loan(&borrower, &5000);
+    client.request_loan(&borrower, &5000, &0u64);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         client.withdraw_vouch(&voucher, &borrower);
@@ -114,7 +114,7 @@ fn test_get_credit_score_after_repayment() {
     token_client.mint(&env.current_contract_address(), &10000);
 
     client.vouch(&borrower, &voucher, &1000);
-    client.request_loan(&borrower, &5000);
+    client.request_loan(&borrower, &5000, &0u64);
     client.repay(&borrower);
 
     let score = client.get_credit_score(&borrower);
@@ -135,7 +135,7 @@ fn test_get_credit_score_after_default() {
     token_client.mint(&voucher, &10000);
 
     client.vouch(&borrower, &voucher, &1000);
-    client.request_loan(&borrower, &5000);
+    client.request_loan(&borrower, &5000, &0u64);
     client.slash(&admin, &borrower);
 
     let score = client.get_credit_score(&borrower);
@@ -159,14 +159,14 @@ fn test_get_credit_score_mixed_history() {
     token_client.mint(&env.current_contract_address(), &10000);
 
     client.vouch(&borrower, &voucher1, &1000);
-    client.request_loan(&borrower, &5000);
+    client.request_loan(&borrower, &5000, &0u64);
     client.repay(&borrower);
 
     let score_after_repay = client.get_credit_score(&borrower);
     assert_eq!(score_after_repay, 100);
 
     client.vouch(&borrower, &voucher2, &1000);
-    client.request_loan(&borrower, &5000);
+    client.request_loan(&borrower, &5000, &0u64);
     client.slash(&admin, &borrower);
 
     let score_after_default = client.get_credit_score(&borrower);
@@ -188,7 +188,7 @@ fn test_repay_with_configurable_yield() {
     token_client.mint(&env.current_contract_address(), &10000);
 
     client.vouch(&borrower, &voucher, &1000);
-    client.request_loan(&borrower, &5000);
+    client.request_loan(&borrower, &5000, &0u64);
 
     let voucher_balance_before = token_client.balance(&voucher);
     client.repay(&borrower);
@@ -238,7 +238,7 @@ fn test_borrower_record_created_on_loan_request() {
     let score_before = client.get_credit_score(&borrower);
     assert_eq!(score_before, 0);
 
-    client.request_loan(&borrower, &5000);
+    client.request_loan(&borrower, &5000, &0u64);
 
     let score_after = client.get_credit_score(&borrower);
     assert_eq!(score_after, 0);
@@ -259,14 +259,14 @@ fn test_repayment_count_increments() {
     token_client.mint(&env.current_contract_address(), &10000);
 
     client.vouch(&borrower, &voucher, &1000);
-    client.request_loan(&borrower, &5000);
+    client.request_loan(&borrower, &5000, &0u64);
     client.repay(&borrower);
 
     let score1 = client.get_credit_score(&borrower);
     assert_eq!(score1, 100);
 
     client.vouch(&borrower, &voucher, &1000);
-    client.request_loan(&borrower, &5000);
+    client.request_loan(&borrower, &5000, &0u64);
     client.repay(&borrower);
 
     let score2 = client.get_credit_score(&borrower);
@@ -287,14 +287,14 @@ fn test_default_count_increments() {
     token_client.mint(&voucher, &10000);
 
     client.vouch(&borrower, &voucher, &1000);
-    client.request_loan(&borrower, &5000);
+    client.request_loan(&borrower, &5000, &0u64);
     client.slash(&admin, &borrower);
 
     let score1 = client.get_credit_score(&borrower);
     assert_eq!(score1, 0);
 
     client.vouch(&borrower, &voucher, &1000);
-    client.request_loan(&borrower, &5000);
+    client.request_loan(&borrower, &5000, &0u64);
     client.slash(&admin, &borrower);
 
     let score2 = client.get_credit_score(&borrower);
@@ -316,28 +316,28 @@ fn test_credit_score_calculation_accuracy() {
     token_client.mint(&env.current_contract_address(), &50000);
 
     client.vouch(&borrower, &voucher, &1000);
-    client.request_loan(&borrower, &5000);
+    client.request_loan(&borrower, &5000, &0u64);
     client.repay(&borrower);
 
     let score_1_0 = client.get_credit_score(&borrower);
     assert_eq!(score_1_0, 100);
 
     client.vouch(&borrower, &voucher, &1000);
-    client.request_loan(&borrower, &5000);
+    client.request_loan(&borrower, &5000, &0u64);
     client.repay(&borrower);
 
     let score_2_0 = client.get_credit_score(&borrower);
     assert_eq!(score_2_0, 100);
 
     client.vouch(&borrower, &voucher, &1000);
-    client.request_loan(&borrower, &5000);
+    client.request_loan(&borrower, &5000, &0u64);
     client.slash(&admin, &borrower);
 
     let score_2_1 = client.get_credit_score(&borrower);
     assert_eq!(score_2_1, 66);
 
     client.vouch(&borrower, &voucher, &1000);
-    client.request_loan(&borrower, &5000);
+    client.request_loan(&borrower, &5000, &0u64);
     client.slash(&admin, &borrower);
 
     let score_2_2 = client.get_credit_score(&borrower);
@@ -415,7 +415,7 @@ fn test_repay_with_custom_yield_rate() {
     token_client.mint(&env.current_contract_address(), &10000);
 
     client.vouch(&borrower, &voucher, &1000);
-    client.request_loan(&borrower, &5000);
+    client.request_loan(&borrower, &5000, &0u64);
 
     let voucher_balance_before = token_client.balance(&voucher);
     client.repay(&borrower);
@@ -456,7 +456,7 @@ fn test_yield_rate_zero_bps() {
     token_client.mint(&env.current_contract_address(), &10000);
 
     client.vouch(&borrower, &voucher, &1000);
-    client.request_loan(&borrower, &5000);
+    client.request_loan(&borrower, &5000, &0u64);
 
     let voucher_balance_before = token_client.balance(&voucher);
     client.repay(&borrower);

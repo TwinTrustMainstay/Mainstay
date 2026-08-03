@@ -38,7 +38,7 @@ fn test_set_min_stake_by_admin() {
 
     token_client.mint(&token_admin, &voucher, &1000);
 
-    client.request_loan(&borrower, &100);
+    client.request_loan(&borrower, &100, &0u64);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         client.vouch(&borrower, &voucher, &100);
@@ -65,7 +65,7 @@ fn test_set_min_stake_allows_valid_stake() {
 
     token_client.mint(&token_admin, &voucher, &1000);
 
-    client.request_loan(&borrower, &100);
+    client.request_loan(&borrower, &100, &0u64);
     client.vouch(&borrower, &voucher, &100);
 
     let vouches = client.get_vouches(&borrower);
@@ -104,7 +104,7 @@ fn test_set_min_stake_zero() {
 
     token_client.mint(&token_admin, &voucher, &1000);
 
-    client.request_loan(&borrower, &100);
+    client.request_loan(&borrower, &100, &0u64);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         client.vouch(&borrower, &voucher, &1);
@@ -130,7 +130,7 @@ fn test_set_min_stake_high_value() {
 
     token_client.mint(&token_admin, &voucher, &10000);
 
-    client.request_loan(&borrower, &100);
+    client.request_loan(&borrower, &100, &0u64);
     client.vouch(&borrower, &voucher, &5000);
 
     let vouches = client.get_vouches(&borrower);

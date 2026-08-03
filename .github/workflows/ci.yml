@@ -172,17 +172,97 @@ jobs:
       # ── Step 4: Snapshot contract state ──────────────────
       - name: Snapshot pre-upgrade state
         run: |
+          echo "=== Pre-Upgrade State Snapshot ==="
+
           stellar contract invoke --id "$LC_ID" --network local --source deployer \
             -- get_config
+
+          echo "Pre-upgrade state captured"
+
+      # ── Step 4b: Simulate contract upgrade ───────────────
+      - name: Simulate contract upgrade
+        run: |
+          echo "=== Simulating Contract Upgrade ==="
+
+          # Re-build contracts (simulates compiling the new version).
+          # In a real upgrade the new WASM would be different; here we test
+          # the upgrade *process* using the same code to verify the flow works.
+          cargo build --target wasm32-unknown-unknown --release
+
+          # Install the new WASM into the local ledger and capture its hash
+          NEW_AR_WASM="target/wasm32-unknown-unknown/release/asset_registry.wasm"
+          NEW_AR_HASH=$(stellar contract install \
+            --wasm "$NEW_AR_WASM" \
+            --network local \
+            --source deployer)
+          echo "NEW_AR_HASH=$NEW_AR_HASH" >> $GITHUB_ENV
+
+          NEW_ER_WASM="target/wasm32-unknown-unknown/release/engineer_registry.wasm"
+          NEW_ER_HASH=$(stellar contract install \
+            --wasm "$NEW_ER_WASM" \
+            --network local \
+            --source deployer)
+          echo "NEW_ER_HASH=$NEW_ER_HASH" >> $GITHUB_ENV
+
+          NEW_LC_WASM="target/wasm32-unknown-unknown/release/lifecycle.wasm"
+          NEW_LC_HASH=$(stellar contract install \
+            --wasm "$NEW_LC_WASM" \
+            --network local \
+            --source deployer)
+          echo "NEW_LC_HASH=$NEW_LC_HASH" >> $GITHUB_ENV
+
+          echo "New WASM hashes installed"
+          echo "  AR: $NEW_AR_HASH"
+          echo "  ER: $NEW_ER_HASH"
+          echo "  LC: $NEW_LC_HASH"
+
+          # Propose upgrades on all three contracts.
+          # The timelock prevents immediate execution, but we exercise the
+          # propose path to ensure storage is not corrupted.
+          echo "Proposing upgrades..."
+
+          stellar contract invoke --id "$AR_ID" --network local --source deployer \
+            -- propose_upgrade --admin "$DEPLOYER_ADDR" --new_wasm_hash "$NEW_AR_HASH"
+
+          stellar contract invoke --id "$ER_ID" --network local --source deployer \
+            -- propose_upgrade --admin "$DEPLOYER_ADDR" --new_wasm_hash "$NEW_ER_HASH"
+
+          stellar contract invoke --id "$LC_ID" --network local --source deployer \
+            -- propose_upgrade --admin "$DEPLOYER_ADDR" --new_wasm_hash "$NEW_LC_HASH"
+
+          echo "Upgrades proposed successfully"
+
+      # ── Step 4c: Verify state after upgrade proposal ─────
+      - name: Verify state after upgrade proposal
+        run: |
+          echo "=== Post-Proposal State Verification ==="
+
+          # Verify that proposing an upgrade did not corrupt existing data
+          stellar contract invoke --id "$LC_ID" --network local --source deployer \
+            -- get_config
+
+          stellar contract invoke --id "$AR_ID" --network local --source deployer \
+            -- get_admin
+
+          stellar contract invoke --id "$ER_ID" --network local --source deployer \
+            -- get_admin
+
+          echo "State intact after upgrade proposal"
 
       # ── Step 5: Run storage migration validation tests ───
       - name: Storage migration validation
         run: |
           echo "=== Storage Migration Validation ==="
 
-          # Verify all storage keys are accessible after simulated upgrade.
-          # Tests prefixed with `test_` in the workspace cover storage
-          # persistence, TTL handling, and data integrity across upgrades.
+          # Dedicated storage migration tests verify:
+          # - Storage key persistence after simulated upgrade
+          # - Data integrity for assets, engineers, and maintenance records
+          # - Counter consistency (monotonic IDs are not reset)
+          # - Cross-contract binding persistence
+          # - Empty-history edge cases and expired credentials
+          cargo test --workspace -- test_storage_migration -- --nocapture
+
+          # Existing E2E tests also validate storage patterns
           cargo test --workspace -- test_full_lifecycle_e2e -- --nocapture
           cargo test --workspace -- test_multi_asset_collateral -- --nocapture
 
@@ -193,12 +273,17 @@ jobs:
         run: |
           echo "=== Engineer Credential Signature Compatibility ==="
 
-          # Verify engineer credential verification is backward-compatible.
-          # Tests engineer registration, credential expiry, and re-registration flows.
-          cargo test --workspace -- test_engineer_credential_expiry -- --nocapture
+          # Dedicated signature compatibility tests verify:
+          # - Credential status consistency (Valid/GracePeriod/HardExpired/Revoked)
+          # - EngineerAuth enforcement for maintenance submissions
+          # - Issuer auth enforcement (only original issuer can revoke)
+          # - Batch verification compatibility
+          # - Event topic consistency (reg_eng, REV_CRED)
+          # - Suspension status consistency
+          cargo test --workspace -- test_signature_compatibility -- --nocapture
 
-          # Verify the Engineerauth check guards unauthorized submissions.
-          cargo test --workspace -- test_unauthorized_engineer -- --nocapture
+          # Existing credential expiry test
+          cargo test --workspace -- test_engineer_credential_expiry -- --nocapture
 
           echo "Signature compatibility check complete"
 
@@ -207,10 +292,17 @@ jobs:
         run: |
           echo "=== Error Recovery Tests ==="
 
-          # Test that the contract properly handles:
-          # - NotInitialized state (fresh deploy detection)
-          # - AlreadyInitialized rejection (double-init protection)
-          # - Paused state transitions
+          # Dedicated error recovery tests verify:
+          # - Double-initialization protection (AlreadyInitialized)
+          # - Timelock enforcement for execute_upgrade
+          # - Unauthorized upgrade proposals
+          # - Paused contract blocking upgrades
+          # - Data integrity after failed upgrade attempts
+          # - Proposal lifecycle (already-executed, duplicate proposals)
+          # - Cross-contract recovery (lifecycle functions after dependency failure)
+          cargo test --workspace -- test_upgrade_error_recovery -- --nocapture
+
+          # Existing pause/recovery tests
           cargo test --workspace -- test_paused_contract -- --nocapture
           cargo test --workspace -- test_emergency_pause -- --nocapture
 

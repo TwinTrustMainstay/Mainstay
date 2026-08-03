@@ -66,7 +66,7 @@ fn test_vouch_with_active_loan_rejection() {
     stellar_asset_client.mint(&voucher, &10_000_000);
 
     // Request a loan first
-    client.request_loan(&borrower, &100_000);
+    client.request_loan(&borrower, &100_000, &0u64);
 
     // Verify loan is active
     let loan = client.get_loan(&borrower);
@@ -97,7 +97,7 @@ fn test_insufficient_contract_balance_rejection() {
 
     // Attempt to request loan of 100 should fail with InsufficientFunds
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.request_loan(&borrower, &100);
+        client.request_loan(&borrower, &100, &0u64);
     }));
 
     assert!(
@@ -157,7 +157,7 @@ fn test_withdraw_vouch_with_active_loan_rejection() {
     client.vouch(&borrower, &voucher, &1_000);
 
     // Request a loan
-    client.request_loan(&borrower, &100_000);
+    client.request_loan(&borrower, &100_000, &0u64);
 
     // Attempt to withdraw vouch with active loan should fail
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -190,7 +190,7 @@ fn test_loan_disbursal_transfers_funds() {
     assert_eq!(initial_balance, 0);
 
     // Request loan
-    client.request_loan(&borrower, &100_000);
+    client.request_loan(&borrower, &100_000, &0u64);
 
     // Check borrower received the loan amount
     let final_balance = token_client.balance(&borrower);

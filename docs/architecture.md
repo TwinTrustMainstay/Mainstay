@@ -152,6 +152,40 @@ sequenceDiagram
     Lifecycle-->>Engineer: emit (maint, asset_id, engineer, task_type, timestamp)
 ```
 
+### submit_maintenance — Cross-Contract Call Chain
+
+This diagram shows only the contract-to-contract calls triggered by a single
+`submit_maintenance` invocation. It omits actor details and internal
+computation to make the dependency order clear at a glance.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Lifecycle
+    participant AssetRegistry
+    participant EngineerRegistry
+
+    Note over Lifecycle: submit_maintenance called<br/>(local validation first)
+
+    Lifecycle->>AssetRegistry: try_get_asset(asset_id)
+    AssetRegistry-->>Lifecycle: Asset | None
+
+    Lifecycle->>EngineerRegistry: get_credential_status(engineer)
+    EngineerRegistry-->>Lifecycle: CredentialStatus
+
+    alt status is Valid or GracePeriod
+        Note over Lifecycle: credential accepted
+    else status is anything else
+        Lifecycle->>EngineerRegistry: verify_engineer(engineer)
+        EngineerRegistry-->>Lifecycle: bool (false → panic UnauthorizedEngineer)
+    end
+
+    Lifecycle->>EngineerRegistry: get_reputation(engineer)
+    EngineerRegistry-->>Lifecycle: reputation_score (0–1000)
+
+    Note over Lifecycle: weighted score update, append record, emit event
+```
+
 ### Collateral Score Query Flow (with Lazy Decay)
 
 `get_collateral_score` is read-only from the caller's perspective but applies
@@ -186,6 +220,50 @@ sequenceDiagram
     Lifecycle-->>Caller: return score (0–100)
 ```
 
+### Loan Request with Collateral Verification
+
+The `Lending` contract does not make cross-contract calls autonomously — a
+lender performs collateral verification by calling `Lifecycle` and
+`AssetRegistry` directly before submitting a loan request and recording a lien.
+The diagram below shows the full off-chain → on-chain sequence a lender
+integration must execute.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Lender
+    participant AssetRegistry
+    participant Lifecycle
+    participant Lending
+
+    Lender->>AssetRegistry: get_asset(asset_id)
+    AssetRegistry-->>Lender: Asset { owner, deprecation_status, … }
+    Note over Lender: reject if asset is None, Deprecated,<br/>or Decommissioned
+
+    Note over Lender: verify asset.owner == borrower address
+
+    Lender->>Lifecycle: get_collateral_score(asset_id)
+    Note over Lifecycle: lazy decay applied; reads HIST, SCORE, LUPD
+    Lifecycle->>AssetRegistry: get_asset(asset_id)
+    AssetRegistry-->>Lifecycle: Asset { deprecation_status, … }
+    Note over Lifecycle: return 0 immediately if deprecated
+    Lifecycle-->>Lender: score (0–100)
+    Note over Lender: reject if score < 50 (configurable threshold)
+
+    Lender->>Lending: get_liens(asset_id)
+    Lending-->>Lender: Vec<LienRecord>
+    Note over Lender: reject if total encumbrance + loan_amount > asset_value
+
+    Lender->>Lending: request_loan(borrower, amount)
+    Note over Lending: borrower.require_auth()<br/>check for existing active loan<br/>verify contract token balance ≥ amount<br/>set deadline = now + loan_duration
+    Lending-->>Lender: emit loan_req event; transfer tokens to borrower
+
+    Note over Lender: Admin records lien to secure the claim
+    Lender->>Lending: record_lien(admin, asset_id, lender, loan_id, amount)
+    Note over Lending: require admin auth<br/>check no duplicate (lender, loan_id)<br/>append LienRecord; extend TTL
+    Lending-->>Lender: lien recorded (on-chain claim secured)
+```
+
 ---
 
 ## Deployment & Initialization
@@ -203,6 +281,40 @@ The Lifecycle contract stores the addresses of the other two contracts at initia
 ## TTL Strategy
 
 All three contracts use Soroban persistent storage and extend TTL by 518,400 ledgers (~30 days) on every write. See [ttl-strategy.md](ttl-strategy.md) for full details.
+
+---
+
+## Security Patterns
+
+### Reentrancy Guard on `submit_maintenance` (#1022)
+
+`submit_maintenance` in the Lifecycle contract makes cross-contract calls to the **Asset Registry** (to verify the asset exists and check its status) and the **Engineer Registry** (to verify the engineer's credential and specialization). A malicious registry contract could theoretically re-enter the Lifecycle contract while `submit_maintenance` is still executing — before state is committed — and write duplicate entries to the maintenance history.
+
+To prevent this, `submit_maintenance` uses a **reentrancy lock** stored in Soroban *instance* storage:
+
+```
+LOCKED key (instance storage) = true
+  ↓
+cross-contract calls (asset-registry, engineer-registry)
+  ↓
+state writes (history, score, last_update)
+  ↓
+LOCKED key removed
+```
+
+**Implementation details:**
+- The lock is stored under the symbol key `"LOCKED"` in **instance storage** (not persistent), so it does not persist across transactions or incur TTL extension costs.
+- `acquire_reentrancy_guard()` checks the flag; if already set, panics with `ContractError::Reentrancy` (discriminant 25).
+- `release_reentrancy_guard()` removes the flag unconditionally at the end of the function.
+- The lock is acquired **before** the first cross-contract call and released **after** all state writes and the final event emission.
+- `batch_submit_maintenance` does not currently apply the per-call guard (each element calls internal logic directly); the guard is intentionally scoped to the public `submit_maintenance` entry point.
+
+**Attack scenario prevented:**
+1. Attacker deploys a malicious contract at the engineer registry address.
+2. Attacker calls `submit_maintenance` on the Lifecycle contract.
+3. During the engineer credential check, the malicious registry re-invokes `submit_maintenance`.
+4. Without the guard, the second invocation would execute against the un-committed first write, allowing double-writes to maintenance history.
+5. With the guard, step 4 panics immediately with `ContractError::Reentrancy`.
 
 ---
 
