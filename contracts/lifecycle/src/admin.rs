@@ -251,6 +251,16 @@ pub(crate) fn accept_admin(env: Env) {
     env.events().publish((EVENT_ADMIN_SET,), (pending_admin,));
 }
 
+/// Internal implementation of `set_admin_quorum`.
+///
+/// Called by the public contract entry-point after it has already performed
+/// input validation (auth, threshold check, and duplicate check).  This layer
+/// repeats the duplicate check as defence-in-depth so the invariant holds even
+/// if the function is ever called from another internal site.
+///
+/// # Uniqueness requirement (#1195)
+/// `new_admins` must contain only distinct addresses.  Panics with
+/// [`ContractError::DuplicateAdmin`] if any address appears more than once.
 pub(crate) fn set_admin_quorum(env: Env, admin: Address, new_admins: Vec<Address>, threshold: u32) {
     ensure_not_paused(&env);
     admin.require_auth();
@@ -261,6 +271,27 @@ pub(crate) fn set_admin_quorum(env: Env, admin: Address, new_admins: Vec<Address
     }
     if threshold > 0 && threshold > new_admins.len() {
         panic_with_error!(&env, ContractError::InvalidConfig);
+    }
+    // #1195: Reject lists that contain any repeated address.  A duplicate
+    // inflates the apparent quorum count so that fewer real signers than
+    // `threshold` could satisfy `require_quorum`, undermining the security
+    // guarantee.  All addresses must be unique.
+    //
+    // We check uniqueness with a nested O(n²) scan — acceptable because
+    // admin lists are expected to be small (≤ ~10 entries) and the
+    // soroban_sdk::Vec does not expose a sorted or hashed variant.
+    let n = new_admins.len();
+    let mut i: u32 = 0;
+    while i < n {
+        let a = new_admins.get(i).unwrap();
+        let mut j = i + 1;
+        while j < n {
+            if new_admins.get(j).unwrap() == a {
+                panic_with_error!(&env, ContractError::DuplicateAdmin);
+            }
+            j += 1;
+        }
+        i += 1;
     }
     config.admins = new_admins.clone();
     config.admin_threshold = threshold;
