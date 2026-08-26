@@ -50,9 +50,7 @@ pub(crate) fn unpause(env: Env, admin: Address) {
     admin.require_auth();
     let config: Config = env.storage().persistent().get(&CONFIG)
         .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-    if config.admin != admin {
-        panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-    }
+    require_quorum(&env, &config, &admin);
     env.storage().persistent().set(&PAUSED_KEY, &false);
     extend_persistent_ttl(&env, &PAUSED_KEY);
     env.events().publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
@@ -111,9 +109,7 @@ pub(crate) fn execute_unpause(env: Env, admin: Address) {
     admin.require_auth();
     let config: Config = env.storage().persistent().get(&CONFIG)
         .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-    if config.admin != admin {
-        panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-    }
+    require_quorum(&env, &config, &admin);
     env.storage().persistent().set(&PAUSED_KEY, &false);
     extend_persistent_ttl(&env, &PAUSED_KEY);
     env.events().publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
@@ -141,9 +137,7 @@ pub(crate) fn unpause(env: Env, admin: Address) {
     admin.require_auth();
     let config: Config = env.storage().persistent().get(&CONFIG)
         .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-    if config.admin != admin {
-        panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-    }
+    require_quorum(&env, &config, &admin);
     env.storage().persistent().set(&PAUSED_KEY, &false);
     extend_persistent_ttl(&env, &PAUSED_KEY);
     env.events().publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
@@ -202,9 +196,7 @@ pub(crate) fn execute_unpause(env: Env, admin: Address) {
     admin.require_auth();
     let config: Config = env.storage().persistent().get(&CONFIG)
         .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-    if config.admin != admin {
-        panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-    }
+    require_quorum(&env, &config, &admin);
     env.storage().persistent().set(&PAUSED_KEY, &false);
     extend_persistent_ttl(&env, &PAUSED_KEY);
     env.events().publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
