@@ -199,6 +199,4 @@ pub enum DataKey {
     OwnershipStartLedger(u64),
     /// Stores a `WeightProposal` for the given task-type symbol.
     WeightProposal(Symbol),
-    /// Stores `Vec<(timestamp: u64, value: u64)>` collateral-valuation history for an asset.
-    CollateralValuationHistory(u64),
 }
