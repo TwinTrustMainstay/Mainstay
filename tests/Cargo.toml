@@ -198,3 +198,8 @@ path = "test_is_collateral_eligible_decay_applied.rs"
 [[test]]
 name = "test_lending_error_variants"
 path = "test_lending_error_variants.rs"
+
+# Issue #1194: single code path for pause / unpause
+[[test]]
+name = "test_single_pause_code_path_1194"
+path = "test_single_pause_code_path_1194.rs"
