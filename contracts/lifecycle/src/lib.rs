@@ -116,16 +116,6 @@ const MIN_SCORE_WITH_HISTORY: u32 = 1;
 /// Older records still contribute nothing, newer records are weighted linearly.
 const MAX_AGE_LEDGERS: u64 = TTL_THRESHOLD as u64;
 
-const EVENT_INIT: Symbol = symbol_short!("INIT");
-const EVENT_MAINT: Symbol = symbol_short!("MAINT");
-const EVENT_DECAY: Symbol = symbol_short!("DECAY");
-const EVENT_REG_AST: Symbol = symbol_short!("REG_AST");
-const EVENT_REG_ENG: Symbol = symbol_short!("REG_ENG");
-const EVENT_RST_SCR: Symbol = symbol_short!("RST_SCR");
-const EVENT_XFER: Symbol = symbol_short!("XFER");
-const EVENT_PROP_ADMIN: Symbol = symbol_short!("PROP_ADM");
-const EVENT_ADMIN_SET: Symbol = symbol_short!("ADMIN_SET");
-const EVENT_PRUNED: Symbol = symbol_short!("PRUNED");
 /// Emitted when a health snapshot is anchored to reconstructed history.
 const EVENT_RECONSTR: Symbol = symbol_short!("RECONSTR");
 /// Emitted when a task-weight-change proposal is created.
