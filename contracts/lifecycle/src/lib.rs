@@ -175,7 +175,7 @@ fn revoke_eng_timelock_key(asset_id: u64, engineer: &Address) -> (Symbol, u64, A
 
 /// Storage key for the dynamic frequency-based scoring weights for a given asset type.
 fn scoring_weights_key(_env: &Env, asset_type: &Symbol) -> (Symbol, Symbol) {
-    (symbol_short!("SCRWTS"), asset_type.clone())
+    (symbol_short!("SCR_WGT"), asset_type.clone())
 }
 
 /// Storage key for a pending weight-change proposal for a given task type.
