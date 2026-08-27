@@ -198,3 +198,8 @@ path = "test_is_collateral_eligible_decay_applied.rs"
 [[test]]
 name = "test_lending_error_variants"
 path = "test_lending_error_variants.rs"
+
+# Issue #1200: get_task_weight panics on unknown task type — return safe default
+[[test]]
+name = "test_unknown_task_type_fallback_1200"
+path = "test_unknown_task_type_fallback_1200.rs"

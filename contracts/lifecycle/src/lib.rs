@@ -64,6 +64,13 @@ const DEFAULT_DECAY_RATE: u32 = 5;
 const DEFAULT_DECAY_INTERVAL: u64 = 2_592_000;
 const DEFAULT_ELIGIBILITY_THRESHOLD: u32 = 50;
 const DEFAULT_MAX_NOTES_LENGTH: u32 = 256;
+/// Default per-engineer submission rate cap (submissions per rolling hour).
+/// `0` would disable rate limiting entirely; using 100 as a conservative default.
+const DEFAULT_MAX_SUBMISSIONS_PER_HOUR: u32 = 100;
+/// Default score weight for task types that are not in `config.task_weights`
+/// and do not match any of the built-in hardcoded types (fix for #1200).
+/// Exported so that `scoring.rs` can reference it via `super::DEFAULT_TASK_WEIGHT`.
+pub(crate) const DEFAULT_TASK_WEIGHT: u32 = 1;
 
 fn effective_min_collateral_score(config: &Config) -> u32 {
     if config.min_collateral_score > 0 {
@@ -1246,6 +1253,7 @@ impl Lifecycle {
             max_notes_length: DEFAULT_MAX_NOTES_LENGTH,
             task_weights: Map::new(&env),
             max_submissions_per_hour: DEFAULT_MAX_SUBMISSIONS_PER_HOUR,
+            default_task_weight: 0,
         };
         env.storage().persistent().set(&CONFIG, &config);
         extend_persistent_ttl(&env, &CONFIG);
@@ -5549,7 +5557,7 @@ mod tests {
     }
 
     #[test]
-    fn test_submit_maintenance_rejects_unknown_task_type() {
+    fn test_submit_maintenance_unknown_task_type_uses_default_weight() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -5558,6 +5566,8 @@ mod tests {
         let engineer = register_engineer(&env, &engineer_registry_client);
         client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
+        // Unknown task types must no longer panic — they fall back to the
+        // default weight and the submission succeeds (fix for #1200).
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("UNKNOWN"),
@@ -5566,11 +5576,14 @@ mod tests {
             &engineer,
         );
 
+        assert!(
+            result.is_ok(),
+            "submit_maintenance must succeed for unknown task types after #1200 fix"
+        );
         assert_eq!(
-            result,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::InvalidTaskType as u32,
-            ))),
+            client.get_maintenance_history(&asset_id).len(),
+            1,
+            "one record must be written for the unknown task type"
         );
     }
 
@@ -8497,7 +8510,7 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_submit_maintenance_rejects_unknown_task_type() {
+    fn test_batch_submit_maintenance_unknown_task_type_uses_default_weight() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -8513,13 +8526,18 @@ mod tests {
             notes: String::from_str(&env, "Unknown task type"),
         });
 
+        // Unknown task types must no longer panic in batch submissions either
+        // — they fall back to the default weight (fix for #1200).
         let result = client.try_batch_submit_maintenance(&asset_id, &records, &engineer);
 
+        assert!(
+            result.is_ok(),
+            "batch_submit_maintenance must succeed for unknown task types after #1200 fix"
+        );
         assert_eq!(
-            result,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::InvalidTaskType as u32,
-            ))),
+            client.get_maintenance_history(&asset_id).len(),
+            1,
+            "one record must be written for the unknown task type"
         );
     }
 
@@ -8792,19 +8810,21 @@ mod tests {
             priority: Priority::Low,
             notes: String::from_str(&env, "Valid"),
         });
+        // Record at index 2 has oversized notes — must trigger NotesTooLong
+        // and the batch must be rejected atomically (no partial writes).
         records.push_back(BatchRecord {
-            task_type: symbol_short!("UNKNOWN"),
+            task_type: symbol_short!("FILTER"),
             priority: Priority::Low,
-            notes: String::from_str(&env, "Invalid task type"),
+            notes: String::from_str(&env, &"x".repeat(300)),
         });
 
         let result = client.try_batch_submit_maintenance(&asset_id, &records, &engineer);
 
-        // Should fail with InvalidTaskType at index 2
+        // Should fail with NotesTooLong at index 2
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::InvalidTaskType as u32,
+                ContractError::NotesTooLong as u32,
             ))),
         );
     }
@@ -9443,17 +9463,16 @@ mod tests {
 
         client.reset_score(&admin, &asset_id);
 
+        // Unknown task type: must now succeed and use the default weight (fix for #1200).
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("UNKNOWN"),
             &String::from_str(&env, "ok"),
             &engineer,
         );
-        assert_eq!(
-            result,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::InvalidTaskType as u32,
-            ))),
+        assert!(
+            result.is_ok(),
+            "submit_maintenance must succeed for unknown task types after #1200 fix"
         );
     }
 
