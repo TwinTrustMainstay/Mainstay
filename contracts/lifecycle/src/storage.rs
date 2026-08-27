@@ -37,6 +37,13 @@ pub(crate) fn frozen_key(asset_id: u64) -> (Symbol, u64) {
 }
 
 /// Frozen score for an asset (score captured at freeze time): `u32`.
+///
+/// TTL strategy: this key's TTL is extended both when it is written (freeze
+/// time) and on every subsequent read (`get_collateral_score_opt`,
+/// `batch_is_collateral_eligible`). A frozen asset can otherwise go
+/// unqueried for long stretches; extending only on write would let the TTL
+/// lapse and silently drop the stored value, causing reads to fall back to
+/// `0` instead of the preserved frozen score.
 pub(crate) fn frozen_score_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("FRZ_SCR"), asset_id)
 }

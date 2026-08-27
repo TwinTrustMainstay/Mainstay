@@ -142,7 +142,7 @@ stellar keys generate deployer --network testnet
 ```rust
 register_asset(asset_id, asset_type, metadata) -> u64
 get_asset(asset_id) -> Asset
-get_lifecycle_score(asset_id) -> u32
+get_lifecycle_score(asset_id, lifecycle_contract) -> Option<u32>  # None if no maintenance history yet
 ```
 
 ### Engineer Registry
