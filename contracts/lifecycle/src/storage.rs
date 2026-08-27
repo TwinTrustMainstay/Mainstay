@@ -65,6 +65,11 @@ pub(crate) fn engineer_auth_key(asset_id: u64, engineer: &Address) -> (Symbol, u
     (symbol_short!("ENG_AUTH"), asset_id, engineer.clone())
 }
 
+/// Rolling-hour submission rate window for an engineer: `(window_start: u64, count: u32)`.
+pub(crate) fn submission_window_key(engineer: &Address) -> (Symbol, Address) {
+    (symbol_short!("SUB_WIN"), engineer.clone())
+}
+
 /// Timelock proposal for revoking an engineer's auth on an asset: `TimelockProposal`.
 pub(crate) fn revoke_eng_timelock_key(
     asset_id: u64,
