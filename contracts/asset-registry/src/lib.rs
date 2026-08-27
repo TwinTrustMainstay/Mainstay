@@ -43,6 +43,14 @@ pub enum ContractError {
     UnauthorizedLender = 21,
     LoanIdMismatch = 22,
     AssetNotLocked = 23,
+    /// An unexpired ownership transfer is already pending for this asset.
+    TransferAlreadyPending = 24,
+    /// No pending ownership transfer exists for this asset.
+    NoPendingTransfer = 25,
+    /// The pending ownership transfer's acceptance window has elapsed.
+    TransferExpired = 26,
+    /// A pending ownership transfer exists but has not yet passed its timeout.
+    TransferNotExpired = 27,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -2035,6 +2043,33 @@ impl AssetRegistry {
         );
     }
 
+    /// Clear a pending ownership transfer that has passed its `TRANSFER_TIMEOUT_SECS`
+    /// acceptance window. Callable by anyone, since an expired transfer can no longer
+    /// be accepted; this simply frees the pending-transfer slot so a new transfer can
+    /// be initiated immediately instead of waiting on `initiate_ownership_transfer`'s
+    /// own lazy-expiry check.
+    ///
+    /// # Panics
+    /// - [`ContractError::NoPendingTransfer`] if no transfer is pending for this asset
+    /// - [`ContractError::TransferNotExpired`] if the timeout has not yet elapsed
+    pub fn cancel_expired_transfer(env: Env, asset_id: u64) {
+        let key = pending_transfer_key(asset_id);
+        let pending: PendingTransfer = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoPendingTransfer));
+
+        if env.ledger().timestamp().saturating_sub(pending.initiated_at) < TRANSFER_TIMEOUT_SECS {
+            panic_with_error!(&env, ContractError::TransferNotExpired);
+        }
+
+        env.storage().persistent().remove(&key);
+
+        env.events()
+            .publish((symbol_short!("OWN_EXP"), asset_id), pending.new_owner);
+    }
+
     /// Admin-only function to decommission an asset.
     /// Sets the decommissioned flag and resets the collateral score to 0.
     ///
@@ -2471,6 +2506,21 @@ impl AssetRegistry {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
         if asset.is_locked {
             panic_with_error!(&env, ContractError::AssetLocked);
+        }
+
+        // Refuse to lock an asset with a live ownership transfer in flight: if the
+        // transfer completed after the lien were placed, the new owner would inherit
+        // a locked asset pledged by the previous owner with no lender notification.
+        let pending_key = pending_transfer_key(asset_id);
+        if let Some(pending) = env
+            .storage()
+            .persistent()
+            .get::<_, PendingTransfer>(&pending_key)
+        {
+            if env.ledger().timestamp().saturating_sub(pending.initiated_at) < TRANSFER_TIMEOUT_SECS
+            {
+                panic_with_error!(&env, ContractError::TransferAlreadyPending);
+            }
         }
 
         asset.is_locked = true;
@@ -4226,6 +4276,137 @@ mod tests {
         assert_eq!(client.get_asset(&id).owner, new_owner);
     }
 
+    /// Issue #1215: an expired pending transfer must be cancellable by anyone,
+    /// freeing the slot without waiting on a stray `accept`/`initiate` call.
+    #[test]
+    fn test_cancel_expired_transfer_succeeds_after_timeout() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let another_owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        client.initiate_ownership_transfer(&id, &new_owner);
+
+        env.ledger()
+            .with_mut(|li| li.timestamp += TRANSFER_TIMEOUT_SECS);
+
+        client.cancel_expired_transfer(&id);
+
+        // A new transfer can be initiated immediately after cancellation.
+        client.initiate_ownership_transfer(&id, &another_owner);
+        client.accept_ownership_transfer(&id);
+        assert_eq!(client.get_asset(&id).owner, another_owner);
+    }
+
+    #[test]
+    fn test_cancel_expired_transfer_fails_before_timeout() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        client.initiate_ownership_transfer(&id, &new_owner);
+
+        let result = client.try_cancel_expired_transfer(&id);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::TransferNotExpired as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_cancel_expired_transfer_fails_without_pending_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        let result = client.try_cancel_expired_transfer(&id);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::NoPendingTransfer as u32,
+            ))),
+        );
+    }
+
+    /// Issue #1214: a pending ownership transfer must block a new lien from being
+    /// placed, otherwise the transfer could complete after the lock and hand the
+    /// new owner a locked asset with no lender notification.
+    #[test]
+    fn test_lock_asset_as_collateral_blocked_by_pending_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let lender = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        client.set_lending_contract(&admin, &lender);
+        client.initiate_ownership_transfer(&id, &new_owner);
+
+        let result = client.try_lock_asset_as_collateral(&lender, &id, &1u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::TransferAlreadyPending as u32,
+            ))),
+        );
+    }
+
     #[test]
     fn test_ownership_transfer_updates_dedup_so_old_owner_can_reregister() {
         let env = Env::default();
@@ -5420,6 +5601,43 @@ mod tests {
                 ContractError::InvalidAssetType as u32,
             ))),
         );
+    }
+
+    /// Issue #1213: an empty-metadata element inside an otherwise valid batch must be
+    /// rejected the same way a lone `register_asset` call with empty metadata is,
+    /// instead of only the outer `Vec<AssetInput>` being checked for non-emptiness.
+    #[test]
+    fn test_batch_register_assets_rejects_empty_metadata_element() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let mut batch = Vec::new(&env);
+        batch.push_back(AssetInput {
+            asset_type: symbol_short!("GENSET"),
+            metadata: String::from_str(&env, "Valid asset"),
+            serial_number: unique_serial(&env),
+        });
+        batch.push_back(AssetInput {
+            asset_type: symbol_short!("GENSET"),
+            metadata: String::from_str(&env, ""),
+            serial_number: unique_serial(&env),
+        });
+
+        let result = client.try_batch_register_assets(&owner, &batch);
+        assert!(
+            result.is_err(),
+            "a batch containing one empty-metadata asset must be rejected"
+        );
+
+        // No asset from the batch should have been persisted.
+        assert_eq!(client.get_assets_by_owner(&owner).len(), 0);
     }
 
     #[test]

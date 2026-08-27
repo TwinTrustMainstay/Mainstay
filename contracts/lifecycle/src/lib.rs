@@ -6555,6 +6555,45 @@ mod tests {
         );
     }
 
+    /// Issue #1208: after pruning, the new oldest record's `previous_record_hash`
+    /// must not still point at a now-pruned record — that would leave the hash
+    /// chain referencing a link a verifier can never resolve.
+    #[test]
+    fn test_prune_asset_history_resets_hash_chain_anchor() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 10);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        for _i in 0..10 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &Priority::Low,
+                &String::from_str(&env, "Maintenance"),
+                &engineer,
+            );
+        }
+
+        // Before pruning, every record but the first chains to its predecessor.
+        let history_before = client.get_maintenance_history(&asset_id);
+        assert!(history_before.get(0).unwrap().previous_record_hash.is_none());
+        assert!(history_before.get(1).unwrap().previous_record_hash.is_some());
+
+        client.update_max_history(&admin, &3);
+        client.prune_asset_history(&admin, &asset_id);
+
+        let history_after = client.get_maintenance_history(&asset_id);
+        assert_eq!(history_after.len(), 3u32);
+        assert!(
+            history_after.get(0).unwrap().previous_record_hash.is_none(),
+            "new oldest record must not chain to a pruned record"
+        );
+    }
+
     /// Issue #1072: pruning must recalculate and persist the collateral score
     /// immediately, otherwise readers of the raw stored score (e.g.
     /// `take_health_snapshot`, which does not recompute from live history)
