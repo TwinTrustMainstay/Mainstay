@@ -19,20 +19,12 @@ pub struct TransferRecord {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Priority level for a maintenance record.
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Priority {
     Low = 0,
     Medium = 1,
     High = 2,
     Critical = 3,
-/// Urgency/severity of a maintenance task.
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Priority {
-    Low,
-    Medium,
-    High,
-    Critical,
 }
 
 #[contracttype]
