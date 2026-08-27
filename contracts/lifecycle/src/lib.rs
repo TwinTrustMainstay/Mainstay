@@ -390,6 +390,40 @@ fn release_reentrancy_guard(env: &Env) {
     env.storage().instance().remove(&REENTRANCY_LOCK);
 }
 
+/// Advances `next_due` on every active recurring task of `asset_id` whose
+/// `task_type` matches a maintenance submission that just completed.
+///
+/// Mirrors the `next_due` update already performed by `auto_create_recurring_task`
+/// (`timestamp + interval_value`) so a manually-submitted record that happens to
+/// satisfy a recurring schedule keeps that schedule from going perpetually overdue.
+fn advance_recurring_tasks_on_submission(
+    env: &Env,
+    asset_id: u64,
+    task_type: &Symbol,
+    timestamp: u64,
+) {
+    let tasks_key = DataKey::RecurringTasks(asset_id);
+    let mut tasks: Vec<RecurringTask> = match env.storage().persistent().get(&tasks_key) {
+        Some(t) => t,
+        None => return,
+    };
+
+    let mut changed = false;
+    for i in 0..tasks.len() {
+        let mut task = tasks.get(i).unwrap();
+        if task.is_active && task.task_type == *task_type {
+            task.next_due = timestamp.saturating_add(task.interval_value);
+            tasks.set(i, task);
+            changed = true;
+        }
+    }
+
+    if changed {
+        env.storage().persistent().set(&tasks_key, &tasks);
+        extend_persistent_ttl(env, &tasks_key);
+    }
+}
+
 pub(crate) fn require_admin(env: &Env, admin: &Address) {
     admin.require_auth();
     let config: Config = env
@@ -1983,6 +2017,10 @@ impl Lifecycle {
             .set(&history_key(asset_id), &history);
         extend_persistent_ttl(&env, &history_key(asset_id));
 
+        // #1222: Advance next_due for any recurring task this submission satisfies,
+        // so the schedule doesn't stay perpetually overdue after the first submission.
+        advance_recurring_tasks_on_submission(&env, asset_id, &task_type, timestamp);
+
         engineer_history_add(&env, &engineer, asset_id, config.max_engineer_history);
 
         // Accumulate score: add this submission's increment to the stored score (cap at 100).
@@ -2413,7 +2451,6 @@ impl Lifecycle {
                 timestamp,
                 cost: rec_cost,
                 ownership_start_ledger,
-            });
                 previous_record_hash: chain_link,
             };
             chain_link = Some(hash_maintenance_record(&env, &new_record));
@@ -2434,6 +2471,14 @@ impl Lifecycle {
                 (EVENT_MAINT, asset_id),
                 (record.task_type.clone(), record.priority, engineer.clone(), timestamp),
             );
+            // #1221: Critical-priority records get no elevated authorization check,
+            // so alert lenders/watchers directly via a dedicated event instead.
+            if record.priority == Priority::Critical {
+                env.events().publish(
+                    (symbol_short!("CRIT_MNT"), asset_id),
+                    (record.task_type.clone(), engineer.clone(), timestamp),
+                );
+            }
         }
 
         // Add to engineer history only once per asset per batch
@@ -3462,6 +3507,54 @@ impl Lifecycle {
         env.events().publish(
             (symbol_short!("MARK_DUP"), asset_id),
             (primary_id, duplicate_id, env.ledger().timestamp()),
+        );
+    }
+
+    /// Clear a previously-marked duplicate maintenance record.
+    ///
+    /// Admin-only. Removes `duplicate_id` from the asset's `DuplicateRecords` list
+    /// so it no longer keeps the list — and the O(n*m) scan `compute_decay`
+    /// performs against it — growing indefinitely (#1223).
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `duplicate_id` - The timestamp of the previously-marked duplicate record to clear
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::DuplicateRecordNotFound`] if `duplicate_id` is not currently marked
+    pub fn clear_duplicate_record(env: Env, admin: Address, asset_id: u64, duplicate_id: u64) {
+        ensure_not_paused(&env);
+        require_admin(&env, &admin);
+
+        let duplicates: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DuplicateRecords(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut remaining: Vec<u64> = Vec::new(&env);
+        let mut found = false;
+        for d in duplicates.iter() {
+            if d == duplicate_id {
+                found = true;
+            } else {
+                remaining.push_back(d);
+            }
+        }
+        if !found {
+            panic_with_error!(&env, ContractError::DuplicateRecordNotFound);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::DuplicateRecords(asset_id), &remaining);
+        extend_persistent_ttl(&env, &DataKey::DuplicateRecords(asset_id));
+
+        env.events().publish(
+            (symbol_short!("CLR_DUP"), asset_id),
+            (duplicate_id, env.ledger().timestamp()),
         );
     }
 
@@ -14651,5 +14744,108 @@ mod tests {
         // Offset beyond available assets
         let assets = lifecycle.get_assets_by_owner(&owner, &10, &5);
         assert_eq!(assets.len(), 0);
+    }
+
+    // ---------------------------------------------------------------------------
+    //  #1222: next_due advances after a matching submit_maintenance call
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_next_due_advances_after_matching_submission() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_id, owner, engineer) = setup_chain_test(&env);
+
+        client.schedule_recurring_task(
+            &owner,
+            &asset_id,
+            &1u64,
+            &symbol_short!("OIL_CHG"),
+            &symbol_short!("DAYS"),
+            &30u64,
+        );
+        let original_next_due = client.get_recurring_tasks(&asset_id).get(0).unwrap().next_due;
+
+        env.ledger().set_timestamp(env.ledger().timestamp() + 100);
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "Scheduled oil change"),
+            &engineer,
+            &None,
+        );
+
+        let task = client.get_recurring_tasks(&asset_id).get(0).unwrap();
+        assert!(task.next_due > original_next_due);
+        assert_eq!(task.next_due, env.ledger().timestamp() + 30u64);
+    }
+
+    // ---------------------------------------------------------------------------
+    //  #1221: Critical-priority batch records emit a dedicated alert event
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_batch_submit_critical_priority_emits_dedicated_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_id, _owner, engineer) = setup_chain_test(&env);
+
+        let mut records = Vec::new(&env);
+        records.push_back(BatchRecord {
+            task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
+            notes: String::from_str(&env, "Routine"),
+        });
+        records.push_back(BatchRecord {
+            task_type: symbol_short!("ENGINE"),
+            priority: Priority::Critical,
+            notes: String::from_str(&env, "Engine failure"),
+        });
+
+        client.batch_submit_maintenance(&asset_id, &records, &engineer, &None);
+
+        let events = env.events().all();
+        let crit_count = events
+            .iter()
+            .filter(|(_, topics, _)| {
+                let t0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+                t0.map(|s: Symbol| s == symbol_short!("CRIT_MNT")).unwrap_or(false)
+            })
+            .count();
+        assert_eq!(crit_count, 1);
+    }
+
+    // ---------------------------------------------------------------------------
+    //  #1223: clear_duplicate_record removes a stale DuplicateRecords entry
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "DuplicateRecordNotFound")]
+    fn test_clear_duplicate_record_removes_entry() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry, engineer_registry, admin) = setup(&env, 0);
+        let (asset_id, owner) = register_asset(&env, &asset_registry);
+        let engineer = register_engineer(&env, &engineer_registry);
+
+        client.schedule_recurring_task(
+            &owner,
+            &asset_id,
+            &1u64,
+            &symbol_short!("OIL_CHG"),
+            &symbol_short!("HOURS"),
+            &3600u64,
+        );
+        client.auto_create_recurring_task(&asset_id, &1u64, &engineer);
+
+        let ts = client.get_maintenance_history(&asset_id).get(0).unwrap().timestamp;
+        client.mark_maintenance_as_duplicate(&admin, &asset_id, &0u64, &ts);
+
+        // First clear succeeds and actually removes the entry...
+        client.clear_duplicate_record(&admin, &asset_id, &ts);
+        // ...so clearing the same, already-cleared entry again must panic.
+        client.clear_duplicate_record(&admin, &asset_id, &ts);
     }
 }

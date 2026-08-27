@@ -43,6 +43,10 @@ pub enum ContractError {
     UnauthorizedLender = 21,
     LoanIdMismatch = 22,
     AssetNotLocked = 23,
+    /// Engineer's specialization does not match the asset's type.
+    /// Mirrors lifecycle::ContractError::SpecializationMismatch so cross-contract
+    /// calls decode this discriminant correctly.
+    SpecializationMismatch = 30,
     /// An unexpired ownership transfer is already pending for this asset.
     TransferAlreadyPending = 24,
     /// No pending ownership transfer exists for this asset.
@@ -9120,5 +9124,14 @@ mod tests {
         assert_ne!(asset_a.asset_id, asset_b.asset_id);
         assert_eq!(asset_a.serial_number, serial_a);
         assert_eq!(asset_b.serial_number, serial_b);
+    }
+
+    // #1220: asset-registry's ContractError must define SpecializationMismatch at the
+    // same discriminant (30) that lifecycle's ContractError uses for the same variant,
+    // so a caller decoding an error propagated across the two contracts resolves the
+    // same variant instead of an unknown discriminant.
+    #[test]
+    fn test_specialization_mismatch_discriminant_matches_lifecycle() {
+        assert_eq!(ContractError::SpecializationMismatch as u32, 30);
     }
 }
