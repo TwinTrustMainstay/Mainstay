@@ -19,20 +19,12 @@ pub struct TransferRecord {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Priority level for a maintenance record.
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Priority {
     Low = 0,
     Medium = 1,
     High = 2,
     Critical = 3,
-/// Urgency/severity of a maintenance task.
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Priority {
-    Low,
-    Medium,
-    High,
-    Critical,
 }
 
 #[contracttype]
@@ -51,10 +43,9 @@ pub struct MaintenanceRecord {
     pub cost: Option<u64>,
     /// The ledger sequence number at which the current ownership period started.
     ///
-    /// Set to `Some(ledger)` on the first maintenance record submitted after an
-    /// ownership transfer (and propagated to all subsequent records in that
-    /// ownership period).  `None` for records created before any transfer has
-    /// occurred or for the XFER sentinel records themselves.
+    /// Set to `Some(ledger)` on the XFER sentinel written by `record_transfer`
+    /// and propagated to all subsequent records in that ownership period.
+    /// `None` for records created before any transfer has occurred.
     ///
     /// DeFi lenders can use this field together with
     /// [`LifecycleContract::get_maintenance_history_since_transfer`] to isolate

@@ -57,6 +57,20 @@ Use `propose_deregister_asset` → `execute_deregister_asset` (48-hr timelock) w
 - You need to free up the serial-number dedup slot for a corrected registration.
 - Full removal is acceptable.
 
+## Transfer Rules by Deprecation State
+
+`transfer_asset` and `initiate_ownership_transfer` (the propose step of the two-step
+transfer flow) both reject any asset whose `deprecation_status` is not `Active`:
+
+| `deprecation_status` | Transferable? | Error on attempt         |
+|-----------------------|----------------|---------------------------|
+| `Active`               | Yes            | —                          |
+| `Deprecated`           | No             | `AssetDecommissioned`    |
+| `Decommissioned`       | No             | `AssetDecommissioned`    |
+
+This applies regardless of the asset's separate admin-controlled decommission flag —
+either lifecycle state alone is sufficient to block a transfer.
+
 ## API Reference
 
 ### Asset Registry

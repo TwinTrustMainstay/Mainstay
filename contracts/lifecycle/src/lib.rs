@@ -13,7 +13,7 @@ pub(crate) use storage::{
     engineer_auth_key, engineer_history_key, frozen_key, frozen_score_key,
     health_snapshot_key, history_key, last_update_key, revoke_eng_timelock_key,
     score_history_key, score_key, scoring_weights_key, standard_key, timelock_key,
-    transfer_hist_key,
+    transfer_hist_key, submission_window_key,
 };
 
 // Re-export event constants at the crate root for the same reason.
@@ -27,13 +27,11 @@ use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_
 use crate::types::{
     BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
     ScoreEntry, TimelockProposal, TransferRecord, WeightProposal,
-    ScoreEntry, TimelockProposal, TransferRecord,
 };
 use shared::extend_persistent_ttl;
 use shared::validation::require_non_empty_vec;
 use shared::{TIMELOCK_DELAY_SECS, DEFAULT_DECAY_INTERVAL_SECS, DEFAULT_TTL_LEDGERS};
 use shared::{TTL_THRESHOLD, TTL_TARGET};
-use shared::TTL_THRESHOLD;
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contractimpl, panic_with_error, symbol_short, Address, Bytes, BytesN, Env, Map,
@@ -64,6 +62,10 @@ const DEFAULT_DECAY_RATE: u32 = 5;
 const DEFAULT_DECAY_INTERVAL: u64 = 2_592_000;
 const DEFAULT_ELIGIBILITY_THRESHOLD: u32 = 50;
 const DEFAULT_MAX_NOTES_LENGTH: u32 = 256;
+/// Default per-engineer cap on maintenance submissions within a rolling hour.
+const DEFAULT_MAX_SUBMISSIONS_PER_HOUR: u32 = 20;
+/// Length of the rolling submission-rate window, in seconds.
+const SUBMISSION_RATE_WINDOW_SECS: u64 = 3600;
 
 fn effective_min_collateral_score(config: &Config) -> u32 {
     if config.min_collateral_score > 0 {
@@ -98,12 +100,25 @@ pub const MAX_BATCH_SIZE: u32 = 50;
 /// Upper bound on `limit` accepted by [`LifecycleContract::get_maintenance_history_page`].
 /// Without this cap a caller could pass an arbitrarily large `limit` and reintroduce
 /// the unbounded-response failure the paginated endpoint exists to prevent.
+///
+/// This endpoint predates [`get_maintenance_history_paginated`] and its cap was
+/// never tightened to match. The two limits are kept intentionally distinct
+/// (see [`MAX_PAGINATED_LIMIT`]) rather than unified, since `get_maintenance_history_page`
+/// already has external callers relying on its current 100-record cap; lowering it
+/// would be a breaking change for those integrators. Prefer
+/// [`LifecycleContract::get_maintenance_history_paginated`] with [`MAX_PAGINATED_LIMIT`]
+/// for new integrations, and see #996 / #1209 for the history behind this split.
 pub const MAX_PAGE_SIZE: u32 = 100;
 /// Upper bound on `limit` accepted by
 /// [`LifecycleContract::get_maintenance_history_paginated`].
 ///
 /// Stricter than [`MAX_PAGE_SIZE`] (100) to keep individual responses
 /// well within Soroban's per-call data budget as history grows (#996).
+///
+/// `get_maintenance_history_paginated` is the newer, preferred pagination
+/// endpoint (see its doc comment for the full list of differences from
+/// [`LifecycleContract::get_maintenance_history_page`]); its stricter cap was
+/// chosen deliberately when the endpoint was added and is not a bug — see #1209.
 pub const MAX_PAGINATED_LIMIT: u32 = 50;
 const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
 /// Minimum score returned for an asset that has at least one maintenance record.
@@ -264,6 +279,43 @@ fn require_engineer_authorized(env: &Env, asset_id: u64, engineer: &Address) {
     extend_persistent_ttl(env, &key);
 }
 
+/// Enforce the per-engineer `max_submissions_per_hour` rate limit for a
+/// submission of `count` records (1 for `submit_maintenance`, the full batch
+/// size for `batch_submit_maintenance`). The combined count is checked
+/// against the remaining allowance in the current rolling-hour window
+/// *before* any record is written, so a single large batch cannot bypass the
+/// cap the way `count` individual calls would be blocked.
+fn enforce_submission_rate(env: &Env, engineer: &Address, config: &Config, count: u32) {
+    if config.max_submissions_per_hour == 0 {
+        return;
+    }
+
+    let key = submission_window_key(engineer);
+    let (window_start, existing_count): (u64, u32) =
+        env.storage().persistent().get(&key).unwrap_or((0, 0));
+
+    let now = env.ledger().timestamp();
+    let (new_window_start, base_count) = if now.saturating_sub(window_start) >= SUBMISSION_RATE_WINDOW_SECS {
+        (now, 0u32)
+    } else {
+        (window_start, existing_count)
+    };
+
+    let new_count = base_count
+        .checked_add(count)
+        .unwrap_or(u32::MAX);
+    if new_count > config.max_submissions_per_hour {
+        env.events().publish(
+            (symbol_short!("RATE_LIM"), engineer.clone()),
+            (base_count, count, config.max_submissions_per_hour),
+        );
+        panic_with_error!(env, ContractError::RateLimitExceeded);
+    }
+
+    env.storage().persistent().set(&key, &(new_window_start, new_count));
+    extend_persistent_ttl(env, &key);
+}
+
 pub(crate) fn engineer_history_add(env: &Env, engineer: &Address, asset_id: u64, max_history: u32) {
     let key = engineer_history_key(engineer);
     let mut ids: Vec<u64> = env
@@ -375,6 +427,40 @@ fn acquire_reentrancy_guard(env: &Env) {
 /// Release the reentrancy lock acquired by [`acquire_reentrancy_guard`].
 fn release_reentrancy_guard(env: &Env) {
     env.storage().instance().remove(&REENTRANCY_LOCK);
+}
+
+/// Advances `next_due` on every active recurring task of `asset_id` whose
+/// `task_type` matches a maintenance submission that just completed.
+///
+/// Mirrors the `next_due` update already performed by `auto_create_recurring_task`
+/// (`timestamp + interval_value`) so a manually-submitted record that happens to
+/// satisfy a recurring schedule keeps that schedule from going perpetually overdue.
+fn advance_recurring_tasks_on_submission(
+    env: &Env,
+    asset_id: u64,
+    task_type: &Symbol,
+    timestamp: u64,
+) {
+    let tasks_key = DataKey::RecurringTasks(asset_id);
+    let mut tasks: Vec<RecurringTask> = match env.storage().persistent().get(&tasks_key) {
+        Some(t) => t,
+        None => return,
+    };
+
+    let mut changed = false;
+    for i in 0..tasks.len() {
+        let mut task = tasks.get(i).unwrap();
+        if task.is_active && task.task_type == *task_type {
+            task.next_due = timestamp.saturating_add(task.interval_value);
+            tasks.set(i, task);
+            changed = true;
+        }
+    }
+
+    if changed {
+        env.storage().persistent().set(&tasks_key, &tasks);
+        extend_persistent_ttl(env, &tasks_key);
+    }
 }
 
 pub(crate) fn require_admin(env: &Env, admin: &Address) {
@@ -1970,6 +2056,10 @@ impl Lifecycle {
             .set(&history_key(asset_id), &history);
         extend_persistent_ttl(&env, &history_key(asset_id));
 
+        // #1222: Advance next_due for any recurring task this submission satisfies,
+        // so the schedule doesn't stay perpetually overdue after the first submission.
+        advance_recurring_tasks_on_submission(&env, asset_id, &task_type, timestamp);
+
         engineer_history_add(&env, &engineer, asset_id, config.max_engineer_history);
 
         // Accumulate score: add this submission's increment to the stored score (cap at 100).
@@ -2077,19 +2167,30 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::UnauthorizedOwner);
         }
 
+        // Invalidate all per-asset engineer authorizations on every ownership
+        // transfer so an engineer authorized by the previous owner cannot keep
+        // submitting maintenance records against the new owner without being
+        // re-authorized.
+        let auth_list_key = authorized_engineers_key(asset_id);
+        let authorized_engineers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&auth_list_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        for eng in authorized_engineers.iter() {
+            env.storage()
+                .persistent()
+                .remove(&engineer_auth_key(asset_id, &eng));
+        }
+        env.storage().persistent().remove(&auth_list_key);
+
         let timestamp = env.ledger().timestamp();
-        let sentinel = MaintenanceRecord {
-            asset_id,
-            task_type: symbol_short!("XFER"),
-            priority: Priority::Low,
-            notes: String::from_str(&env, "Ownership transferred"),
-            engineer: new_owner.clone(),
-            timestamp,
-            cost: None,
-            // XFER sentinel records are ownership boundary markers, not maintenance
-            // events; ownership_start_ledger is not meaningful for them.
-            ownership_start_ledger: None,
-        };
+        // Record the current ledger sequence as the ownership_start_ledger for this
+        // asset. The XFER sentinel itself carries this value (rather than `None`) so
+        // that `get_maintenance_history_since_transfer` can anchor on the sentinel to
+        // distinguish pre- and post-transfer records; all subsequent maintenance
+        // records also carry this value.
+        let current_ledger = env.ledger().sequence();
 
         let mut history: Vec<MaintenanceRecord> = env
             .storage()
@@ -2110,6 +2211,7 @@ impl Lifecycle {
             engineer: new_owner.clone(),
             timestamp,
             cost: None,
+            ownership_start_ledger: Some(current_ledger),
             previous_record_hash,
         };
         history.push_back(sentinel);
@@ -2119,10 +2221,6 @@ impl Lifecycle {
             .set(&history_key(asset_id), &history);
         extend_persistent_ttl(&env, &history_key(asset_id));
 
-        // Record the current ledger sequence as the ownership_start_ledger for this
-        // asset. All subsequent maintenance records will carry this value so lenders
-        // can determine which records belong to the current owner's tenure.
-        let current_ledger = env.ledger().sequence();
         env.storage()
             .persistent()
             .set(&DataKey::OwnershipStartLedger(asset_id), &current_ledger);
@@ -2400,7 +2498,6 @@ impl Lifecycle {
                 timestamp,
                 cost: rec_cost,
                 ownership_start_ledger,
-            });
                 previous_record_hash: chain_link,
             };
             chain_link = Some(hash_maintenance_record(&env, &new_record));
@@ -2421,6 +2518,14 @@ impl Lifecycle {
                 (EVENT_MAINT, asset_id),
                 (record.task_type.clone(), record.priority, engineer.clone(), timestamp),
             );
+            // #1221: Critical-priority records get no elevated authorization check,
+            // so alert lenders/watchers directly via a dedicated event instead.
+            if record.priority == Priority::Critical {
+                env.events().publish(
+                    (symbol_short!("CRIT_MNT"), asset_id),
+                    (record.task_type.clone(), engineer.clone(), timestamp),
+                );
+            }
         }
 
         // Add to engineer history only once per asset per batch
@@ -2739,6 +2844,14 @@ impl Lifecycle {
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::AssetNotFound`] if the asset does not exist
     ///
+    /// # vs. `get_maintenance_history_page`
+    /// This contract also exposes [`get_maintenance_history_page`], an older
+    /// endpoint with the same `(asset_id, offset, limit)` shape but a looser
+    /// [`MAX_PAGE_SIZE`] (100) cap. The two are kept separate rather than
+    /// merged so existing `get_maintenance_history_page` callers are not
+    /// broken by a lower cap (see #1209). New integrations should prefer
+    /// this function.
+    ///
     /// # Deprecation note
     /// [`get_maintenance_history`] (unbounded) is deprecated. New integrations
     /// should use this function or [`get_maintenance_history_page`].
@@ -2819,7 +2932,10 @@ impl Lifecycle {
     /// done should use this function instead of [`get_maintenance_history`].  All
     /// returned records will have `ownership_start_ledger == Some(ledger)` where
     /// `ledger` is the sequence number at which the most recent transfer was
-    /// recorded.
+    /// recorded. The XFER sentinel record itself also carries this same
+    /// `ownership_start_ledger` value (see [`LifecycleContract::record_transfer`]),
+    /// but is excluded from the returned Vec since it is a boundary marker, not
+    /// a maintenance event.
     ///
     /// If the asset has never been transferred, this function returns the full
     /// maintenance history (excluding any future XFER sentinels, of which there
@@ -2885,6 +3001,14 @@ impl Lifecycle {
     ///
     /// # Panics
     /// - [`ContractError::IndexOutOfBounds`] if `offset` >= history length
+    ///
+    /// # vs. `get_maintenance_history_paginated`
+    /// [`get_maintenance_history_paginated`] offers the same `(asset_id, offset,
+    /// limit)` shape with a stricter [`MAX_PAGINATED_LIMIT`] (50) cap. This
+    /// function's looser 100-record cap is kept as-is for backward
+    /// compatibility with existing callers rather than unified with the
+    /// stricter endpoint (see #1209). Prefer `get_maintenance_history_paginated`
+    /// for new integrations.
     pub fn get_maintenance_history_page(
         env: Env,
         asset_id: u64,
@@ -3436,6 +3560,54 @@ impl Lifecycle {
         );
     }
 
+    /// Clear a previously-marked duplicate maintenance record.
+    ///
+    /// Admin-only. Removes `duplicate_id` from the asset's `DuplicateRecords` list
+    /// so it no longer keeps the list — and the O(n*m) scan `compute_decay`
+    /// performs against it — growing indefinitely (#1223).
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `duplicate_id` - The timestamp of the previously-marked duplicate record to clear
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::DuplicateRecordNotFound`] if `duplicate_id` is not currently marked
+    pub fn clear_duplicate_record(env: Env, admin: Address, asset_id: u64, duplicate_id: u64) {
+        ensure_not_paused(&env);
+        require_admin(&env, &admin);
+
+        let duplicates: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DuplicateRecords(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut remaining: Vec<u64> = Vec::new(&env);
+        let mut found = false;
+        for d in duplicates.iter() {
+            if d == duplicate_id {
+                found = true;
+            } else {
+                remaining.push_back(d);
+            }
+        }
+        if !found {
+            panic_with_error!(&env, ContractError::DuplicateRecordNotFound);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::DuplicateRecords(asset_id), &remaining);
+        extend_persistent_ttl(&env, &DataKey::DuplicateRecords(asset_id));
+
+        env.events().publish(
+            (symbol_short!("CLR_DUP"), asset_id),
+            (duplicate_id, env.ledger().timestamp()),
+        );
+    }
+
     // ---------------------------------------------------------------------------
     //  Maintenance Compliance Standards
     // ---------------------------------------------------------------------------
@@ -3669,6 +3841,12 @@ impl Lifecycle {
             .get::<_, bool>(&frozen_key(asset_id))
             .unwrap_or(false)
         {
+            // Extend the frozen score's TTL on every read, not just on write, so
+            // an infrequently-queried frozen asset never silently loses its
+            // preserved score to TTL expiry and falls back to 0.
+            if env.storage().persistent().has(&frozen_score_key(asset_id)) {
+                extend_persistent_ttl(&env, &frozen_score_key(asset_id));
+            }
             return Some(
                 env.storage()
                     .persistent()
@@ -4289,6 +4467,11 @@ impl Lifecycle {
             let score = if asset.deprecation_status != asset_registry::DeprecationStatus::Active {
                 0
             } else if env.storage().persistent().get::<_, bool>(&frozen_key(asset_id)).unwrap_or(false) {
+                // Extend TTL on read (mirrors `get_collateral_score_opt`) so the
+                // frozen score survives regardless of read/write cadence.
+                if env.storage().persistent().has(&frozen_score_key(asset_id)) {
+                    extend_persistent_ttl(&env, &frozen_score_key(asset_id));
+                }
                 env.storage().persistent().get(&frozen_score_key(asset_id)).unwrap_or(0)
             } else {
                 compute_read_only_collateral_score(&env, asset_id, &asset.asset_type, &config)
@@ -4681,6 +4864,10 @@ impl Lifecycle {
         env.events().publish(
             (EVENT_RECONSTR, asset_id),
             (snapshot_index, snapshot.score, snapshot.timestamp),
+        );
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("RECON")),
+            (admin, asset_id, env.ledger().timestamp()),
         );
     }
 
@@ -6552,6 +6739,45 @@ mod tests {
         assert_eq!(
             last_before.timestamp, last_after.timestamp,
             "Most recent entries should be kept"
+        );
+    }
+
+    /// Issue #1208: after pruning, the new oldest record's `previous_record_hash`
+    /// must not still point at a now-pruned record — that would leave the hash
+    /// chain referencing a link a verifier can never resolve.
+    #[test]
+    fn test_prune_asset_history_resets_hash_chain_anchor() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 10);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        for _i in 0..10 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &Priority::Low,
+                &String::from_str(&env, "Maintenance"),
+                &engineer,
+            );
+        }
+
+        // Before pruning, every record but the first chains to its predecessor.
+        let history_before = client.get_maintenance_history(&asset_id);
+        assert!(history_before.get(0).unwrap().previous_record_hash.is_none());
+        assert!(history_before.get(1).unwrap().previous_record_hash.is_some());
+
+        client.update_max_history(&admin, &3);
+        client.prune_asset_history(&admin, &asset_id);
+
+        let history_after = client.get_maintenance_history(&asset_id);
+        assert_eq!(history_after.len(), 3u32);
+        assert!(
+            history_after.get(0).unwrap().previous_record_hash.is_none(),
+            "new oldest record must not chain to a pruned record"
         );
     }
 
@@ -13218,6 +13444,53 @@ mod tests {
     }
 
     #[test]
+    fn test_frozen_score_survives_ttl_expiry_via_get_collateral_score_opt() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, engineer_registry, _admin) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry);
+        let engineer = register_engineer(&env, &engineer_registry);
+        lifecycle.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        for _ in 0..5 {
+            lifecycle.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &Priority::Low,
+                &String::from_str(&env, "Pre-decommission service"),
+                &engineer,
+                &None,
+            );
+        }
+
+        lifecycle.decommission_notify(&asset_id);
+        let frozen_score = lifecycle.get_collateral_score_opt(&asset_id).unwrap();
+        assert!(frozen_score > 0, "expected a non-zero frozen score");
+
+        // Cross the frozen score's TTL boundary without reading it — this alone
+        // must not lose the value, and reading it via get_collateral_score_opt
+        // must bump the TTL again so a *second* boundary crossing also survives.
+        env.ledger().with_mut(|li| {
+            li.sequence_number += 518_401;
+        });
+        assert_eq!(
+            lifecycle.get_collateral_score_opt(&asset_id),
+            Some(frozen_score),
+            "frozen score must survive one TTL boundary and be reported on read"
+        );
+
+        env.ledger().with_mut(|li| {
+            li.sequence_number += 518_401;
+        });
+        assert_eq!(
+            lifecycle.get_collateral_score_opt(&asset_id),
+            Some(frozen_score),
+            "reading the frozen score must extend its TTL so it survives a second boundary"
+        );
+    }
+
+    #[test]
     fn test_decay_score_is_zero_after_decommission() {
         let env = Env::default();
         env.mock_all_auths();
@@ -14572,5 +14845,106 @@ mod tests {
             last_val, expected_last,
             "last value should be {expected_last}, got {last_val}",
         );
+    // ---------------------------------------------------------------------------
+    //  #1222: next_due advances after a matching submit_maintenance call
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_next_due_advances_after_matching_submission() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_id, owner, engineer) = setup_chain_test(&env);
+
+        client.schedule_recurring_task(
+            &owner,
+            &asset_id,
+            &1u64,
+            &symbol_short!("OIL_CHG"),
+            &symbol_short!("DAYS"),
+            &30u64,
+        );
+        let original_next_due = client.get_recurring_tasks(&asset_id).get(0).unwrap().next_due;
+
+        env.ledger().set_timestamp(env.ledger().timestamp() + 100);
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "Scheduled oil change"),
+            &engineer,
+            &None,
+        );
+
+        let task = client.get_recurring_tasks(&asset_id).get(0).unwrap();
+        assert!(task.next_due > original_next_due);
+        assert_eq!(task.next_due, env.ledger().timestamp() + 30u64);
+    }
+
+    // ---------------------------------------------------------------------------
+    //  #1221: Critical-priority batch records emit a dedicated alert event
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_batch_submit_critical_priority_emits_dedicated_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_id, _owner, engineer) = setup_chain_test(&env);
+
+        let mut records = Vec::new(&env);
+        records.push_back(BatchRecord {
+            task_type: symbol_short!("OIL_CHG"),
+            priority: Priority::Low,
+            notes: String::from_str(&env, "Routine"),
+        });
+        records.push_back(BatchRecord {
+            task_type: symbol_short!("ENGINE"),
+            priority: Priority::Critical,
+            notes: String::from_str(&env, "Engine failure"),
+        });
+
+        client.batch_submit_maintenance(&asset_id, &records, &engineer, &None);
+
+        let events = env.events().all();
+        let crit_count = events
+            .iter()
+            .filter(|(_, topics, _)| {
+                let t0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+                t0.map(|s: Symbol| s == symbol_short!("CRIT_MNT")).unwrap_or(false)
+            })
+            .count();
+        assert_eq!(crit_count, 1);
+    }
+
+    // ---------------------------------------------------------------------------
+    //  #1223: clear_duplicate_record removes a stale DuplicateRecords entry
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "DuplicateRecordNotFound")]
+    fn test_clear_duplicate_record_removes_entry() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry, engineer_registry, admin) = setup(&env, 0);
+        let (asset_id, owner) = register_asset(&env, &asset_registry);
+        let engineer = register_engineer(&env, &engineer_registry);
+
+        client.schedule_recurring_task(
+            &owner,
+            &asset_id,
+            &1u64,
+            &symbol_short!("OIL_CHG"),
+            &symbol_short!("HOURS"),
+            &3600u64,
+        );
+        client.auto_create_recurring_task(&asset_id, &1u64, &engineer);
+
+        let ts = client.get_maintenance_history(&asset_id).get(0).unwrap().timestamp;
+        client.mark_maintenance_as_duplicate(&admin, &asset_id, &0u64, &ts);
+
+        // First clear succeeds and actually removes the entry...
+        client.clear_duplicate_record(&admin, &asset_id, &ts);
+        // ...so clearing the same, already-cleared entry again must panic.
+        client.clear_duplicate_record(&admin, &asset_id, &ts);
     }
 }
