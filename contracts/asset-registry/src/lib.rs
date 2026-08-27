@@ -43,6 +43,9 @@ pub enum ContractError {
     UnauthorizedLender = 21,
     LoanIdMismatch = 22,
     AssetNotLocked = 23,
+    /// A required configuration field was missing for the requested operation
+    /// (e.g. `SearchFilter::lifecycle_contract` when sorting by `ByCollateralScore`).
+    InvalidConfig = 24,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -194,7 +197,9 @@ pub struct SearchFilter {
     pub max_age_months: Option<u32>,
     /// How to sort the results.  Defaults to no particular order when `None`.
     pub sort: Option<SortOrder>,
-    /// Required when `sort` is [`SortOrder::ByCollateralScore`].
+    /// Required when `sort` is [`SortOrder::ByCollateralScore`]. If omitted while
+    /// that sort order is requested, `search_assets` panics with
+    /// `ContractError::InvalidConfig` instead of attempting the cross-contract call.
     pub lifecycle_contract: Option<Address>,
 }
 
@@ -244,12 +249,6 @@ const MAX_BATCH_SIZE: u32 = 50;
 pub const DEREG_TOPIC: Symbol = symbol_short!("DEREG");
 pub const ADD_TYPE_TOPIC: Symbol = symbol_short!("ADD_TYPE");
 pub const RM_TYPE_TOPIC: Symbol = symbol_short!("RM_TYPE");
-
-/// Sentinel score returned by [`AssetRegistry::get_lifecycle_score`] for assets that
-/// have never had a maintenance record submitted. Distinguishes a brand-new asset
-/// from one with an actual score of 0 (e.g. deprecated or decommissioned), so DeFi
-/// lenders don't mistake "no history yet" for "poor maintenance record".
-pub const NO_LIFECYCLE_HISTORY_SCORE: u32 = u32::MAX;
 
 fn asset_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("ASSET"), id)
@@ -2341,13 +2340,14 @@ impl AssetRegistry {
     /// * `lifecycle_contract` - The address of the Lifecycle contract
     ///
     /// # Returns
-    /// The collateral score (u32) for the asset, or [`NO_LIFECYCLE_HISTORY_SCORE`]
-    /// if the asset has never had a maintenance record submitted. This sentinel lets
-    /// callers distinguish a brand-new asset from one with an actual score of 0.
+    /// `Some(score)` with the collateral score for the asset, or `None` if the asset
+    /// has never had a maintenance record submitted. Returning `None` instead of a
+    /// sentinel value forces callers (e.g. DeFi lenders) to explicitly handle the
+    /// no-history case rather than risk misreading it as a valid, high score.
     ///
     /// # Panics
     /// - [`ContractError::AssetNotFound`] if the asset does not exist
-    pub fn get_lifecycle_score(env: Env, asset_id: u64, lifecycle_contract: Address) -> u32 {
+    pub fn get_lifecycle_score(env: Env, asset_id: u64, lifecycle_contract: Address) -> Option<u32> {
         // Verify asset exists in this registry
         if !Self::asset_exists(env.clone(), asset_id) {
             panic_with_error!(&env, ContractError::AssetNotFound);
@@ -2360,8 +2360,8 @@ impl AssetRegistry {
             soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(&asset_id, &env)
         ];
 
-        // A fresh asset with no maintenance history at all must be reported with the
-        // sentinel rather than the raw score, which would otherwise read as 0 and be
+        // A fresh asset with no maintenance history at all must be reported as `None`
+        // rather than the raw score, which would otherwise read as 0 and be
         // indistinguishable from a poorly-maintained (also-0) asset.
         let last_service: Option<u64> = env.invoke_contract(
             &lifecycle_contract,
@@ -2369,7 +2369,7 @@ impl AssetRegistry {
             args.clone(),
         );
         if last_service.is_none() {
-            return NO_LIFECYCLE_HISTORY_SCORE;
+            return None;
         }
 
         let score: u32 = env.invoke_contract(
@@ -2377,7 +2377,7 @@ impl AssetRegistry {
             &Symbol::new(&env, "get_collateral_score"),
             args,
         );
-        score
+        Some(score)
     }
 
     /// Decommission an asset and notify the lifecycle contract to freeze the score.
@@ -2541,6 +2541,11 @@ impl AssetRegistry {
     pub fn search_assets(env: Env, filter: SearchFilter) -> SearchPage {
         const MAX_RESULTS: u32 = 100;
         const SECS_PER_MONTH: u64 = 30 * 86_400;
+
+        if filter.sort == Some(SortOrder::ByCollateralScore) && filter.lifecycle_contract.is_none()
+        {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
 
         let total_assets: u64 = env
             .storage()
@@ -6194,8 +6199,8 @@ mod tests {
         // Get lifecycle score via cross-contract call
         let score = asset_client.get_lifecycle_score(&asset_id, &lifecycle_id);
 
-        // A fresh asset with no maintenance history returns the sentinel, not 0.
-        assert_eq!(score, NO_LIFECYCLE_HISTORY_SCORE);
+        // A fresh asset with no maintenance history returns None, not Some(0).
+        assert_eq!(score, None);
     }
 
     #[test]
@@ -7948,6 +7953,25 @@ mod tests {
         });
         assert_eq!(page.total, 2);
         assert_eq!(page.assets.len(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidConfig")]
+    fn test_search_by_collateral_score_without_lifecycle_contract_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup_search_env(&env);
+        let owner = Address::generate(&env);
+        reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "Acme Turbine"), &owner);
+
+        client.search_assets(&SearchFilter {
+            asset_type: None,
+            manufacturer: None,
+            min_age_months: None,
+            max_age_months: None,
+            sort: Some(SortOrder::ByCollateralScore),
+            lifecycle_contract: None,
+        });
     }
 
     #[test]
