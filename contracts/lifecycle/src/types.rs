@@ -17,6 +17,9 @@ pub struct TransferRecord {
 /// and DeFi collateral purposes.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Priority level for a maintenance record.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Priority {
     Low = 0,
     Medium = 1,
