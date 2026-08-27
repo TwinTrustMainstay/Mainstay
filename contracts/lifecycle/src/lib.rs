@@ -13,7 +13,7 @@ pub(crate) use storage::{
     engineer_auth_key, engineer_history_key, frozen_key, frozen_score_key,
     health_snapshot_key, history_key, last_update_key, revoke_eng_timelock_key,
     score_history_key, score_key, scoring_weights_key, standard_key, timelock_key,
-    transfer_hist_key,
+    transfer_hist_key, submission_window_key,
 };
 
 // Re-export event constants at the crate root for the same reason.
@@ -27,13 +27,11 @@ use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_
 use crate::types::{
     BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
     ScoreEntry, TimelockProposal, TransferRecord, WeightProposal,
-    ScoreEntry, TimelockProposal, TransferRecord,
 };
 use shared::extend_persistent_ttl;
 use shared::validation::require_non_empty_vec;
 use shared::{TIMELOCK_DELAY_SECS, DEFAULT_DECAY_INTERVAL_SECS, DEFAULT_TTL_LEDGERS};
 use shared::{TTL_THRESHOLD, TTL_TARGET};
-use shared::TTL_THRESHOLD;
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contractimpl, panic_with_error, symbol_short, Address, Bytes, BytesN, Env, Map,
@@ -64,6 +62,10 @@ const DEFAULT_DECAY_RATE: u32 = 5;
 const DEFAULT_DECAY_INTERVAL: u64 = 2_592_000;
 const DEFAULT_ELIGIBILITY_THRESHOLD: u32 = 50;
 const DEFAULT_MAX_NOTES_LENGTH: u32 = 256;
+/// Default per-engineer cap on maintenance submissions within a rolling hour.
+const DEFAULT_MAX_SUBMISSIONS_PER_HOUR: u32 = 20;
+/// Length of the rolling submission-rate window, in seconds.
+const SUBMISSION_RATE_WINDOW_SECS: u64 = 3600;
 
 fn effective_min_collateral_score(config: &Config) -> u32 {
     if config.min_collateral_score > 0 {
@@ -274,6 +276,43 @@ fn require_engineer_authorized(env: &Env, asset_id: u64, engineer: &Address) {
     if !authorized {
         panic_with_error!(env, ContractError::EngineerNotAuthorized);
     }
+    extend_persistent_ttl(env, &key);
+}
+
+/// Enforce the per-engineer `max_submissions_per_hour` rate limit for a
+/// submission of `count` records (1 for `submit_maintenance`, the full batch
+/// size for `batch_submit_maintenance`). The combined count is checked
+/// against the remaining allowance in the current rolling-hour window
+/// *before* any record is written, so a single large batch cannot bypass the
+/// cap the way `count` individual calls would be blocked.
+fn enforce_submission_rate(env: &Env, engineer: &Address, config: &Config, count: u32) {
+    if config.max_submissions_per_hour == 0 {
+        return;
+    }
+
+    let key = submission_window_key(engineer);
+    let (window_start, existing_count): (u64, u32) =
+        env.storage().persistent().get(&key).unwrap_or((0, 0));
+
+    let now = env.ledger().timestamp();
+    let (new_window_start, base_count) = if now.saturating_sub(window_start) >= SUBMISSION_RATE_WINDOW_SECS {
+        (now, 0u32)
+    } else {
+        (window_start, existing_count)
+    };
+
+    let new_count = base_count
+        .checked_add(count)
+        .unwrap_or(u32::MAX);
+    if new_count > config.max_submissions_per_hour {
+        env.events().publish(
+            (symbol_short!("RATE_LIM"), engineer.clone()),
+            (base_count, count, config.max_submissions_per_hour),
+        );
+        panic_with_error!(env, ContractError::RateLimitExceeded);
+    }
+
+    env.storage().persistent().set(&key, &(new_window_start, new_count));
     extend_persistent_ttl(env, &key);
 }
 
@@ -2128,19 +2167,30 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::UnauthorizedOwner);
         }
 
+        // Invalidate all per-asset engineer authorizations on every ownership
+        // transfer so an engineer authorized by the previous owner cannot keep
+        // submitting maintenance records against the new owner without being
+        // re-authorized.
+        let auth_list_key = authorized_engineers_key(asset_id);
+        let authorized_engineers: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&auth_list_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        for eng in authorized_engineers.iter() {
+            env.storage()
+                .persistent()
+                .remove(&engineer_auth_key(asset_id, &eng));
+        }
+        env.storage().persistent().remove(&auth_list_key);
+
         let timestamp = env.ledger().timestamp();
-        let sentinel = MaintenanceRecord {
-            asset_id,
-            task_type: symbol_short!("XFER"),
-            priority: Priority::Low,
-            notes: String::from_str(&env, "Ownership transferred"),
-            engineer: new_owner.clone(),
-            timestamp,
-            cost: None,
-            // XFER sentinel records are ownership boundary markers, not maintenance
-            // events; ownership_start_ledger is not meaningful for them.
-            ownership_start_ledger: None,
-        };
+        // Record the current ledger sequence as the ownership_start_ledger for this
+        // asset. The XFER sentinel itself carries this value (rather than `None`) so
+        // that `get_maintenance_history_since_transfer` can anchor on the sentinel to
+        // distinguish pre- and post-transfer records; all subsequent maintenance
+        // records also carry this value.
+        let current_ledger = env.ledger().sequence();
 
         let mut history: Vec<MaintenanceRecord> = env
             .storage()
@@ -2161,6 +2211,7 @@ impl Lifecycle {
             engineer: new_owner.clone(),
             timestamp,
             cost: None,
+            ownership_start_ledger: Some(current_ledger),
             previous_record_hash,
         };
         history.push_back(sentinel);
@@ -2170,10 +2221,6 @@ impl Lifecycle {
             .set(&history_key(asset_id), &history);
         extend_persistent_ttl(&env, &history_key(asset_id));
 
-        // Record the current ledger sequence as the ownership_start_ledger for this
-        // asset. All subsequent maintenance records will carry this value so lenders
-        // can determine which records belong to the current owner's tenure.
-        let current_ledger = env.ledger().sequence();
         env.storage()
             .persistent()
             .set(&DataKey::OwnershipStartLedger(asset_id), &current_ledger);
@@ -2885,7 +2932,10 @@ impl Lifecycle {
     /// done should use this function instead of [`get_maintenance_history`].  All
     /// returned records will have `ownership_start_ledger == Some(ledger)` where
     /// `ledger` is the sequence number at which the most recent transfer was
-    /// recorded.
+    /// recorded. The XFER sentinel record itself also carries this same
+    /// `ownership_start_ledger` value (see [`LifecycleContract::record_transfer`]),
+    /// but is excluded from the returned Vec since it is a boundary marker, not
+    /// a maintenance event.
     ///
     /// If the asset has never been transferred, this function returns the full
     /// maintenance history (excluding any future XFER sentinels, of which there
@@ -4814,6 +4864,10 @@ impl Lifecycle {
         env.events().publish(
             (EVENT_RECONSTR, asset_id),
             (snapshot_index, snapshot.score, snapshot.timestamp),
+        );
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("RECON")),
+            (admin, asset_id, env.ledger().timestamp()),
         );
     }
 
