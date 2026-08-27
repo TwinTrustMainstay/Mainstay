@@ -98,12 +98,25 @@ pub const MAX_BATCH_SIZE: u32 = 50;
 /// Upper bound on `limit` accepted by [`LifecycleContract::get_maintenance_history_page`].
 /// Without this cap a caller could pass an arbitrarily large `limit` and reintroduce
 /// the unbounded-response failure the paginated endpoint exists to prevent.
+///
+/// This endpoint predates [`get_maintenance_history_paginated`] and its cap was
+/// never tightened to match. The two limits are kept intentionally distinct
+/// (see [`MAX_PAGINATED_LIMIT`]) rather than unified, since `get_maintenance_history_page`
+/// already has external callers relying on its current 100-record cap; lowering it
+/// would be a breaking change for those integrators. Prefer
+/// [`LifecycleContract::get_maintenance_history_paginated`] with [`MAX_PAGINATED_LIMIT`]
+/// for new integrations, and see #996 / #1209 for the history behind this split.
 pub const MAX_PAGE_SIZE: u32 = 100;
 /// Upper bound on `limit` accepted by
 /// [`LifecycleContract::get_maintenance_history_paginated`].
 ///
 /// Stricter than [`MAX_PAGE_SIZE`] (100) to keep individual responses
 /// well within Soroban's per-call data budget as history grows (#996).
+///
+/// `get_maintenance_history_paginated` is the newer, preferred pagination
+/// endpoint (see its doc comment for the full list of differences from
+/// [`LifecycleContract::get_maintenance_history_page`]); its stricter cap was
+/// chosen deliberately when the endpoint was added and is not a bug — see #1209.
 pub const MAX_PAGINATED_LIMIT: u32 = 50;
 const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
 /// Minimum score returned for an asset that has at least one maintenance record.
@@ -2739,6 +2752,14 @@ impl Lifecycle {
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::AssetNotFound`] if the asset does not exist
     ///
+    /// # vs. `get_maintenance_history_page`
+    /// This contract also exposes [`get_maintenance_history_page`], an older
+    /// endpoint with the same `(asset_id, offset, limit)` shape but a looser
+    /// [`MAX_PAGE_SIZE`] (100) cap. The two are kept separate rather than
+    /// merged so existing `get_maintenance_history_page` callers are not
+    /// broken by a lower cap (see #1209). New integrations should prefer
+    /// this function.
+    ///
     /// # Deprecation note
     /// [`get_maintenance_history`] (unbounded) is deprecated. New integrations
     /// should use this function or [`get_maintenance_history_page`].
@@ -2885,6 +2906,14 @@ impl Lifecycle {
     ///
     /// # Panics
     /// - [`ContractError::IndexOutOfBounds`] if `offset` >= history length
+    ///
+    /// # vs. `get_maintenance_history_paginated`
+    /// [`get_maintenance_history_paginated`] offers the same `(asset_id, offset,
+    /// limit)` shape with a stricter [`MAX_PAGINATED_LIMIT`] (50) cap. This
+    /// function's looser 100-record cap is kept as-is for backward
+    /// compatibility with existing callers rather than unified with the
+    /// stricter endpoint (see #1209). Prefer `get_maintenance_history_paginated`
+    /// for new integrations.
     pub fn get_maintenance_history_page(
         env: Env,
         asset_id: u64,
@@ -3669,6 +3698,12 @@ impl Lifecycle {
             .get::<_, bool>(&frozen_key(asset_id))
             .unwrap_or(false)
         {
+            // Extend the frozen score's TTL on every read, not just on write, so
+            // an infrequently-queried frozen asset never silently loses its
+            // preserved score to TTL expiry and falls back to 0.
+            if env.storage().persistent().has(&frozen_score_key(asset_id)) {
+                extend_persistent_ttl(&env, &frozen_score_key(asset_id));
+            }
             return Some(
                 env.storage()
                     .persistent()
@@ -4289,6 +4324,11 @@ impl Lifecycle {
             let score = if asset.deprecation_status != asset_registry::DeprecationStatus::Active {
                 0
             } else if env.storage().persistent().get::<_, bool>(&frozen_key(asset_id)).unwrap_or(false) {
+                // Extend TTL on read (mirrors `get_collateral_score_opt`) so the
+                // frozen score survives regardless of read/write cadence.
+                if env.storage().persistent().has(&frozen_score_key(asset_id)) {
+                    extend_persistent_ttl(&env, &frozen_score_key(asset_id));
+                }
                 env.storage().persistent().get(&frozen_score_key(asset_id)).unwrap_or(0)
             } else {
                 compute_read_only_collateral_score(&env, asset_id, &asset.asset_type, &config)
@@ -13253,6 +13293,53 @@ mod tests {
         assert_eq!(
             score_after, 0,
             "decommissioned asset must report collateral score of 0 (got {score_after})"
+        );
+    }
+
+    #[test]
+    fn test_frozen_score_survives_ttl_expiry_via_get_collateral_score_opt() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, engineer_registry, _admin) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry);
+        let engineer = register_engineer(&env, &engineer_registry);
+        lifecycle.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        for _ in 0..5 {
+            lifecycle.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &Priority::Low,
+                &String::from_str(&env, "Pre-decommission service"),
+                &engineer,
+                &None,
+            );
+        }
+
+        lifecycle.decommission_notify(&asset_id);
+        let frozen_score = lifecycle.get_collateral_score_opt(&asset_id).unwrap();
+        assert!(frozen_score > 0, "expected a non-zero frozen score");
+
+        // Cross the frozen score's TTL boundary without reading it — this alone
+        // must not lose the value, and reading it via get_collateral_score_opt
+        // must bump the TTL again so a *second* boundary crossing also survives.
+        env.ledger().with_mut(|li| {
+            li.sequence_number += 518_401;
+        });
+        assert_eq!(
+            lifecycle.get_collateral_score_opt(&asset_id),
+            Some(frozen_score),
+            "frozen score must survive one TTL boundary and be reported on read"
+        );
+
+        env.ledger().with_mut(|li| {
+            li.sequence_number += 518_401;
+        });
+        assert_eq!(
+            lifecycle.get_collateral_score_opt(&asset_id),
+            Some(frozen_score),
+            "reading the frozen score must extend its TTL so it survives a second boundary"
         );
     }
 
