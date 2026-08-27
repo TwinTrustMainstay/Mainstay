@@ -52,7 +52,15 @@ pub fn valuation_history_push(env: &Env, asset_id: u64, timestamp: u64, value: u
         }
     }
 
-    if max_history > 0 && history.len() >= max_history {
+    // Treat max_history == 0 as "use contract default" so callers that pass
+    // zero (e.g. during initialisation before config is set) never leave the
+    // history vector unbounded.  Fixes #1198.
+    let effective_max = if max_history == 0 {
+        super::DEFAULT_MAX_HISTORY
+    } else {
+        max_history
+    };
+    if history.len() >= effective_max {
         history.remove(0);
     }
     history.push_back((timestamp, value));

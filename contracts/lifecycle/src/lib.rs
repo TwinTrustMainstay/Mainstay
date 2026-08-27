@@ -14526,4 +14526,51 @@ mod tests {
         let assets = lifecycle.get_assets_by_owner(&owner, &10, &5);
         assert_eq!(assets.len(), 0);
     }
+
+    /// #1198 — valuation_history_push must cap at DEFAULT_MAX_HISTORY (200)
+    /// when max_history == 0, not grow without bound.
+    ///
+    /// Push DEFAULT_MAX_HISTORY + 5 entries with max_history == 0 and assert
+    /// the stored vector length stays at DEFAULT_MAX_HISTORY.
+    #[test]
+    fn test_valuation_history_push_caps_at_default_when_max_history_is_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let asset_id: u64 = 42;
+        // Push one more than the default cap to confirm the oldest entry is
+        // evicted rather than the vector growing unbounded.
+        let push_count = DEFAULT_MAX_HISTORY + 5;
+        for i in 0..push_count {
+            scoring::valuation_history_push(&env, asset_id, i as u64, i as u64, 0);
+        }
+
+        let key = DataKey::CollateralValuationHistory(asset_id);
+        let history: soroban_sdk::Vec<(u64, u64)> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .expect("valuation history should be present");
+
+        assert_eq!(
+            history.len(),
+            DEFAULT_MAX_HISTORY,
+            "history length should be capped at DEFAULT_MAX_HISTORY ({DEFAULT_MAX_HISTORY}) \
+             when max_history == 0, got {}",
+            history.len(),
+        );
+
+        // The oldest entries must have been evicted; the last entry should be
+        // the most recently pushed value.
+        let (last_ts, last_val) = history.get(history.len() - 1).unwrap();
+        let expected_last = (push_count - 1) as u64;
+        assert_eq!(
+            last_ts, expected_last,
+            "last timestamp should be {expected_last}, got {last_ts}",
+        );
+        assert_eq!(
+            last_val, expected_last,
+            "last value should be {expected_last}, got {last_val}",
+        );
+    }
 }
