@@ -109,16 +109,6 @@ pub struct MetadataHistoryEntry {
     pub old_hash: BytesN<32>,
     pub new_hash: BytesN<32>,
     pub updated_at: u64,
-    /// Soft lifecycle status set by the owner. Defaults to `Active` on registration.
-    pub deprecation_status: DeprecationStatus,
-    /// Whether this asset is currently locked as collateral under a lien.
-    /// While `true`, ownership transfers are blocked.
-    pub is_locked: bool,
-    /// The lending contract address that placed the lien, if any.
-    pub lender: Option<Address>,
-    /// The loan ID associated with the lien, used to verify the correct loan
-    /// releases the lock on repayment.
-    pub loan_id: Option<u64>,
 }
 
 #[contracttype]
@@ -1169,7 +1159,20 @@ impl AssetRegistry {
                 .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
         }
 
-        let total = all.len();
+        // Exclude decommissioned assets from both the returned page and the total count.
+        let mut active: Vec<u64> = Vec::new(&env);
+        for id in all.iter() {
+            let is_decommissioned: bool = env
+                .storage()
+                .persistent()
+                .get(&decommissioned_key(id))
+                .unwrap_or(false);
+            if !is_decommissioned {
+                active.push_back(id);
+            }
+        }
+
+        let total = active.len();
 
         if page_size == 0 {
             return OwnerPage {
@@ -1198,7 +1201,7 @@ impl AssetRegistry {
         let end = (offset + page_size).min(total);
         let mut assets = Vec::new(&env);
         for i in offset..end {
-            assets.push_back(all.get(i).unwrap());
+            assets.push_back(active.get(i).unwrap());
         }
 
         OwnerPage { assets, total }
@@ -1866,6 +1869,7 @@ impl AssetRegistry {
     /// # Panics
     /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
     /// - [`ContractError::UnauthorizedOwner`] if caller is not the current owner
+    /// - [`ContractError::AssetDecommissioned`] if the asset is `Deprecated` or `Decommissioned`
     pub fn transfer_asset(env: Env, asset_id: u64, current_owner: Address, new_owner: Address) {
         ensure_not_paused(&env);
         current_owner.require_auth();
@@ -1887,6 +1891,11 @@ impl AssetRegistry {
         // Block transfers while the asset is locked as collateral under a lien.
         if asset.is_locked {
             panic_with_error!(&env, ContractError::AssetLocked);
+        }
+
+        // Deprecated (and decommissioned) assets are not transferable.
+        if asset.deprecation_status != DeprecationStatus::Active {
+            panic_with_error!(&env, ContractError::AssetDecommissioned);
         }
 
         // Move dedup key to new owner
@@ -1929,6 +1938,7 @@ impl AssetRegistry {
     /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
     /// - [`ContractError::SameOwner`] if `new_owner` is already the current owner
     /// - [`ContractError::TransferAlreadyPending`] if an unexpired transfer is already pending
+    /// - [`ContractError::AssetDecommissioned`] if the asset is `Deprecated` or `Decommissioned`
     pub fn initiate_ownership_transfer(env: Env, asset_id: u64, new_owner: Address) {
         ensure_not_paused(&env);
 
@@ -1942,6 +1952,11 @@ impl AssetRegistry {
 
         if asset.owner == new_owner {
             panic_with_error!(&env, ContractError::SameOwner);
+        }
+
+        // Deprecated (and decommissioned) assets are not transferable.
+        if asset.deprecation_status != DeprecationStatus::Active {
+            panic_with_error!(&env, ContractError::AssetDecommissioned);
         }
 
         let key = pending_transfer_key(asset_id);
@@ -5175,6 +5190,36 @@ mod tests {
     }
 
     #[test]
+    fn test_update_metadata_extends_history_key_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Original spec"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        client.update_asset_metadata(&id, &owner, &String::from_str(&env, "Updated spec"));
+
+        env.as_contract(&contract_id, || {
+            let history_ttl = env
+                .storage()
+                .persistent()
+                .get_ttl(&metadata_history_key(id));
+            assert!(history_ttl > 0, "Metadata history key TTL should be extended");
+        });
+    }
+
+    #[test]
     fn test_batch_register_assets_rejects_duplicate_existing_metadata() {
         let env = Env::default();
         env.mock_all_auths();
@@ -7976,6 +8021,52 @@ mod tests {
         assert_eq!(
             client.get_asset(&asset_id).deprecation_status,
             DeprecationStatus::Deprecated
+        );
+    }
+
+    #[test]
+    fn test_transfer_deprecated_asset_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let asset_id = reg(
+            &client,
+            &env,
+            symbol_short!("GENSET"),
+            String::from_str(&env, "Old Generator"),
+            &owner,
+        );
+
+        client.deprecate_asset(
+            &owner,
+            &asset_id,
+            &String::from_str(&env, "End of service life"),
+        );
+
+        let result = client.try_transfer_asset(&asset_id, &owner, &new_owner);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetDecommissioned as u32
+            ))),
+            "deprecated assets must not be transferable"
+        );
+
+        let result = client.try_initiate_ownership_transfer(&asset_id, &new_owner);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetDecommissioned as u32
+            ))),
+            "deprecated assets must not have ownership transfer proposals initiated"
         );
     }
 
