@@ -105,6 +105,7 @@ pub struct Vouch {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Borrower {
+    pub repayment_count: u32,
     pub default_count: u32,
 }
 
@@ -589,11 +590,22 @@ impl LendingContract {
         env.storage().persistent().set(&key, &loan);
         extend_persistent_ttl(&env, &key);
 
-        // Track repayment count for credit score calculation.
-        let rep_key = (symbol_short!("REP_CNT"), borrower.clone());
-        let rep_count: u32 = env.storage().persistent().get(&rep_key).unwrap_or(0);
-        env.storage().persistent().set(&rep_key, &(rep_count + 1));
-        extend_persistent_ttl(&env, &rep_key);
+        // Track successful repayments in the borrower record for credit scoring.
+        let borrower_key_val = borrower_key(&borrower);
+        let mut borrower_record: Borrower = env
+            .storage()
+            .persistent()
+            .get(&borrower_key_val)
+            .unwrap_or(Borrower {
+                repayment_count: 0,
+                default_count: 0,
+            });
+        borrower_record.repayment_count = borrower_record
+            .repayment_count
+            .checked_add(1)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::StakeSummationOverflow));
+        env.storage().persistent().set(&borrower_key_val, &borrower_record);
+        extend_persistent_ttl(&env, &borrower_key_val);
 
         // #632: Distribute yield to vouchers from collected repayment.
         for v in vouches.iter() {
@@ -736,7 +748,10 @@ impl LendingContract {
             .persistent()
             .get::<_, Borrower>(&borrower_key_val)
         {
-            borrower_record.default_count += 1;
+            borrower_record.default_count = borrower_record
+                .default_count
+                .checked_add(1)
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::StakeSummationOverflow));
             env.storage()
                 .persistent()
                 .set(&borrower_key_val, &borrower_record);
@@ -956,14 +971,8 @@ impl LendingContract {
     pub fn get_credit_score(env: Env, borrower: Address) -> u32 {
         let borrower_key_val = borrower_key(&borrower);
         let borrower_record: Option<Borrower> = env.storage().persistent().get(&borrower_key_val);
+        let repayment_count = borrower_record.as_ref().map(|b| b.repayment_count).unwrap_or(0);
         let default_count = borrower_record.map(|b| b.default_count).unwrap_or(0);
-
-        let repayment_count_key = (symbol_short!("REP_CNT"), borrower.clone());
-        let repayment_count: u32 = env
-            .storage()
-            .persistent()
-            .get(&repayment_count_key)
-            .unwrap_or(0);
 
         let total = repayment_count + default_count;
         if total == 0 {
