@@ -133,10 +133,8 @@ const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
 /// Grace period allowing engineers to work after credential expiry (7 days).
 #[allow(dead_code)]
 const GRACE_PERIOD_SECS: u64 = 7 * 86_400;
-/// Alias used by get_grace_period fallback.
+/// Default grace period constant used by `get_grace_period` fallback and the public API.
 const DEFAULT_GRACE_PERIOD_SECS: u64 = GRACE_PERIOD_SECS;
-/// Alias for the default grace period constant; used by the public API.
-const DEFAULT_GRACE_PERIOD_SECS: u64 = 7 * 86_400;
 const GRACE_PERIOD_KEY: Symbol = symbol_short!("GRACE_P");
 const MAX_BATCH_REVOKE: u32 = 50;
 const DEPLOYER_KEY: Symbol = symbol_short!("DEPLOYER");
