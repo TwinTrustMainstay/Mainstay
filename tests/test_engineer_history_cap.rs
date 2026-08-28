@@ -167,6 +167,7 @@ fn test_engineer_history_cap_enforced_on_submit() {
         "engineer history must be capped at max_engineer_history (3), got {}",
         history.len()
     );
+    assert_eq!(s.lifecycle.get_engineer_history_count(&engineer), 3);
 
     // The retained entries must be the 3 most-recently worked-on assets.
     // asset_ids[0] and asset_ids[1] should have been pruned (oldest first).
@@ -275,6 +276,14 @@ fn test_update_max_engineer_history_rejects_zero() {
 }
 
 /// The default `max_engineer_history` reported by `get_config()` must be 200.
+#[test]
+fn test_engineer_history_count_empty() {
+    let s = Setup::new();
+    let engineer = Address::generate(&s.env);
+
+    assert_eq!(s.lifecycle.get_engineer_history_count(&engineer), 0);
+}
+
 #[test]
 fn test_default_max_engineer_history_is_200() {
     let env = Env::default();
