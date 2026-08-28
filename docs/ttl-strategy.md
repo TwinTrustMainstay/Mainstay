@@ -97,6 +97,7 @@ All Lifecycle keys are stored in **persistent** storage. There is no instance st
 | Key | If it expires |
 | --- | ------------- |
 | `HIST` | Maintenance history is lost. `get_collateral_score` and `decay_score` return 0. The asset loses all collateral eligibility. Historical audit trail is permanently destroyed. |
+| `HIST` (pruned, not expired) | `prune_asset_history` truncates the front of the history vector to `max_history`. Because the removed records are gone, the new oldest record's `previous_record_hash` is reset to `None` so the hash chain does not reference a pruned (and therefore unverifiable) record — verifiers should treat `previous_record_hash == None` as a valid chain root, not a break. |
 | `SCORE` | Stored accumulated score resets to 0 on next read. `get_collateral_score` falls back to `compute_decay` from history; if `HIST` is still alive the score can be recomputed, but write-back sets 0 as a starting point until `HIST` is processed. |
 | `SCHIST` | Score trend history is wiped. `get_score_history` returns an empty vec. Lenders lose visibility into score trajectory but current eligibility is unaffected (it uses `HIST`). |
 | `LUPD` | Last-update timestamp is lost. `apply_decay` treats `last_update` as 0 (epoch), causing the full elapsed time since epoch to be used for decay — potentially zeroing the score instantly on the next `decay_score` call. |

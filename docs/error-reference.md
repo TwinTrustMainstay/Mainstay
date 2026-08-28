@@ -35,6 +35,7 @@ This document lists every `ContractError` variant across the three core contract
 | 16 | `ProposalAlreadyExists` | A pending deregister proposal already exists for this asset; wait for it to expire or execute it first. |
 | 17 | `AssetAlreadyDeprecated` | The asset has already been deprecated and cannot be deprecated again. |
 | 18 | `BatchTooLarge` | The batch passed to `batch_register_assets` exceeds the maximum of 50 assets per call. |
+| 30 | `SpecializationMismatch` | Engineer's specialization does not match the asset's type. Shares its discriminant with `Lifecycle`'s `SpecializationMismatch` so the two contracts decode this error consistently. |
 
 ### Resolution guidance
 
@@ -58,6 +59,7 @@ This document lists every `ContractError` variant across the three core contract
 | `ProposalAlreadyExists` | Wait for the existing 48-hour window to pass and then call `execute_deregister_asset`, or allow the proposal to lapse before re-proposing. |
 | `AssetAlreadyDeprecated` | Query the asset's `deprecation_status` field before calling deprecate. |
 | `BatchTooLarge` | Split the batch into chunks of ≤ 50 assets per call. |
+| `SpecializationMismatch` | Verify the engineer's specializations (via the engineer registry) include the asset's `asset_type` before submitting maintenance. |
 
 ---
 
