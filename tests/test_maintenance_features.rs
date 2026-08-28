@@ -144,6 +144,38 @@ fn test_cost_tracking_no_history_returns_zero() {
     assert_eq!(avg, 0);
 }
 
+#[test]
+fn test_maintenance_history_by_engineer_filters_asset_history() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (lifecycle, asset_id, engineer, _owner) = setup_maintenance_env(&env);
+    let other_engineer = Address::generate(&env);
+
+    lifecycle.submit_maintenance(
+        &asset_id,
+        &symbol_short!("OIL_CHG"),
+        &String::from_str(&env, "Engineer maintenance"),
+        &engineer,
+        &Some(10u64),
+    );
+    lifecycle.submit_maintenance(
+        &asset_id,
+        &symbol_short!("FILTER"),
+        &String::from_str(&env, "Other engineer maintenance"),
+        &other_engineer,
+        &Some(20u64),
+    );
+
+    let records = lifecycle.get_maintenance_history_by_engineer(&asset_id, &engineer);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records.get(0).unwrap().engineer, engineer);
+    assert_eq!(records.get(0).unwrap().task_type, symbol_short!("OIL_CHG"));
+
+    let no_records = lifecycle.get_maintenance_history_by_engineer(&asset_id, &Address::generate(&env));
+    assert!(no_records.is_empty());
+}
+
 // ============================================================================
 //  Feature 2: Recurring Maintenance Tasks
 // ============================================================================
