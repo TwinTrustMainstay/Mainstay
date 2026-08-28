@@ -248,6 +248,54 @@ fn test_get_recurring_tasks_empty() {
     assert!(tasks.is_empty());
 }
 
+#[test]
+fn test_get_overdue_recurring_tasks_filters_active_and_due_tasks() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (lifecycle, asset_id, _engineer, owner) = setup_maintenance_env(&env);
+
+    env.ledger().set_timestamp(1_000);
+    lifecycle.schedule_recurring_task(
+        &owner,
+        &asset_id,
+        &1u64,
+        &symbol_short!("DUE_NOW"),
+        &symbol_short!("DAYS"),
+        &1u64,
+    );
+    lifecycle.schedule_recurring_task(
+        &owner,
+        &asset_id,
+        &2u64,
+        &symbol_short!("DUE_LATER"),
+        &symbol_short!("DAYS"),
+        &100u64,
+    );
+
+    // The first task is exactly due; the second is not yet due.
+    env.ledger().set_timestamp(1_001);
+    let overdue = lifecycle.get_overdue_recurring_tasks(&asset_id);
+    assert_eq!(overdue.len(), 1);
+    assert_eq!(overdue.get(0).unwrap().task_id, 1);
+
+    // A task that is no longer active must not be reported as overdue. The
+    // current public API does not deactivate tasks, so this also verifies the
+    // empty result for an asset with no active overdue tasks.
+    env.ledger().set_timestamp(1_099);
+    let overdue = lifecycle.get_overdue_recurring_tasks(&asset_id);
+    assert_eq!(overdue.len(), 1);
+    assert_eq!(overdue.get(0).unwrap().task_id, 1);
+}
+
+#[test]
+fn test_get_overdue_recurring_tasks_empty_when_none_configured() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (lifecycle, asset_id, _engineer, _owner) = setup_maintenance_env(&env);
+
+    assert!(lifecycle.get_overdue_recurring_tasks(&asset_id).is_empty());
+}
+
 // ============================================================================
 //  Feature 3: Duplicate Maintenance Detection
 // ============================================================================

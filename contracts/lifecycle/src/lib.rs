@@ -3487,10 +3487,44 @@ impl Lifecycle {
     /// # Returns
     /// `Vec<RecurringTask>` — empty if none are configured
     pub fn get_recurring_tasks(env: Env, asset_id: u64) -> Vec<RecurringTask> {
-        env.storage()
+        let key = DataKey::RecurringTasks(asset_id);
+        let tasks: Vec<RecurringTask> = env
+            .storage()
             .persistent()
-            .get(&DataKey::RecurringTasks(asset_id))
-            .unwrap_or_else(|| Vec::new(&env))
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !tasks.is_empty() {
+            extend_persistent_ttl(&env, &key);
+        }
+        tasks
+    }
+
+    /// Returns active recurring tasks whose due timestamp has passed.
+    ///
+    /// The comparison is against the current ledger timestamp, so callers do
+    /// not need to fetch every task and perform overdue checks client-side.
+    /// Tasks due exactly at the current timestamp are considered overdue.
+    pub fn get_overdue_recurring_tasks(env: Env, asset_id: u64) -> Vec<RecurringTask> {
+        let key = DataKey::RecurringTasks(asset_id);
+        let tasks: Vec<RecurringTask> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if tasks.is_empty() {
+            return Vec::new(&env);
+        }
+
+        let now = env.ledger().timestamp();
+        let mut overdue: Vec<RecurringTask> = Vec::new(&env);
+        for task in tasks.iter() {
+            if task.is_active && task.next_due <= now {
+                overdue.push_back(task);
+            }
+        }
+
+        extend_persistent_ttl(&env, &key);
+        overdue
     }
 
     // ---------------------------------------------------------------------------
