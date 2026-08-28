@@ -3039,6 +3039,37 @@ impl Lifecycle {
         result
     }
 
+    /// Return maintenance records for one engineer on an asset.
+    ///
+    /// Filters on-chain history before returning it, so callers do not need to
+    /// download and filter the complete asset history client-side. Ownership
+    /// transfer sentinel records are excluded because they are not maintenance
+    /// submissions.
+    ///
+    /// Results retain the chronological order of the stored history. Returns an
+    /// empty vector when the engineer has no matching records.
+    pub fn get_maintenance_history_by_engineer(
+        env: Env,
+        asset_id: u64,
+        engineer: Address,
+    ) -> Vec<MaintenanceRecord> {
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut result = Vec::new(&env);
+        for record in history.iter() {
+            if record.engineer == engineer && record.task_type != symbol_short!("XFER") {
+                result.push_back(record);
+            }
+        }
+        result
+    }
+
     /// Get a paginated slice of the maintenance history for an asset.
     /// Useful for UI components that display maintenance records in pages.
     ///
