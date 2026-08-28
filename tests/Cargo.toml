@@ -126,12 +126,16 @@ path = "test_update_config.rs"
 [[test]]
 name = "test_deprecation_warning"
 path = "test_deprecation_warning.rs"
+
+[[test]]
 name = "test_issues_1010_1013"
 path = "test_issues_1010_1013.rs"
 
 [[test]]
 name = "test_engineer_history_cap"
 path = "test_engineer_history_cap.rs"
+
+[[test]]
 name = "test_asset_lien_blocks_transfer_1043"
 path = "test_asset_lien_blocks_transfer_1043.rs"
 
@@ -198,3 +202,8 @@ path = "test_is_collateral_eligible_decay_applied.rs"
 [[test]]
 name = "test_lending_error_variants"
 path = "test_lending_error_variants.rs"
+
+# Issue #1194: single code path for pause / unpause
+[[test]]
+name = "test_single_pause_code_path_1194"
+path = "test_single_pause_code_path_1194.rs"

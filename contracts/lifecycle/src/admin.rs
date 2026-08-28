@@ -631,6 +631,12 @@ pub(crate) fn prune_asset_history(env: Env, admin: Address, asset_id: u64) {
             let oldest_ts = history.get(0).unwrap().timestamp;
             let mut kept: Vec<MaintenanceRecord> = Vec::new(&env);
             for i in start..history.len() { kept.push_back(history.get(i).unwrap()); }
+            // The new oldest record's `previous_record_hash` still points at a now-pruned
+            // record; clear it so the hash chain doesn't reference missing history.
+            if let Some(mut oldest) = kept.get(0) {
+                oldest.previous_record_hash = None;
+                kept.set(0, oldest);
+            }
             env.storage().persistent().set(&hist_key, &kept);
             extend_persistent_ttl(&env, &hist_key);
             env.events().publish((EVENT_PRUNED,), (asset_id, pruned_count, oldest_ts));
