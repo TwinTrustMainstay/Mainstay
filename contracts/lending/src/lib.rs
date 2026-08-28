@@ -56,9 +56,9 @@ pub enum ContractError {
     /// No pending admin-transfer proposal exists for the given address.
     ProposalNotFound = 20,
     /// Asset is not eligible to be used as collateral.
-    CollateralIneligible = 19,
+    CollateralIneligible = 21,
     /// Requested loan amount exceeds the maximum allowed by the LTV ratio.
-    LtvExceeded = 20,
+    LtvExceeded = 22,
 }
 
 impl From<SharedContractError> for ContractError {
