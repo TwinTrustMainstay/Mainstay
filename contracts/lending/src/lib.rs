@@ -876,6 +876,31 @@ impl LendingContract {
         env.storage().persistent().get(&SLASH_BAL).unwrap_or(0u64)
     }
 
+    /// Calculate an asset's maximum collateral-backed loan amount.
+    ///
+    /// `score` is the lifecycle collateral score in the range `0..=100`,
+    /// `ltv_bps` is the lender's loan-to-value ratio in basis points, and
+    /// `asset_base_value` is denominated in the caller's asset-value units.
+    /// Integer division floors the result:
+    /// `asset_base_value * score / 100 * ltv_bps / 10_000`.
+    ///
+    /// This is a pure view calculation: it does not read or write contract
+    /// storage and leaves score/oracle policy to the caller.
+    pub fn get_collateral_value(
+        _env: Env,
+        asset_base_value: u64,
+        score: u32,
+        ltv_bps: u32,
+    ) -> u64 {
+        let score = u64::from(score.min(100));
+        let ltv_bps = u64::from(ltv_bps.min(10_000));
+        asset_base_value
+            .saturating_mul(score)
+            .saturating_mul(ltv_bps)
+            / 100
+            / 10_000
+    }
+
     /// Returns whether the contract has been initialized.
     pub fn is_initialized(env: Env) -> bool {
         env.storage().persistent().has(&ADMIN_KEY)
