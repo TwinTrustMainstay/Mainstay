@@ -274,6 +274,28 @@ fn test_repayment_count_increments() {
 }
 
 #[test]
+fn test_credit_score_balances_successful_repayments_and_defaults() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, token_addr, _token_admin) = setup_contract(&env);
+    let borrower = Address::generate(&env);
+    let voucher = Address::generate(&env);
+    let token_client = token::Client::new(&env, &token_addr);
+    token_client.mint(&voucher, &50000);
+    token_client.mint(&env.current_contract_address(), &50000);
+
+    client.vouch(&borrower, &voucher, &1000);
+    client.request_loan(&borrower, &5000, &0u64);
+    client.repay(&borrower);
+    client.vouch(&borrower, &voucher, &1000);
+    client.request_loan(&borrower, &5000, &0u64);
+    client.slash(&admin, &borrower);
+
+    assert_eq!(client.get_credit_score(&borrower), 50);
+}
+
+#[test]
 fn test_default_count_increments() {
     let env = Env::default();
     env.mock_all_auths();
