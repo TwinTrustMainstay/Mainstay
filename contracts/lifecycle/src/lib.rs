@@ -19,7 +19,8 @@ pub(crate) use storage::{
 // Re-export event constants at the crate root for the same reason.
 pub(crate) use events::{
     EVENT_ADMIN_SET, EVENT_DECAY, EVENT_INIT, EVENT_MAINT, EVENT_PROP_ADMIN, EVENT_PRUNED,
-    EVENT_REG_AST, EVENT_REG_ENG, EVENT_RST_SCR, EVENT_XFER,
+    EVENT_REG_AST, EVENT_REG_ENG, EVENT_RST_SCR, EVENT_XFER, EVENT_WEIGHT_PROP, EVENT_WEIGHT_EXEC,
+    EVENT_RECONSTR,
 };
 
 use crate::errors::ContractError;
@@ -131,35 +132,43 @@ const MIN_SCORE_WITH_HISTORY: u32 = 1;
 /// Older records still contribute nothing, newer records are weighted linearly.
 const MAX_AGE_LEDGERS: u64 = TTL_THRESHOLD as u64;
 
-/// Emitted when a health snapshot is anchored to reconstructed history.
-const EVENT_RECONSTR: Symbol = symbol_short!("RECONSTR");
-/// Emitted when a task-weight-change proposal is created.
-const EVENT_WEIGHT_PROP: Symbol = symbol_short!("WT_PROP");
-/// Emitted when a pending task-weight-change proposal is executed.
-const EVENT_WEIGHT_EXEC: Symbol = symbol_short!("WT_EXEC");
-
 fn history_key(asset_id: u64) -> (Symbol, u64) {
-const MAX_AGE_LEDGERS: u64 = TTL_THRESHOLD as u64;
-
-
     (symbol_short!("HIST"), asset_id)
+}
 
+fn timelock_key(op: Symbol) -> (Symbol, Symbol) {
     (symbol_short!("TL_PROP"), op)
+}
 
+fn score_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("SCORE"), asset_id)
+}
 
+fn score_history_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("SCHIST"), asset_id)
+}
 
+fn last_update_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("LUPD"), asset_id)
+}
 
+fn engineer_history_key(engineer: &Address) -> (Symbol, Address) {
     (symbol_short!("ENG_HIST"), engineer.clone())
+}
 
+fn engineer_auth_key(asset_id: u64, engineer: &Address) -> (Symbol, u64, Address) {
     (symbol_short!("ENG_AUTH"), asset_id, engineer.clone())
+}
 
+fn frozen_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("FROZEN"), asset_id)
+}
 
+fn frozen_score_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("FRZ_SCR"), asset_id)
+}
 
+fn health_snapshot_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("HLTH_SNP"), asset_id)
 
     (symbol_short!("XFER_HIST"), asset_id)
@@ -14574,6 +14583,131 @@ mod tests {
 
         // No proposal exists
         lifecycle.execute_weight_change(&admin, &task_type);
+    }
+
+    #[test]
+    fn test_propose_weight_change_allowed_after_execution() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, _asset_registry, _engineer_registry, admin) = setup(&env, 0);
+        let task_type = symbol_short!("OIL_CHG");
+
+        // First proposal
+        lifecycle.propose_weight_change(&admin, &task_type, &10);
+
+        // Fast-forward past timelock
+        env.ledger().with_mut(|li| {
+            li.timestamp = li.timestamp.saturating_add(48 * 60 * 60 + 1);
+        });
+
+        // Execute first proposal
+        lifecycle.execute_weight_change(&admin, &task_type);
+
+        // Reset ledger time for second proposal
+        env.ledger().with_mut(|li| {
+            li.timestamp = li.timestamp.saturating_sub(48 * 60 * 60 + 1);
+        });
+
+        // Second proposal should succeed (first is now executed)
+        lifecycle.propose_weight_change(&admin, &task_type, &15);
+
+        // Verify the new proposal is pending
+        let config = lifecycle.get_config();
+        assert_eq!(config.task_weights.get(task_type).unwrap(), 10); // Still old value
+    }
+
+    #[test]
+    fn test_execute_weight_change_emits_event_with_correct_data() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, _asset_registry, _engineer_registry, admin) = setup(&env, 0);
+        let task_type = symbol_short!("OIL_CHG");
+        let new_weight = 42u32;
+
+        lifecycle.propose_weight_change(&admin, &task_type, &new_weight);
+
+        // Fast-forward past timelock
+        env.ledger().with_mut(|li| {
+            li.timestamp = li.timestamp.saturating_add(48 * 60 * 60 + 1);
+        });
+
+        let exec_timestamp = env.ledger().timestamp();
+
+        lifecycle.execute_weight_change(&admin, &task_type);
+
+        // Verify event was emitted with correct data
+        let events = env.events().all();
+        let exec_event = events.iter().find(|(_, topics, data)| {
+            topics.get(0).map_or(false, |v| {
+                Symbol::from_val(&env, &v) == symbol_short!("WT_EXEC")
+            })
+            && topics.get(1).map_or(false, |v| {
+                Symbol::from_val(&env, &v) == task_type
+            })
+        });
+
+        assert!(exec_event.is_some(), "WT_EXEC event should be emitted");
+
+        if let Some((_, _, data)) = exec_event {
+            let (event_admin, event_weight, event_timestamp): (Address, u32, u64) =
+                data.into_val(&env);
+            assert_eq!(event_admin, admin, "Event should contain admin address");
+            assert_eq!(event_weight, new_weight, "Event should contain new weight");
+            assert_eq!(event_timestamp, exec_timestamp, "Event should contain execution timestamp");
+        }
+    }
+
+    #[test]
+    fn test_anchor_history_to_snapshot_emits_reconstr_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, _engineer_registry, admin) = setup(&env, 0);
+        let (asset_id, _owner) = register_asset(&env, &asset_registry);
+
+        // Create a health snapshot
+        let snapshot = HealthSnapshot {
+            snapshot_timestamp: env.ledger().timestamp(),
+            score: 75u32,
+            maintenance_count: 5u32,
+            last_service_date: env.ledger().timestamp().saturating_sub(86400),
+            reconstructed: false,
+        };
+
+        let key = health_snapshot_key(asset_id);
+        let snapshots = {
+            let mut v = Vec::new(&env);
+            v.push_back(snapshot.clone());
+            v
+        };
+        env.storage().persistent().set(&key, &snapshots);
+
+        lifecycle.anchor_history_to_snapshot(&admin, &asset_id, &0);
+
+        // Verify RECONSTR event was emitted
+        let events = env.events().all();
+        let reconstr_event = events.iter().find(|(_, topics, _)| {
+            topics.get(0).map_or(false, |v| {
+                Symbol::from_val(&env, &v) == symbol_short!("RECONSTR")
+            })
+            && topics.get(1).map_or(false, |v| {
+                u64::from_val(&env, &v) == asset_id
+            })
+        });
+
+        assert!(
+            reconstr_event.is_some(),
+            "RECONSTR event should be emitted with asset_id"
+        );
+
+        if let Some((_, _, data)) = reconstr_event {
+            let (snapshot_idx, score, timestamp): (u32, u32, u64) = data.into_val(&env);
+            assert_eq!(snapshot_idx, 0, "Event should contain snapshot index");
+            assert_eq!(score, 75u32, "Event should contain snapshot score");
+            assert_eq!(timestamp, snapshot.snapshot_timestamp, "Event should contain snapshot timestamp");
+        }
     }
 
     // ==================== Issue #1004 Tests ====================

@@ -191,6 +191,33 @@ Emitted when expired maintenance records beyond the retention TTL are pruned.
 - **Emission Conditions**: Called during automated or manual storage garbage collection.
 - **Use Cases**: Maintain indexer sync with state storage limits.
 
+### 5. `WT_PROP` — Weight Change Proposed
+
+Emitted when an admin proposes a new task-type weight via the governance timelock.
+
+- **Topics**: `(Symbol("WT_PROP"), task_type: Symbol)`
+- **Data**: `(admin: Address, new_weight: u32, proposed_at: u64)`
+- **Emission Conditions**: Called inside `propose_weight_change` after validation.
+- **Use Cases**: Track pending governance proposals; alert off-chain systems of upcoming scoring changes.
+
+### 6. `WT_EXEC` — Weight Change Executed
+
+Emitted when a pending weight-change proposal is executed after the timelock expires.
+
+- **Topics**: `(Symbol("WT_EXEC"), task_type: Symbol)`
+- **Data**: `(admin: Address, new_weight: u32, executed_at: u64)`
+- **Emission Conditions**: Called inside `execute_weight_change` after timelock verification.
+- **Use Cases**: Synchronize off-chain scoring models with new task weights; audit governance execution.
+
+### 7. `RECONSTR` — History Anchored to Snapshot
+
+Emitted when maintenance history is anchored to a previously-recorded health snapshot.
+
+- **Topics**: `(Symbol("RECONSTR"), asset_id: u64)`
+- **Data**: `(snapshot_index: u32, score: u32, snapshot_timestamp: u64)`
+- **Emission Conditions**: Called inside `anchor_history_to_snapshot` to mark snapshot as anchor point.
+- **Use Cases**: Signal off-chain indexers that reconstructed history is available; validate collateral score continuity.
+
 ---
 
 ## Lending Contract Events
