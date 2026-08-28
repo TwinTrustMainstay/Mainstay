@@ -50,9 +50,7 @@ pub(crate) fn unpause(env: Env, admin: Address) {
     admin.require_auth();
     let config: Config = env.storage().persistent().get(&CONFIG)
         .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-    if config.admin != admin {
-        panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-    }
+    require_quorum(&env, &config, &admin);
     env.storage().persistent().set(&PAUSED_KEY, &false);
     extend_persistent_ttl(&env, &PAUSED_KEY);
     env.events().publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
@@ -111,9 +109,94 @@ pub(crate) fn execute_unpause(env: Env, admin: Address) {
     admin.require_auth();
     let config: Config = env.storage().persistent().get(&CONFIG)
         .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+    require_quorum(&env, &config, &admin);
+    env.storage().persistent().set(&PAUSED_KEY, &false);
+    extend_persistent_ttl(&env, &PAUSED_KEY);
+    env.events().publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
+    env.events().publish(
+        (symbol_short!("ADM_AUD"), symbol_short!("UNPAUSED")),
+        (admin, env.ledger().timestamp()),
+    );
+}
+
+pub(crate) fn pause(env: Env, admin: Address) {
+    admin.require_auth();
+    let config: Config = env.storage().persistent().get(&CONFIG)
+        .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+    require_quorum(&env, &config, &admin);
+    env.storage().persistent().set(&PAUSED_KEY, &true);
+    extend_persistent_ttl(&env, &PAUSED_KEY);
+    env.events().publish((symbol_short!("PAUSED"),), (admin.clone(),));
+    env.events().publish(
+        (symbol_short!("ADM_AUD"), symbol_short!("PAUSED")),
+        (admin, env.ledger().timestamp()),
+    );
+}
+
+pub(crate) fn unpause(env: Env, admin: Address) {
+    admin.require_auth();
+    let config: Config = env.storage().persistent().get(&CONFIG)
+        .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+    require_quorum(&env, &config, &admin);
+    env.storage().persistent().set(&PAUSED_KEY, &false);
+    extend_persistent_ttl(&env, &PAUSED_KEY);
+    env.events().publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
+    env.events().publish(
+        (symbol_short!("ADM_AUD"), symbol_short!("UNPAUSED")),
+        (admin, env.ledger().timestamp()),
+    );
+}
+
+pub(crate) fn propose_pause(env: Env, admin: Address) {
+    ensure_not_paused(&env);
+    admin.require_auth();
+    let config: Config = env.storage().persistent().get(&CONFIG)
+        .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+    require_quorum(&env, &config, &admin);
+    store_timelock(&env, symbol_short!("PAUSE"));
+    env.events().publish((symbol_short!("PROP_PAUSE"),), (admin.clone(),));
+    env.events().publish(
+        (symbol_short!("ADM_AUD"), symbol_short!("PROP_PAUSE")),
+        (admin, env.ledger().timestamp()),
+    );
+}
+
+pub(crate) fn execute_pause(env: Env, admin: Address) {
+    require_timelock_ready(&env, symbol_short!("PAUSE"));
+    admin.require_auth();
+    let config: Config = env.storage().persistent().get(&CONFIG)
+        .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+    require_quorum(&env, &config, &admin);
+    env.storage().persistent().set(&PAUSED_KEY, &true);
+    extend_persistent_ttl(&env, &PAUSED_KEY);
+    env.events().publish((symbol_short!("PAUSED"),), (admin.clone(),));
+    env.events().publish(
+        (symbol_short!("ADM_AUD"), symbol_short!("PAUSED")),
+        (admin, env.ledger().timestamp()),
+    );
+}
+
+pub(crate) fn propose_unpause(env: Env, admin: Address) {
+    admin.require_auth();
+    let config: Config = env.storage().persistent().get(&CONFIG)
+        .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
     if config.admin != admin {
         panic_with_error!(&env, ContractError::UnauthorizedAdmin);
     }
+    store_timelock(&env, symbol_short!("UNPAUSE"));
+    env.events().publish((symbol_short!("PROP_UNPAUSE"),), (admin.clone(),));
+    env.events().publish(
+        (symbol_short!("ADM_AUD"), symbol_short!("PROP_UNPAUSE")),
+        (admin, env.ledger().timestamp()),
+    );
+}
+
+pub(crate) fn execute_unpause(env: Env, admin: Address) {
+    require_timelock_ready(&env, symbol_short!("UNPAUSE"));
+    admin.require_auth();
+    let config: Config = env.storage().persistent().get(&CONFIG)
+        .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+    require_quorum(&env, &config, &admin);
     env.storage().persistent().set(&PAUSED_KEY, &false);
     extend_persistent_ttl(&env, &PAUSED_KEY);
     env.events().publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
