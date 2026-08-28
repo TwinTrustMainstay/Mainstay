@@ -38,9 +38,9 @@ pub enum ContractError {
     InvalidGracePeriod = 22,
     /// Engineer's specializations do not cover the required task type.
     SpecializationNotCovered = 23,
-    InvalidSpecialization = 22,
-    SpecializationAlreadyExists = 23,
-    UnauthorizedRevoker = 22,
+    InvalidSpecialization = 24,
+    SpecializationAlreadyExists = 25,
+    UnauthorizedRevoker = 26,
 }
 
 impl From<SharedContractError> for ContractError {
