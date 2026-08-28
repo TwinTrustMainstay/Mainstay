@@ -97,6 +97,8 @@ const MAX_BUILT_IN_TASK_WEIGHT: u32 = 10;
 /// for the cross-contract calls and per-record validation performed
 /// inside the batch path.
 pub const MAX_BATCH_SIZE: u32 = 50;
+/// Hard cap on engineers accepted by one bulk authorization-revocation call.
+pub const MAX_BATCH_REVOKE_SIZE: u32 = 50;
 /// Upper bound on `limit` accepted by [`LifecycleContract::get_maintenance_history_page`].
 /// Without this cap a caller could pass an arbitrarily large `limit` and reintroduce
 /// the unbounded-response failure the paginated endpoint exists to prevent.
@@ -1224,6 +1226,66 @@ impl Lifecycle {
             (symbol_short!("REVOKE_AUTH"), owner.clone()),
             (asset_id, engineer.clone(), env.ledger().timestamp()),
         );
+    }
+
+    /// Immediately revoke multiple engineers' owner-approved authorizations for an asset.
+    ///
+    /// The current owner must authorize the call. The operation is bounded to
+    /// keep transaction work predictable and updates the maintained authorized
+    /// engineer list in one storage write.
+    pub fn batch_revoke_engineer_authorizations(
+        env: Env,
+        owner: Address,
+        asset_id: u64,
+        engineers: Vec<Address>,
+    ) {
+        ensure_not_paused(&env);
+        owner.require_auth();
+        if engineers.len() > MAX_BATCH_REVOKE_SIZE {
+            panic_with_error!(&env, ContractError::BatchRevokeTooLarge);
+        }
+
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+        let asset =
+            asset_registry::AssetRegistryClient::new(&env, &asset_registry).get_asset(&asset_id);
+        if asset.owner != owner {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        let list_key = authorized_engineers_key(asset_id);
+        let current_list: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&list_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut remaining = Vec::new(&env);
+
+        for current in current_list.iter() {
+            let mut revoked = false;
+            for engineer in engineers.iter() {
+                if current == engineer {
+                    revoked = true;
+                    break;
+                }
+            }
+            if revoked {
+                env.storage()
+                    .persistent()
+                    .remove(&engineer_auth_key(asset_id, &current));
+                env.events().publish(
+                    (symbol_short!("REVOKE_AUTH"), owner.clone()),
+                    (asset_id, current, env.ledger().timestamp()),
+                );
+            } else {
+                remaining.push_back(current);
+            }
+        }
+
+        if !current_list.is_empty() {
+            env.storage().persistent().set(&list_key, &remaining);
+            extend_persistent_ttl(&env, &list_key);
+        }
     }
 
     // ─── Issue #1012 ──────────────────────────────────────────────────────────
