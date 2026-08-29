@@ -1,0 +1,23 @@
+[[rules]]
+  description = "Detect AWS access key IDs and secrets"
+  regex = '''(?i)(aws_access_key_id|aws_secret_access_key)\s*=\s*['\"]?([A-Za-z0-9/+=]{16,128})['\"]?'''
+  tags = ["secret", "aws"]
+
+[[rules]]
+  description = "Detect generic API keys and tokens in env files"
+  regex = '''(?i)(api_key|api-key|apikey|secret|token)\s*=\s*['\"]?([A-Za-z0-9\-_.]{16,128})['\"]?'''
+  tags = ["secret", "api"]
+
+[[rules]]
+  description = "Detect private key files"
+  regex = '''-----BEGIN (RSA|EC|OPENSSH|PGP|PRIVATE) KEY-----'''
+  tags = ["secret", "private-key"]
+
+[[rules]]
+  description = "Detect GitHub personal access tokens"
+  regex = '''ghp_[A-Za-z0-9_]{36}'''
+  tags = ["secret", "github"]
+
+[[allowlist]]
+  description = "Allow placeholder values in env test data and documentation"
+  regex = '''(?i)(api_key|api-key|apikey|secret|token|password)\s*=\s*['\"]?(test|example|dummy|fake|placeholder)['\"]?'''

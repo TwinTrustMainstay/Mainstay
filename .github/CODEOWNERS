@@ -1,0 +1,13 @@
+# CODEOWNERS — required reviewers for sensitive paths.
+# See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Smart contract source: every PR touching contracts/ must be approved by a
+# contract maintainer before it can be merged.
+/contracts/ @marvs8
+
+# CI / workflow changes require the same maintainer sign-off.
+/.github/workflows/ @marvs8
+
+# Security policy and threat model are owner-gated.
+/SECURITY.md @marvs8
+/docs/threat-model.md @marvs8

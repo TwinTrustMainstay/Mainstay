@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 source ~/.cargo/env 2>/dev/null || true
 source .env 2>/dev/null || true
+
+: "${STELLAR_NETWORK:=testnet}"
+if [[ "${STELLAR_NETWORK}" != "testnet" ]]; then
+  echo "Refusing to deploy: STELLAR_NETWORK must be 'testnet' (got '${STELLAR_NETWORK}')." >&2
+  exit 1
+fi
 
 echo "Deploying to testnet..."
 

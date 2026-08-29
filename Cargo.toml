@@ -1,8 +1,11 @@
 [workspace]
 members = [
+    "contracts/shared",
     "contracts/asset-registry",
     "contracts/engineer-registry",
     "contracts/lifecycle",
+    "contracts/lending",
+    "tests",
 ]
 resolver = "2"
 

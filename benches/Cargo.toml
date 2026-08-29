@@ -1,0 +1,29 @@
+[package]
+name = "mainstay-benchmarks"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bench]]
+name = "collateral_bench"
+harness = false
+path = "collateral_bench.rs"
+
+[[bench]]
+name = "batch_registration_bench"
+harness = false
+path = "batch_registration_bench.rs"
+
+[[bench]]
+name = "search_bench"
+harness = false
+path = "search_bench.rs"
+
+[dependencies]
+soroban-sdk = { version = "22.0.0", features = ["testutils"] }
+asset-registry = { path = "../contracts/asset-registry" }
+engineer-registry = { path = "../contracts/engineer-registry" }
+lifecycle = { path = "../contracts/lifecycle" }
+
+[dev-dependencies]
+criterion = "0.5"
