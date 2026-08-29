@@ -72,6 +72,11 @@ const DEFAULT_MAX_NOTES_LENGTH: u32 = 256;
 const DEFAULT_MAX_SUBMISSIONS_PER_HOUR: u32 = 20;
 /// Length of the rolling submission-rate window, in seconds.
 const SUBMISSION_RATE_WINDOW_SECS: u64 = 3600;
+/// Default cap on the number of health snapshots retained per asset. Without
+/// a cap, a misconfigured automation loop calling `take_health_snapshot` in a
+/// tight cycle can grow `HealthSnapshots(asset_id)` without bound, inflating
+/// read costs and persistent-TTL-extension costs on every call.
+const DEFAULT_MAX_SNAPSHOTS: u32 = 500;
 
 fn effective_min_collateral_score(config: &Config) -> u32 {
     if config.min_collateral_score > 0 {
@@ -1379,6 +1384,7 @@ impl Lifecycle {
             task_weights: Map::new(&env),
             max_submissions_per_hour: DEFAULT_MAX_SUBMISSIONS_PER_HOUR,
             default_task_weight: 0,
+            max_snapshots: DEFAULT_MAX_SNAPSHOTS,
         };
         env.storage().persistent().set(&CONFIG, &config);
         extend_persistent_ttl(&env, &CONFIG);
@@ -1744,6 +1750,24 @@ impl Lifecycle {
     /// - [`ContractError::InvalidConfig`] if `new_max` is 0.
     pub fn update_max_engineer_history(env: Env, admin: Address, new_max: u32) {
         crate::admin::update_max_engineer_history(env, admin, new_max);
+    }
+
+    /// Admin-only function to update the per-asset health-snapshot retention cap.
+    ///
+    /// Once `HealthSnapshots(asset_id)` reaches `new_max` entries, `take_health_snapshot`
+    /// evicts the oldest snapshot(s) before appending the new one, bounding storage,
+    /// read costs, and TTL-extension costs regardless of how often snapshots are taken.
+    ///
+    /// # Arguments
+    /// * `admin`   - The admin address that must match the stored config admin.
+    /// * `new_max` - New per-asset snapshot cap (must be > 0).
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialised.
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin.
+    /// - [`ContractError::InvalidConfig`] if `new_max` is 0.
+    pub fn update_max_snapshots(env: Env, admin: Address, new_max: u32) {
+        crate::admin::update_max_snapshots(env, admin, new_max);
     }
 
     /// Admin-only function to update the maximum allowed notes length per maintenance record.
@@ -4859,13 +4883,14 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::AssetDecommissioned);
         }
 
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get::<_, Config>(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
         let score = {
             let stored: u32 = env.storage().persistent().get(&score_key(asset_id)).unwrap_or(0);
-            let config: Config = env
-                .storage()
-                .persistent()
-                .get::<_, Config>(&CONFIG)
-                .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
             let last_update: u64 = env
                 .storage()
                 .persistent()
@@ -4903,6 +4928,25 @@ impl Lifecycle {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
         snapshots.push_back(snapshot.clone());
+
+        // Enforce the configurable cap on retained snapshots (#max_snapshots).
+        // A misconfigured automation loop calling this in a tight cycle would
+        // otherwise grow HealthSnapshots(asset_id) without bound, inflating
+        // both read costs and persistent-TTL-extension costs on every future
+        // call. Evict the oldest entries first so the list always reflects
+        // the most recent history.
+        let cap = if config.max_snapshots == 0 {
+            DEFAULT_MAX_SNAPSHOTS
+        } else {
+            config.max_snapshots
+        };
+        if cap > 0 && snapshots.len() > cap {
+            let excess = snapshots.len() - cap;
+            for _ in 0..excess {
+                snapshots.remove(0);
+            }
+        }
+
         env.storage().persistent().set(&key, &snapshots);
         extend_persistent_ttl(&env, &key);
 
@@ -13215,6 +13259,68 @@ mod tests {
             "snapshots should be in chronological order"
         );
         assert_eq!(snapshots.get(1).unwrap().maintenance_count, 2);
+    }
+
+    /// Regression test for the unbounded-snapshot-growth issue: a misconfigured
+    /// automation loop calling `take_health_snapshot` repeatedly must not be able
+    /// to grow `HealthSnapshots(asset_id)` past the configured `max_snapshots`
+    /// cap. Oldest snapshots must be evicted first so the retained list always
+    /// reflects the most recent history.
+    #[test]
+    fn test_take_health_snapshot_enforces_max_snapshots_cap() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _, admin) = setup(&env, 0);
+        let (asset_id, _) = register_asset(&env, &asset_registry_client);
+
+        // Tighten the cap to 3 so the test doesn't need 500+ iterations.
+        client.update_max_snapshots(&admin, &3);
+
+        // Take 5 snapshots at distinct timestamps.
+        let mut timestamps = Vec::new(&env);
+        for _ in 0..5u32 {
+            let snap = client.take_health_snapshot(&asset_id);
+            timestamps.push_back(snap.snapshot_timestamp);
+            env.ledger().with_mut(|li| li.timestamp += 10);
+        }
+
+        let snapshots = client.get_health_snapshots(&asset_id);
+        assert_eq!(
+            snapshots.len(),
+            3,
+            "snapshot list must be capped at max_snapshots (3), not grow to 5"
+        );
+
+        // The retained snapshots must be the 3 most recent (oldest-first eviction).
+        let expected_oldest_retained = timestamps.get(2).unwrap();
+        assert_eq!(
+            snapshots.get(0).unwrap().snapshot_timestamp,
+            expected_oldest_retained,
+            "the two oldest snapshots must have been evicted first"
+        );
+        assert_eq!(
+            snapshots.get(2).unwrap().snapshot_timestamp,
+            timestamps.get(4).unwrap(),
+            "the most recent snapshot must always be retained"
+        );
+    }
+
+    /// `update_max_snapshots` must reject a zero cap (which would make every
+    /// `take_health_snapshot` call immediately evict its own new entry).
+    #[test]
+    fn test_update_max_snapshots_rejects_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, _, admin) = setup(&env, 0);
+
+        let result = client.try_update_max_snapshots(&admin, &0);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidConfig as u32
+            )))
+        );
     }
 
     #[test]

@@ -426,6 +426,43 @@ pub(crate) fn update_max_engineer_history(env: Env, admin: Address, new_max: u32
     );
 }
 
+/// Admin-only function to update the per-asset health-snapshot retention cap.
+///
+/// # Arguments
+/// * `admin`   - The admin address that must match the stored config admin.
+/// * `new_max` - New cap on the number of snapshots kept per asset in
+///               `HealthSnapshots(asset_id)` (must be > 0). When
+///               `take_health_snapshot` would exceed this cap, the oldest
+///               snapshots are evicted first.
+///
+/// # Panics
+/// - [`ContractError::NotInitialized`] if the contract has not been initialised.
+/// - [`ContractError::UnauthorizedAdmin`] if the caller is not the admin.
+/// - [`ContractError::InvalidConfig`] if `new_max` is 0.
+pub(crate) fn update_max_snapshots(env: Env, admin: Address, new_max: u32) {
+    ensure_not_paused(&env);
+    admin.require_auth();
+    if new_max == 0 {
+        panic_with_error!(&env, ContractError::InvalidConfig);
+    }
+    let mut config: Config = env.storage().persistent().get(&CONFIG)
+        .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+    if config.admin != admin {
+        panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+    }
+    config.max_snapshots = new_max;
+    env.storage().persistent().set(&CONFIG, &config);
+    extend_persistent_ttl(&env, &CONFIG);
+    env.events().publish(
+        (symbol_short!("UPD_SNAP"), admin.clone()),
+        new_max,
+    );
+    env.events().publish(
+        (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
+        (admin, env.ledger().timestamp(), symbol_short!("MAX_SNAP"), new_max),
+    );
+}
+
 pub(crate) fn update_max_notes_length(env: Env, admin: Address, new_max: u32) {
     ensure_not_paused(&env);
     admin.require_auth();
