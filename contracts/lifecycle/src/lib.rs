@@ -659,6 +659,26 @@ pub(crate) fn store_timelock(env: &Env, op: Symbol) {
     extend_persistent_ttl(&env, &key);
 }
 
+/// Validate that a timelocked proposal is ready to execute, then mark it
+/// executed.
+///
+/// # Atomicity guarantee
+/// `proposal.executed = true` is written to persistent storage here, in this
+/// call, **before** the caller runs the guarded operation (e.g.
+/// `crate::admin::update_score_increment`). This ordering means the
+/// "executed" flag can never be observed as `true` without the corresponding
+/// guarded operation actually having run: Soroban contract invocations are
+/// all-or-nothing — every storage write performed during an invocation
+/// (including this one) is part of the same host-managed transaction, so if
+/// anything later in the same invocation panics or the transaction fails to
+/// commit for any reason, this write is rolled back along with it. There is
+/// no intermediate state, observable by another call, in which `executed`
+/// is `true` but the guarded operation did not happen. Conversely, once this
+/// call returns normally, the flag write has succeeded and the guarded
+/// operation is guaranteed to run in the remainder of the same invocation,
+/// so a second call for the same `op` always hits the `proposal.executed`
+/// check below and is rejected with `ProposalNotFound` — double-execution of
+/// the same proposal is impossible.
 pub(crate) fn require_timelock_ready(env: &Env, op: Symbol) {
     let key = timelock_key(op);
     let mut proposal: TimelockProposal = env
@@ -8520,6 +8540,41 @@ mod tests {
         client.execute_pause(&admin);
 
         assert!(client.is_paused());
+    }
+
+    /// Regression test for the executed-flag atomicity guarantee documented on
+    /// `require_timelock_ready`: once a timelocked proposal has been executed,
+    /// a second call for the same operation must be rejected with
+    /// `ProposalNotFound` rather than silently re-running the guarded
+    /// operation. This verifies double-execution is impossible.
+    #[test]
+    fn test_execute_update_score_increment_rejects_double_execution() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+
+        client.propose_config_update(&admin, &symbol_short!("SC_INC"));
+        let base = env.ledger().timestamp();
+        env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+
+        // First execution succeeds and applies the new value.
+        client.execute_update_score_increment(&admin, &7);
+        assert_eq!(client.get_config().score_increment, 7);
+
+        // Second execution of the same (now-executed) proposal must be
+        // rejected — the executed flag was already committed atomically
+        // with the first run, so there is no proposal left to execute.
+        let result = client.try_execute_update_score_increment(&admin, &99);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::ProposalNotFound as u32,
+            )))
+        );
+
+        // Config value from the first (only) successful execution is unchanged.
+        assert_eq!(client.get_config().score_increment, 7);
     }
 
     #[test]
