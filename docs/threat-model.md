@@ -111,6 +111,8 @@ Mainstay is a decentralized physical infrastructure network (DePIN) built on Ste
 | T-LC-11 | **E**levation of Privilege | Cross-contract call to AssetRegistry returns stale/false data | High | Lifecycle verifies asset existence at call time; `try_get_asset` panics on non-existent assets |
 | T-LC-12 | **E**levation of Privilege | Cross-contract call to EngineerRegistry bypassed or replayed | High | `get_credential_status` is called at submission time; fallback `verify_engineer` for non-Valid status |
 | T-LC-13 | **E**levation of Privilege | Engineer reputation score is manipulated to inflate collateral weight | Medium | Reputation is read from EngineerRegistry at submission time; not cached in Lifecycle |
+| T-LC-14 | **E**levation of Privilege | Admin instantly swaps engineer/asset registry to a malicious contract (#1256) | Critical | Registry address changes now require a 48-hour timelock via `propose_update_{asset,engineer}_registry` → `execute_update_{asset,engineer}_registry`; direct `update_*_registry` calls are blocked without a prior proposal |
+| T-LC-15 | **D**enial of Service | Admin list unbounded — O(n) scan in `require_quorum` approaches instruction limits (#1259) | Medium | `set_admin_quorum` now rejects lists with more than `MAX_ADMINS` (10) addresses; error `TooManyAdmins` (39) |
 
 ### Lending
 
@@ -140,11 +142,21 @@ Mainstay is a decentralized physical infrastructure network (DePIN) built on Ste
 **Risk:** Medium
 **Mitigation:** Soroban contracts are Wasm-based and isolated. Cross-contract calls execute in the called contract's context. Re-entrancy is limited—the called contract cannot call back into the caller in the same invocation. Lifecycle performs local validation and state writes before external calls.
 
-### CC-03: Lifecycle Registry Binding Immutability
-**Description:** If the registry binding addresses (`REGISTRY`, `ENG_REG`) could be changed after initialization, an attacker could redirect Lifecycle to malicious registry contracts.
+### CC-03: Registry Address Substitution Attack
+**Description:** If the registry binding addresses (`REGISTRY`, `ENG_REG`) can be changed after initialization, a compromised or malicious admin can redirect Lifecycle to attacker-controlled contracts that return forged asset ownership or engineer credential status. Previous versions applied the change immediately on a single admin call with no delay.
 
 **Risk:** Critical
-**Mitigation:** Registry bindings are set once at `initialize` and are immutable thereafter. The `initialize` function is one-shot (cannot be called twice).
+**Mitigation (fixed in #1256):** Registry address changes now follow the same two-step timelocked pattern as all other critical config mutations:
+1. Admin calls `propose_update_asset_registry` or `propose_update_engineer_registry` — stores the pending address and starts the 48-hour timelock.
+2. After `TIMELOCK_DELAY_SECS` (172,800 seconds) has elapsed, the admin calls `execute_update_asset_registry` or `execute_update_engineer_registry` to apply the change.
+3. The legacy single-step `update_asset_registry` / `update_engineer_registry` entry points are now gated: they require an active, unexpired `AST_REG` / `ENG_REG` timelock to be present and consume it when called, preventing any instantaneous registry swap.
+
+**Trust Model for Registry Addresses:**
+- The asset registry and engineer registry addresses are set at `initialize` time by the deployer and cannot be changed without a 48-hour window visible to all chain observers.
+- The 48-hour window is intentionally longer than Stellar network upgrade cycles, giving integrators and lenders sufficient time to detect and respond to any unexpected registry change.
+- Registry address changes emit `PROP_AST` / `PROP_ENG` events (propose) and `REG_AST` / `REG_ENG` events (execute) that monitoring infrastructure should alert on.
+- For mainnet deployments, the admin should be a multisig account so no single key can unilaterally schedule a registry swap.
+- Operators running production deployments should subscribe to `ADM_AUD` events and treat any `PROP_AST` or `PROP_ENG` event as a critical alert requiring manual review before the 48-hour window expires.
 
 ### CC-04: Stale Data from Read-Only Cross-Contract Calls
 **Description:** Lifecycle reads asset data from AssetRegistry. If AssetRegistry's TTL has expired and data is stale, Lifecycle could operate on incorrect data.
