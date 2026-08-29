@@ -97,7 +97,11 @@ decay_intervals = floor((current_time - last_maintenance_time) / decay_interval)
 total_decay = decay_intervals × decay_rate
 
 score_after_decay = max(0, score_before_decay - total_decay)
+score_final = (history_not_empty AND score_after_decay == 0) ? MIN_SCORE_WITH_HISTORY (1) : score_after_decay
 ```
+
+The final line is the floor clamp: it only ever raises a fully-decayed score (0) up to 1, and only for
+assets with maintenance history. See [Score Floor](#score-floor) below.
 
 ### Decay is lazy
 
@@ -342,6 +346,13 @@ get_collateral_score(asset_id) >= eligibility_threshold
 | 1–49 | ❌ | Has history but below threshold |
 | 50–99 | ✅ | Eligible for collateral |
 | 100 | ✅ | Fully scored, maximum eligibility |
+
+> **Threshold = 1 caveat:** because the [Score Floor](#score-floor) guarantees a minimum score of `1`
+> for any asset with at least one maintenance record, configuring `eligibility_threshold = 1` makes
+> **every maintained asset eligible**, including ones whose score has fully decayed to the floor. This
+> threshold value does not express any quality or recency requirement — it only distinguishes
+> "maintained" from "never maintained." Lenders who want to gate on maintenance quality must use a
+> threshold above `1`.
 
 ---
 
