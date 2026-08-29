@@ -13,7 +13,7 @@ use lifecycle::{Lifecycle, LifecycleClient};
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Ledger},
-    Address, BytesN, Env, String,
+    Address, BytesN, Env, String, Vec,
 };
 
 // ─── Error discriminants ──────────────────────────────────────────────────────
@@ -260,6 +260,52 @@ fn test_1012_no_duplicate_on_reauthorize() {
         list.len(),
         1,
         "re-authorizing the same engineer must not create duplicates"
+    );
+}
+
+/// Bulk revocation clears all requested authorizations in one call.
+#[test]
+fn test_bulk_revoke_engineer_authorizations() {
+    let env = Env::default();
+    let s = Setup::new(&env);
+    let engineer2 = Address::generate(&env);
+    let credential_hash2 = BytesN::from_array(&env, &[0xbbu8; 32]);
+    s.engineer_registry.register_engineer(
+        &engineer2,
+        &credential_hash2,
+        &s.issuer,
+        &31_536_000,
+        &None,
+    );
+    s.lifecycle.authorize_engineer(&s.owner, &s.asset_id, &engineer2);
+
+    let mut engineers = Vec::new(&env);
+    engineers.push_back(s.engineer.clone());
+    engineers.push_back(engineer2.clone());
+    s.lifecycle.batch_revoke_engineer_authorizations(&s.owner, &s.asset_id, &engineers);
+
+    assert!(s.lifecycle.get_authorized_engineers(&s.asset_id).is_empty());
+}
+
+/// A non-owner must not be able to bulk revoke authorizations.
+#[test]
+fn test_bulk_revoke_rejects_non_owner() {
+    let env = Env::default();
+    let s = Setup::new(&env);
+    let attacker = Address::generate(&env);
+    let mut engineers = Vec::new(&env);
+    engineers.push_back(s.engineer.clone());
+
+    let result = s.lifecycle.try_batch_revoke_engineer_authorizations(
+        &attacker,
+        &s.asset_id,
+        &engineers,
+    );
+    assert_eq!(
+        result,
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            LIFECYCLE_UNAUTHORIZED_OWNER,
+        )))
     );
 }
 
