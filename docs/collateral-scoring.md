@@ -54,11 +54,20 @@ return if has_history && score == 0 { 1 } else { score }
 ### Score Diagram
 
 ```
-Maintenance history  -->  Weighted event points  -->  Time decay  -->  Score cap (100)
-      task weights          recency calc             decay rate         clamp to [0,100]
+Maintenance history  -->  Weighted event points  -->  Time decay  -->  Score cap (100)  -->  Floor clamp (has_history ? max(score,1) : score)
+      task weights          recency calc             decay rate         clamp to [0,100]        MIN_SCORE_WITH_HISTORY = 1
 ```
 
+The floor clamp is the last step: it only raises a score that decayed to 0, and only when the asset has
+at least one maintenance record. It never affects assets that were never maintained (those stay at 0),
+and it never lowers a score that decay left above 0. See [Score Floor](#score-floor) for the rationale.
+
 The eligibility threshold is checked after this score is computed: the asset is collateral-eligible only if the final score is greater than or equal to the configured threshold.
+
+> **Lender note:** because the floor guarantees a minimum score of 1 for any asset with maintenance
+> history, an `eligibility_threshold` of **1** is effectively "any maintained asset passes" — it does
+> not distinguish between a freshly-serviced asset and one whose score has fully decayed. See
+> [Eligibility Threshold](#eligibility-threshold) for how this interacts with threshold configuration.
 
 ## Task Type Weights
 
@@ -186,6 +195,11 @@ All scoring parameters are configurable by contract administrators:
 - **Purpose**: Minimum score for collateral eligibility
 - **Default**: 50 points
 - **Range**: 0-100 points
+- **Score floor interaction**: Because every asset with at least one maintenance record is guaranteed a
+  score of at least `1` (see [Score Floor](#score-floor)), setting this threshold to `1` means **any
+  maintained asset is eligible**, regardless of how stale its maintenance history is. Lenders wanting to
+  actually gate on maintenance quality/recency should set the threshold well above `MIN_SCORE_WITH_HISTORY`
+  (the default of 50 is intended for this purpose).
 
 ## Maintenance History Limits
 
