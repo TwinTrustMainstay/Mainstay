@@ -13,6 +13,40 @@ Mainstay uses a standardized 30-day extension policy:
 - **Threshold**: 518,400 ledgers (~30 days at 5s/ledger)
 - **Target**: 518,400 ledgers (~30 days)
 
+## Summary: All Persistent Keys & TTL Approach
+
+The table below summarises every persistent (non-instance) storage key across all four contracts and its TTL extension approach, for a quick at-a-glance audit. See the per-contract sections further down for full detail, extension triggers, and expiry consequences.
+
+| Contract | Key | TTL Extended? | Extension Trigger |
+| -------- | --- | -------------- | ------------------ |
+| AssetRegistry | `ASSET` | ✅ Yes | Every write |
+| AssetRegistry | `DEDUP` / `SN_DEDUP` | ✅ Yes | Every write |
+| AssetRegistry | `A_COUNT` | ✅ Yes | Every write |
+| AssetRegistry | `PAUSED` | ✅ Yes | `pause` / `unpause` |
+| AssetRegistry | `AST_TYPE` / `OWN_IDX` / `TYP_IDX` / `AST_CATS` | ✅ Yes | Every write |
+| AssetRegistry | `META_HIS` / `DECOMM` / `U_MAINT` / `DEP_RSN` | ✅ Yes | Respective admin/owner action |
+| AssetRegistry | `TL_PROP` / `TL_GLOB` / `PEND_UPG` | ✅ Yes | `propose_*` |
+| AssetRegistry | `LEND_CTR` | ⚠️ Dead code | Never written |
+| EngineerRegistry | `ENG` / `ISS_ENGS` | ✅ Yes | Every write |
+| EngineerRegistry | `ENG_CNT` / `PAUSED` / `GRACE_P` | ✅ Yes | Respective write |
+| EngineerRegistry | `TL_RVK` / `TL_GLOB` / `PEND_UPG` | ✅ Yes | `propose_*` |
+| EngineerRegistry | `TRAIN` | ⚠️ Dead code | Never written (feature incomplete) |
+| Lifecycle | `HIST` / `SCORE` / `SCHIST` / `LUPD` | ✅ Yes | Every score/history write |
+| Lifecycle | `XFER_HIST` / `HLTH_SNP` | ✅ Yes | `record_transfer` / `take_health_snapshot` |
+| Lifecycle | `ENG_AUTH` / `ENG_HIST` | ✅ Yes | `authorize_engineer` / `submit_maintenance` |
+| Lifecycle | `TL_PROP` / `RVK_TL` | ✅ Yes | `propose_*`; removed on execution |
+| Lifecycle | `FROZEN` / `FRZ_SCR` | ✅ Yes | `decommission_notify` |
+| Lifecycle | `RecurringTasks` | ✅ Yes | `add_recurring_task` / `execute_recurring_task` |
+| Lifecycle | `DuplicateRecords` | ✅ Yes | `flag_duplicate_record` |
+| Lifecycle | `CollateralValuationHistory` | ✅ Yes | Every collateral score write |
+| Lending | `ADMIN` / `TOKEN` / `CONFIG` / `PAUSED` | ✅ Yes | `initialize` and respective writes |
+| Lending | `SL_BAL` / `SL_BPS` / `LOAN_DUR` / `MIN_STK` / `YIELD_BPS` | ✅ Yes | Respective `set_*` call |
+| Lending | `LOAN` / `BORR` / `VOUCHES` / `V_HIST` / `DEF_TIME` | ✅ Yes | Respective loan/vouch lifecycle event |
+| Lending | `Liens` | ✅ Yes | `record_lien` / `release_lien` |
+| Lending | `L_COUNT` / `L_MAP` | ❌ No | Written but never TTL-extended (see follow-up issues) |
+
+---
+
 ## Contract Storage Keys
 
 ### 1. Asset Registry
@@ -91,6 +125,12 @@ All Lifecycle keys are stored in **persistent** storage. There is no instance st
 | `Symbol("PADMIN")` | ✅ Yes | `propose_admin`; removed on `accept_admin` | Pending admin address during 2-step transfer |
 
 > **Note on `CollateralValuationHistory`**: This `DataKey` variant is used in `scoring.rs` and `lib.rs` but is absent from the `DataKey` enum definition in `types.rs`. The code currently relies on Soroban's XDR serialisation of the enum discriminant — this compiles but the missing variant is a correctness risk. See [follow-up issues](#follow-up-issues).
+
+#### TTL extension strategy — newer keys
+
+- **`CollateralValuationHistory(asset_id)`**: Extended with the standard 30-day threshold/target (518,400 ledgers) every time a new valuation entry is appended via `valuation_history_push`, which runs alongside every collateral score write (`submit_maintenance`, `decay_score`). Because valuations accumulate at the same cadence as scoring activity, this key stays alive as long as the asset is actively maintained. Assets that go dormant (no maintenance for >30 days) risk this key expiring silently — lenders should treat a missing valuation history as "unknown," not "no history," and cross-check `SCORE`/`LUPD` before concluding an asset was never valued.
+- **`RecurringTasks(asset_id)`**: Extended on every `add_recurring_task` and `execute_recurring_task` call using the standard 30-day policy. Because recurring tasks are, by design, meant to fire periodically, a healthy schedule should keep this key refreshed indefinitely. A task with an interval longer than 30 days (e.g. an annual inspection) can let this key expire between executions — integrators scheduling long-interval recurring tasks should manually extend the key via the Soroban CLI (see [Manual Extension](#manual-extension)) or set a companion reminder to touch the key before 30 days elapse.
+- **`DuplicateRecords(asset_id)`**: Extended on every `flag_duplicate_record` call. This key is write-infrequent by nature (only touched when a duplicate is detected), so it is the most likely of the three to expire silently on an asset with a single flagged duplicate and no further activity. Losing this key does not corrupt scoring, but it does allow a previously-flagged duplicate record to appear "clean" again — auditors relying on this history for compliance reporting should periodically re-extend it manually for high-value assets.
 
 #### Expiry consequences — Lifecycle
 
