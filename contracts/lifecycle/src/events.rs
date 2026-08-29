@@ -35,3 +35,12 @@ pub(crate) const EVENT_ADMIN_SET: Symbol = symbol_short!("ADMIN_SET");
 
 /// Emitted when a maintenance history or score history is pruned by an admin.
 pub(crate) const EVENT_PRUNED: Symbol = symbol_short!("PRUNED");
+
+/// Emitted when an admin proposes a new task-type weight via `propose_weight_change`.
+pub(crate) const EVENT_WEIGHT_PROP: Symbol = symbol_short!("WT_PROP");
+
+/// Emitted when an admin executes a pending weight-change proposal via `execute_weight_change`.
+pub(crate) const EVENT_WEIGHT_EXEC: Symbol = symbol_short!("WT_EXEC");
+
+/// Emitted when an admin anchors maintenance history to a health snapshot via `anchor_history_to_snapshot`.
+pub(crate) const EVENT_RECONSTR: Symbol = symbol_short!("RECONSTR");
