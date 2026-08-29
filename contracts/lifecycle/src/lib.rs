@@ -6063,6 +6063,121 @@ mod tests {
         assert!(history.contains(&asset_ids.get(4).unwrap()));
     }
 
+    /// Issue: verify that when the engineer history sliding window is filled to
+    /// exactly `cap + 1` distinct assets, the single oldest asset_id is evicted
+    /// and every other (newer) asset_id is retained, in insertion order.
+    #[test]
+    fn test_engineer_history_evicts_oldest_at_cap_plus_one() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let cap: u32 = 4;
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, cap);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        // Fill history to cap + 1 distinct assets.
+        let mut asset_ids = Vec::new(&env);
+        for _ in 0..(cap + 1) {
+            let (asset_id, _asset_owner) = register_asset(&env, &asset_registry_client);
+            asset_ids.push_back(asset_id);
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &Priority::Low,
+                &String::from_str(&env, "service"),
+                &engineer,
+            );
+        }
+
+        let history = client.get_engineer_maintenance_history(&engineer);
+        assert_eq!(
+            history.len(),
+            cap,
+            "history length must stay capped at max_engineer_history"
+        );
+
+        // The oldest asset_id (index 0) must have been evicted.
+        assert!(
+            !history.contains(&asset_ids.get(0).unwrap()),
+            "oldest asset_id must be evicted once cap + 1 distinct assets are added"
+        );
+
+        // Every newer asset_id (indices 1..=cap) must still be present.
+        for i in 1..=cap {
+            let id = asset_ids.get(i).unwrap();
+            assert!(
+                history.contains(&id),
+                "newer asset_id at index {i} must be retained after eviction"
+            );
+        }
+
+        // The newest asset_id in particular must be retained.
+        assert!(history.contains(&asset_ids.get(cap).unwrap()));
+    }
+
+    /// Issue: with max_engineer_history == 1, the history must always contain
+    /// exactly the single most-recently-added asset_id, evicting every
+    /// previous entry as soon as a new distinct asset is added.
+    #[test]
+    fn test_engineer_history_max_history_of_one() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 1);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        let (asset_id_1, _owner1) = register_asset(&env, &asset_registry_client);
+        client.submit_maintenance(
+            &asset_id_1,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "first asset service"),
+            &engineer,
+        );
+
+        let history_after_first = client.get_engineer_maintenance_history(&engineer);
+        assert_eq!(history_after_first.len(), 1);
+        assert!(history_after_first.contains(&asset_id_1));
+
+        let (asset_id_2, _owner2) = register_asset(&env, &asset_registry_client);
+        client.submit_maintenance(
+            &asset_id_2,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "second asset service"),
+            &engineer,
+        );
+
+        let history_after_second = client.get_engineer_maintenance_history(&engineer);
+        assert_eq!(
+            history_after_second.len(),
+            1,
+            "history must stay at exactly 1 entry when max_engineer_history == 1"
+        );
+        assert!(
+            !history_after_second.contains(&asset_id_1),
+            "first asset_id must be evicted once a second distinct asset is added"
+        );
+        assert!(
+            history_after_second.contains(&asset_id_2),
+            "history must retain only the newest asset_id"
+        );
+
+        let (asset_id_3, _owner3) = register_asset(&env, &asset_registry_client);
+        client.submit_maintenance(
+            &asset_id_3,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "third asset service"),
+            &engineer,
+        );
+
+        let history_after_third = client.get_engineer_maintenance_history(&engineer);
+        assert_eq!(history_after_third.len(), 1);
+        assert!(!history_after_third.contains(&asset_id_2));
+        assert!(history_after_third.contains(&asset_id_3));
+    }
+
     #[test]
     fn test_engineer_history_no_duplicate_asset_id_on_repeated_maintenance() {
         let env = Env::default();
