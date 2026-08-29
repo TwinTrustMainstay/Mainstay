@@ -59,6 +59,17 @@ Document changes in the following categories (when applicable):
 3. Use clear, user-facing language (not implementation details)
 4. Link to relevant issues or PRs when applicable
 
+### Required for every PR
+
+A `CHANGELOG.md` entry is **required**, not optional, for any PR that:
+- Adds, removes, or renumbers a `ContractError` variant in any contract's `errors.rs`
+- Adds or renames a persistent-storage key (e.g. anything returned from `lifecycle/src/storage.rs` key helpers)
+- Adds, removes, or changes the default of a `Config` field
+
+Reviewers should block merge on such PRs until the changelog entry is present. This keeps integrators
+able to diff `CHANGELOG.md` between releases to find every wire-visible or storage-visible change without
+having to read contract source diffs.
+
 ### Example
 
 ```markdown
