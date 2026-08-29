@@ -79,6 +79,7 @@ Mainstay is a decentralized physical infrastructure network (DePIN) built on Ste
 | T-AR-08 | **E**levation of Privilege | Unauthorized party calls admin functions | Critical | `admin.require_auth()` on all admin-gated functions |
 | T-AR-09 | **E**levation of Privilege | Front-run `initialize_admin` to set attacker as admin | Critical | Deployer signature required; same-block initialization mandated in runbook |
 | T-AR-10 | **E**levation of Privilege | Attacker bypasses timelock on admin-initiated asset transfer | Medium | 48-hour timelock with `propose`/`execute` pattern |
+| T-AR-11 | **E**levation of Privilege | Single compromised admin key proposes and executes a malicious contract upgrade, replacing contract logic entirely | Critical | Multisig admin quorum (`set_admin_quorum`) recommended for production; `propose_upgrade`/`execute_upgrade` timelock provides a detection window even if quorum is bypassed |
 
 ### Engineer Registry
 
@@ -189,7 +190,20 @@ The deployer key is the most critical key during deployment. If compromised, the
 
 **Mitigation:** Use a cold wallet for deployment; transfer admin to a multisig account after initialization. Store deployer key in a hardware wallet or secrets manager (HashiCorp Vault).
 
-### DI-03: Testnet → Mainnet Configuration Drift
+### DI-03: Admin Key Compromise + Contract Upgrade Attack
+**Description:** All four contracts (Asset Registry, Engineer Registry, Lifecycle, Lending) expose admin-gated `propose_upgrade(admin, new_wasm_hash)` / `execute_upgrade(admin)` functions that swap the contract's WASM code entirely. If a **single** admin key is compromised — via phishing, a leaked signer, a malicious dependency in a signing tool, or physical key theft — the attacker can propose an upgrade to arbitrary malicious WASM. Because contract logic is Turing-complete, a successful upgrade attack is total: the attacker could drain lending vaults, forge collateral scores, fabricate credentials, or remove all remaining access controls in one shot. This is qualitatively worse than any single-function exploit in the STRIDE tables above, because it replaces the rules those tables assume.
+
+**Risk:** Critical
+
+**Mitigation — Multisig Admin Quorum (primary defense):**
+Production deployments should never run with a single admin key holding unilateral upgrade power. `set_admin_quorum(admin, new_admins, threshold)` converts the contract from single-admin mode to **M-of-N quorum mode**: once `admin_threshold > 1`, `require_quorum()` collects authorization from distinct admin addresses (deduplicated so one compromised signer cannot cast multiple votes) and blocks any admin-gated call — including `propose_upgrade`/`execute_upgrade` — until the threshold is met. A single compromised key is therefore insufficient to propose or execute an upgrade on its own; the attacker would need to separately compromise `threshold` independent keys, ideally held by different people/organizations/hardware wallets. See the runbook's [key management section](deployment-runbook.md#66-key-management-differences) for mainnet key custody guidance, and configure quorum immediately after initialization — see [DI-02](#di-02-admin-key-compromise-during-deployment) for the same principle applied to the deployer key itself.
+
+**Mitigation — Upgrade Timelock (defense in depth):**
+Even with quorum configured, upgrades are not instantaneous. `propose_upgrade` only records an intended `new_wasm_hash`; `execute_upgrade` is rejected until the configured timelock delay has elapsed (mirroring the 48-hour pattern used for asset deregistration in [CC-01](#cc-01-state-drift-between-contracts)). This delay exists specifically so that a malicious or erroneous upgrade proposal is **visible on-chain before it can take effect** — monitoring the `UPGRADE` event (emitted on both propose and execute, per [Section 5.1](deployment-runbook.md#51-event-monitoring) of the runbook) gives operators, auditors, and the community a window to detect an unauthorized proposal and respond (e.g., rally remaining quorum signers to avoid reaching threshold, or coordinate an off-chain response) before the malicious code goes live. The timelock does not prevent an attacker who already controls full quorum, but it removes the possibility of an instant, undetected upgrade — the two mitigations are complementary, not redundant: quorum raises the bar to *execute* an upgrade at all, and the timelock ensures that even a successful proposal is not silent.
+
+**Residual risk:** If an attacker compromises `threshold` or more admin keys simultaneously (e.g. all keys custodied by the same operator, or a coordinated multi-party attack), both mitigations are bypassed. Operators should ensure quorum signers are held by genuinely independent parties/devices, not merely different key files on the same machine.
+
+### DI-04: Testnet → Mainnet Configuration Drift
 Testnet configuration accidentally carried to mainnet (wrong admin, wrong thresholds).
 
 **Mitigation:** `scripts/deploy_testnet.sh` hard-rejects non-testnet networks. Mainnet deployment is manual with `--network mainnet`.
