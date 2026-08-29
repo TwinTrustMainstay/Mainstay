@@ -25,6 +25,9 @@ pub struct MaintenanceRecord {
     pub notes: String,
     pub engineer: Address,
     pub timestamp: u64,
+    /// True if the engineer's credential was in its post-expiry grace
+    /// period at the time this record was signed.
+    pub signed_during_grace_period: bool,
 }
 
 /// A pending admin proposal to permanently delete an asset's maintenance
@@ -68,6 +71,9 @@ const DECAY_INTERVAL: u64 = 2592000; // 30 days in seconds
 const DECAY_RATE: u32 = 5;
 /// Timelock enforced between proposing and executing a history prune: 48 hours.
 const PRUNE_TIMELOCK_SECS: u64 = 172800;
+/// Records signed during an engineer's credential grace period score at half weight.
+const GRACE_PENALTY_NUM: u32 = 1;
+const GRACE_PENALTY_DEN: u32 = 2;
 
 fn history_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("HIST"), asset_id)
@@ -75,6 +81,10 @@ fn history_key(asset_id: u64) -> (Symbol, u64) {
 
 fn prune_proposal_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("PRUNE"), asset_id)
+}
+
+fn grace_period_key(engineer: &Address) -> (Symbol, Address) {
+    (symbol_short!("GRACEEND"), engineer.clone())
 }
 
 fn score_key(asset_id: u64) -> (Symbol, u64) {
@@ -224,12 +234,22 @@ impl Lifecycle {
 
         let timestamp = env.ledger().timestamp();
 
+        // A credential in its post-expiry grace period still lets an engineer
+        // submit, but the record is flagged so lenders can weigh it differently.
+        let grace_end: u64 = env
+            .storage()
+            .persistent()
+            .get(&grace_period_key(&engineer))
+            .unwrap_or(0);
+        let signed_during_grace_period = grace_end > 0 && timestamp <= grace_end;
+
         let record = MaintenanceRecord {
             asset_id,
             task_type: task_type.clone(),
             notes,
             engineer: engineer.clone(),
             timestamp,
+            signed_during_grace_period,
         };
 
         history.push_back(record);
@@ -243,7 +263,10 @@ impl Lifecycle {
             .persistent()
             .get(&score_key(asset_id))
             .unwrap_or(0u32);
-        let weight = get_task_weight(&env, &task_type);
+        let mut weight = get_task_weight(&env, &task_type);
+        if signed_during_grace_period {
+            weight = weight * GRACE_PENALTY_NUM / GRACE_PENALTY_DEN;
+        }
         let new_score = (score + weight).min(100);
         env.storage()
             .persistent()
@@ -331,8 +354,18 @@ impl Lifecycle {
             .get(&score_key(asset_id))
             .unwrap_or(0u32);
 
+        let grace_end: u64 = env
+            .storage()
+            .persistent()
+            .get(&grace_period_key(&engineer))
+            .unwrap_or(0);
+        let signed_during_grace_period = grace_end > 0 && timestamp <= grace_end;
+
         for record in records.iter() {
-            let weight = get_task_weight(&env, &record.task_type);
+            let mut weight = get_task_weight(&env, &record.task_type);
+            if signed_during_grace_period {
+                weight = weight * GRACE_PENALTY_NUM / GRACE_PENALTY_DEN;
+            }
             score = (score + weight).min(100);
             history.push_back(MaintenanceRecord {
                 asset_id,
@@ -340,6 +373,7 @@ impl Lifecycle {
                 notes: record.notes.clone(),
                 engineer: engineer.clone(),
                 timestamp,
+                signed_during_grace_period,
             });
         }
 
@@ -429,6 +463,24 @@ impl Lifecycle {
     pub fn is_collateral_eligible(env: Env, asset_id: u64) -> bool {
         let threshold = 50u32;
         Self::get_collateral_score(env, asset_id) >= threshold
+    }
+
+    /// Admin-only: set the timestamp until which an engineer's expired
+    /// credential is still accepted (in a "grace period"). Records submitted
+    /// while `env.ledger().timestamp() <= grace_period_end` are flagged via
+    /// `MaintenanceRecord::signed_during_grace_period` and score at a
+    /// reduced weight.
+    pub fn set_credential_grace_period(
+        env: Env,
+        admin: Address,
+        engineer: Address,
+        grace_period_end: u64,
+    ) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .set(&grace_period_key(&engineer), &grace_period_end);
     }
 
     /// Admin-only: propose permanently deleting an asset's maintenance
@@ -1162,5 +1214,80 @@ mod tests {
         client.propose_prune_asset_history(&admin, &asset_id);
         let events = env.events().all();
         assert!(events.len() > 0);
+    }
+
+    // --- Issue 3: grace-period record flagging ---
+
+    #[test]
+    fn test_grace_period_record_is_flagged_and_penalized() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        let now = env.ledger().timestamp();
+        client.set_credential_grace_period(&admin, &engineer, &(now + 1000));
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"), // full weight = 10
+            &String::from_str(&env, "grace period service"),
+            &engineer,
+        );
+
+        let history = client.get_maintenance_history(&asset_id);
+        let record = history.get(0).unwrap();
+        assert!(record.signed_during_grace_period);
+        // Halved weight: 10 -> 5
+        assert_eq!(client.get_collateral_score(&asset_id), 5);
+    }
+
+    #[test]
+    fn test_non_grace_period_record_is_not_flagged() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &String::from_str(&env, "normal service"),
+            &engineer,
+        );
+
+        let history = client.get_maintenance_history(&asset_id);
+        let record = history.get(0).unwrap();
+        assert!(!record.signed_during_grace_period);
+        assert_eq!(client.get_collateral_score(&asset_id), 10);
+    }
+
+    #[test]
+    fn test_grace_period_expired_does_not_flag_record() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        let now = env.ledger().timestamp();
+        client.set_credential_grace_period(&admin, &engineer, &(now + 10));
+        env.ledger().with_mut(|li| li.timestamp = li.timestamp + 1000);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &String::from_str(&env, "after grace period expired"),
+            &engineer,
+        );
+
+        let history = client.get_maintenance_history(&asset_id);
+        assert!(!history.get(0).unwrap().signed_during_grace_period);
+        assert_eq!(client.get_collateral_score(&asset_id), 10);
     }
 }
