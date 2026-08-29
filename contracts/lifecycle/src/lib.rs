@@ -15307,4 +15307,236 @@ mod tests {
         // ...so clearing the same, already-cleared entry again must panic.
         client.clear_duplicate_record(&admin, &asset_id, &ts);
     }
+
+    // --- Issue 1: prune_asset_history timelock ---
+
+    #[test]
+    fn test_prune_asset_history_requires_timelock() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "before prune"),
+            &engineer,
+        );
+
+        client.propose_prune_asset_history(&admin, &asset_id);
+
+        // Executing immediately, before the 48h timelock elapses, must fail.
+        let result = client.try_execute_prune_asset_history(&admin, &asset_id);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::PruneTimelockNotElapsed as u32,
+            ))),
+        );
+        // History must still be intact.
+        assert_eq!(client.get_maintenance_history(&asset_id).len(), 1);
+    }
+
+    #[test]
+    fn test_prune_asset_history_succeeds_after_timelock() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "before prune"),
+            &engineer,
+        );
+
+        client.propose_prune_asset_history(&admin, &asset_id);
+        env.ledger()
+            .with_mut(|li| li.timestamp = li.timestamp + PRUNE_TIMELOCK_SECS + 1);
+        client.execute_prune_asset_history(&admin, &asset_id);
+
+        assert_eq!(client.get_maintenance_history(&asset_id).len(), 0);
+    }
+
+    #[test]
+    fn test_prune_asset_history_no_pending_proposal() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _, admin) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+
+        let result = client.try_execute_prune_asset_history(&admin, &asset_id);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::NoPrunePending as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_prune_asset_history_non_admin_cannot_propose() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let outsider = Address::generate(&env);
+
+        let result = client.try_propose_prune_asset_history(&outsider, &asset_id);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_prune_asset_history_emits_prune_prop_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _, admin) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+
+        client.propose_prune_asset_history(&admin, &asset_id);
+        let events = env.events().all();
+        assert!(events.len() > 0);
+    }
+
+    // --- Issue 3: grace-period record flagging ---
+
+    #[test]
+    fn test_grace_period_record_is_flagged_and_penalized() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        let now = env.ledger().timestamp();
+        client.set_credential_grace_period(&admin, &engineer, &(now + 1000));
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"), // full weight = 10
+            &String::from_str(&env, "grace period service"),
+            &engineer,
+        );
+
+        let history = client.get_maintenance_history(&asset_id);
+        let record = history.get(0).unwrap();
+        assert!(record.signed_during_grace_period);
+        // Halved weight: 10 -> 5
+        assert_eq!(client.get_collateral_score(&asset_id), 5);
+    }
+
+    #[test]
+    fn test_non_grace_period_record_is_not_flagged() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &String::from_str(&env, "normal service"),
+            &engineer,
+        );
+
+        let history = client.get_maintenance_history(&asset_id);
+        let record = history.get(0).unwrap();
+        assert!(!record.signed_during_grace_period);
+        assert_eq!(client.get_collateral_score(&asset_id), 10);
+    }
+
+    #[test]
+    fn test_grace_period_expired_does_not_flag_record() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        let now = env.ledger().timestamp();
+        client.set_credential_grace_period(&admin, &engineer, &(now + 10));
+        env.ledger().with_mut(|li| li.timestamp = li.timestamp + 1000);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &String::from_str(&env, "after grace period expired"),
+            &engineer,
+        );
+
+        let history = client.get_maintenance_history(&asset_id);
+        assert!(!history.get(0).unwrap().signed_during_grace_period);
+        assert_eq!(client.get_collateral_score(&asset_id), 10);
+    }
+
+    // --- Issue 4: hash chain integrity ---
+
+    #[test]
+    fn test_record_hash_excludes_notes_and_is_deterministic() {
+        let env = Env::default();
+        let asset_id = 1u64;
+        let task_type = symbol_short!("OIL_CHG");
+        let engineer = Address::generate(&env);
+        let timestamp = 1000u64;
+        let prev = zero_hash(&env);
+
+        // Identical inputs (notes is not part of the hash function's
+        // signature at all) always produce the same hash.
+        let hash_a = compute_record_hash(&env, asset_id, &task_type, &engineer, timestamp, 0, &prev);
+        let hash_b = compute_record_hash(&env, asset_id, &task_type, &engineer, timestamp, 0, &prev);
+        assert_eq!(hash_a, hash_b);
+
+        // Changing the chain position (nonce) changes the hash even though
+        // every other field is identical, which is what prevents an
+        // attacker from crafting `notes` to predict or collide hashes.
+        let hash_c = compute_record_hash(&env, asset_id, &task_type, &engineer, timestamp, 1, &prev);
+        assert_ne!(hash_a, hash_c);
+    }
+
+    #[test]
+    fn test_maintenance_history_hash_chain_links_records() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "first, arbitrary notes A"),
+            &engineer,
+        );
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "second, wildly different notes!!"),
+            &engineer,
+        );
+
+        let history = client.get_maintenance_history(&asset_id);
+        let first = history.get(0).unwrap();
+        let second = history.get(1).unwrap();
+
+        assert_eq!(first.prev_hash, zero_hash(&env));
+        assert_eq!(second.prev_hash, first.record_hash);
+        assert_ne!(first.record_hash, second.record_hash);
+    }
 }
