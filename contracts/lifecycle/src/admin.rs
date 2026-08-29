@@ -50,9 +50,7 @@ pub(crate) fn unpause(env: Env, admin: Address) {
     admin.require_auth();
     let config: Config = env.storage().persistent().get(&CONFIG)
         .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-    if config.admin != admin {
-        panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-    }
+    require_quorum(&env, &config, &admin);
     env.storage().persistent().set(&PAUSED_KEY, &false);
     extend_persistent_ttl(&env, &PAUSED_KEY);
     env.events().publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
@@ -111,9 +109,7 @@ pub(crate) fn execute_unpause(env: Env, admin: Address) {
     admin.require_auth();
     let config: Config = env.storage().persistent().get(&CONFIG)
         .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-    if config.admin != admin {
-        panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-    }
+    require_quorum(&env, &config, &admin);
     env.storage().persistent().set(&PAUSED_KEY, &false);
     extend_persistent_ttl(&env, &PAUSED_KEY);
     env.events().publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
@@ -141,9 +137,7 @@ pub(crate) fn unpause(env: Env, admin: Address) {
     admin.require_auth();
     let config: Config = env.storage().persistent().get(&CONFIG)
         .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-    if config.admin != admin {
-        panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-    }
+    require_quorum(&env, &config, &admin);
     env.storage().persistent().set(&PAUSED_KEY, &false);
     extend_persistent_ttl(&env, &PAUSED_KEY);
     env.events().publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
@@ -202,9 +196,7 @@ pub(crate) fn execute_unpause(env: Env, admin: Address) {
     admin.require_auth();
     let config: Config = env.storage().persistent().get(&CONFIG)
         .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-    if config.admin != admin {
-        panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-    }
+    require_quorum(&env, &config, &admin);
     env.storage().persistent().set(&PAUSED_KEY, &false);
     extend_persistent_ttl(&env, &PAUSED_KEY);
     env.events().publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
@@ -670,6 +662,12 @@ pub(crate) fn prune_asset_history(env: Env, admin: Address, asset_id: u64) {
             let oldest_ts = history.get(0).unwrap().timestamp;
             let mut kept: Vec<MaintenanceRecord> = Vec::new(&env);
             for i in start..history.len() { kept.push_back(history.get(i).unwrap()); }
+            // The new oldest record's `previous_record_hash` still points at a now-pruned
+            // record; clear it so the hash chain doesn't reference missing history.
+            if let Some(mut oldest) = kept.get(0) {
+                oldest.previous_record_hash = None;
+                kept.set(0, oldest);
+            }
             env.storage().persistent().set(&hist_key, &kept);
             extend_persistent_ttl(&env, &hist_key);
             env.events().publish((EVENT_PRUNED,), (asset_id, pruned_count, oldest_ts));

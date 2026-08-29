@@ -142,7 +142,7 @@ stellar keys generate deployer --network testnet
 ```rust
 register_asset(asset_id, asset_type, metadata) -> u64
 get_asset(asset_id) -> Asset
-get_lifecycle_score(asset_id) -> u32
+get_lifecycle_score(asset_id, lifecycle_contract) -> Option<u32>  # None if no maintenance history yet
 ```
 
 ### Engineer Registry
@@ -198,7 +198,7 @@ Mainstay v1 is a strong foundation, but there are several intentional constraint
 
 - **Unbounded history growth when `max_history` is high**: A large `max_history` value means per-asset history vectors can grow to hundreds of entries, making every `submit_maintenance` call increasingly expensive in compute and storage fees. Operators running production deployments should set a conservative `max_history` (≤ 200) and use `prune_asset_history` proactively.
 
-- **Engineer authorization is not transferred automatically**: When an asset changes ownership, the previous owner's engineer authorizations remain in storage and must be explicitly cleared by the new owner via `clear_engineer_authorizations`. Failure to do so allows engineers authorised by the previous owner to continue submitting maintenance records under the new owner's asset.
+- ~~**Engineer authorization is not transferred automatically**~~ **Resolved**: `record_transfer` now automatically clears all `ENG_AUTH` entries for an asset on every ownership transfer, so engineers authorized by the previous owner must be explicitly re-authorized by the new owner. See issue [#1204](https://github.com/TwinTrustMainstay/Mainstay/issues/1204).
 
 ### Planned resolution timeline
 

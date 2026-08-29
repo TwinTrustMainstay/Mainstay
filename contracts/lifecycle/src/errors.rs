@@ -60,6 +60,10 @@ pub enum ContractError {
     DuplicateRecordNotFound = 35,
     /// A compliance standard is already registered for this asset type.
     StandardAlreadyRegistered = 36,
+    /// Engineer has exceeded the configured max_submissions_per_hour rate limit.
+    RateLimitExceeded = 37,
+    /// Bulk engineer authorization revocation exceeds the maximum allowed batch size.
+    BatchRevokeTooLarge = 38,
 }
 
 impl From<SharedContractError> for ContractError {

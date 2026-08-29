@@ -203,7 +203,7 @@ path = "test_is_collateral_eligible_decay_applied.rs"
 name = "test_lending_error_variants"
 path = "test_lending_error_variants.rs"
 
-# Issue #1195: set_admin_quorum must reject duplicate addresses
+# Issue #1194: single code path for pause / unpause
 [[test]]
-name = "test_duplicate_admin_rejected_1195"
-path = "test_duplicate_admin_rejected_1195.rs"
+name = "test_single_pause_code_path_1194"
+path = "test_single_pause_code_path_1194.rs"
