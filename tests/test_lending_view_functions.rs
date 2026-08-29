@@ -5,6 +5,27 @@ use soroban_sdk::{
 };
 
 #[test]
+fn test_get_collateral_value_applies_score_and_ltv() {
+    let env = Env::default();
+    let contract_id = env.register(LendingContract, ());
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    // 10,000 × 80% score × 75% LTV = 6,000.
+    assert_eq!(client.get_collateral_value(&10_000, &80, &7_500), 6_000);
+}
+
+#[test]
+fn test_get_collateral_value_floors_and_clamps_inputs() {
+    let env = Env::default();
+    let contract_id = env.register(LendingContract, ());
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    // Score and LTV are bounded; integer arithmetic floors the result.
+    assert_eq!(client.get_collateral_value(&101, &150, &20_000), 101);
+    assert_eq!(client.get_collateral_value(&99, &50, &5_000), 24);
+}
+
+#[test]
 fn test_loan_status_none() {
     let env = Env::default();
     env.mock_all_auths();

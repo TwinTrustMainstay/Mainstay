@@ -104,6 +104,15 @@ pub struct Config {
     /// `batch_submit_maintenance` (each record in a batch counts individually).
     /// `0` disables rate limiting entirely.
     pub max_submissions_per_hour: u32,
+    /// Weight assigned to task types that are not listed in `task_weights` and
+    /// do not match any of the built-in hardcoded types.
+    ///
+    /// A value of `0` uses the contract-level default (`DEFAULT_TASK_WEIGHT`).
+    /// Setting this to a non-zero value lets operators gracefully handle new or
+    /// custom task types without having to call `set_task_weight` first, and
+    /// eliminates the `InvalidTaskType` panic that previously blocked
+    /// maintenance submissions for unknown types (see issue #1200).
+    pub default_task_weight: u32,
 }
 
 #[contracttype]
