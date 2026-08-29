@@ -2081,6 +2081,27 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::SpecializationMismatch);
         }
 
+        // Re-check the decommissioned/frozen state immediately before committing
+        // any history/score writes. The initial check above happens before the
+        // engineer-authorization cross-contract calls (credential status,
+        // engineer-authorized check, specialization lookup); those calls run
+        // under the reentrancy guard acquired earlier, but an admin could still
+        // decommission the asset via a separate top-level transaction that lands
+        // between when this invocation started and when it reaches this point
+        // in the ledger's transaction ordering. Re-reading the frozen flag here,
+        // directly adjacent to the first write, closes that window: either both
+        // checks observe "not decommissioned" and the write proceeds, or the
+        // second check catches a decommission and the whole invocation reverts
+        // atomically (Soroban invocations are all-or-nothing), so no maintenance
+        // record can ever be committed against a decommissioned asset.
+        if env.storage().persistent().get::<_, bool>(&frozen_key(asset_id)).unwrap_or(false) {
+            panic_with_error!(&env, ContractError::AssetDecommissioned);
+        }
+        let status = asset_client.asset_status(&asset_id);
+        if status == AssetStatus::Decommissioned {
+            panic_with_error!(&env, ContractError::AssetDecommissioned);
+        }
+
         let timestamp = env.ledger().timestamp();
         let previous_record_hash = next_chain_link(&env, &history);
 
@@ -5330,6 +5351,62 @@ mod tests {
         let history = client.get_maintenance_history(&asset_id);
         assert_eq!(history.get(0).unwrap().previous_record_hash, None);
         assert!(client.verify_maintenance_chain_integrity(&asset_id));
+    }
+
+    /// Regression test for the decommission-vs-submit race window: an asset
+    /// decommissioned between the point an engineer's authorization checks
+    /// begin and the point history/score writes would commit must never end
+    /// up with a maintenance record. This simulates the "race" by
+    /// decommissioning the asset via the asset-registry admin and then
+    /// immediately calling submit_maintenance for the same asset/engineer
+    /// pair that was fully authorized beforehand — the second, adjacent-to-
+    /// the-write frozen/status check added to submit_maintenance must catch
+    /// it even though the engineer authorization itself is still valid.
+    #[test]
+    fn test_decommission_submit_race_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_id, owner, engineer) = setup_chain_test(&env);
+
+        // Engineer is fully authorized and a prior submission succeeds.
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "Pre-decommission service"),
+            &engineer,
+            &None,
+        );
+        assert_eq!(client.get_maintenance_history(&asset_id).len(), 1);
+
+        // Simulate the race: the asset is decommissioned by a separate
+        // transaction that lands after this engineer's authorization was
+        // granted, but before their next submission is processed.
+        client.decommission_asset(&owner, &asset_id);
+
+        // The submission must be rejected atomically — no partial write,
+        // no record appended — regardless of when in the invocation the
+        // decommissioned state became visible.
+        let result = client.try_submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &Priority::Low,
+            &String::from_str(&env, "Post-decommission race attempt"),
+            &engineer,
+            &None,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetDecommissioned as u32
+            )))
+        );
+        assert_eq!(
+            client.get_maintenance_history(&asset_id).len(),
+            1,
+            "no maintenance record must be committed for a decommissioned asset, \
+             even when the submitting engineer was authorized before decommission"
+        );
     }
 
     #[test]
