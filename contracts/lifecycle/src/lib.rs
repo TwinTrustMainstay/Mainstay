@@ -1,8 +1,9 @@
 #![no_std]
 
+use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, Address,
-    BytesN, Env, String, Symbol, Vec,
+    Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 #[contracterror]
@@ -17,6 +18,18 @@ pub enum ContractError {
     NoPrunePending = 5,
 }
 
+/// Maintenance record with a tamper-evident hash chain.
+///
+/// `record_hash` is computed as:
+///   sha256(XDR(asset_id) || XDR(task_type) || XDR(engineer) || XDR(timestamp) || XDR(nonce) || XDR(prev_hash))
+///
+/// `notes` is deliberately EXCLUDED from the hash input because it is a
+/// free-form, user-controlled string. Including user-controlled bytes in a
+/// hash that is meant to prove chain integrity would let a submitter craft
+/// `notes` to try to influence/predict the resulting hash. `nonce` (the
+/// record's position in the asset's history) and `prev_hash` (the hash of
+/// the prior record, or 32 zero bytes for the first record) are included
+/// instead, so every record's hash is bound to its position in the chain.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaintenanceRecord {
@@ -28,6 +41,10 @@ pub struct MaintenanceRecord {
     /// True if the engineer's credential was in its post-expiry grace
     /// period at the time this record was signed.
     pub signed_during_grace_period: bool,
+    /// sha256 hash covering this record's chain-relevant fields (see above).
+    pub record_hash: BytesN<32>,
+    /// record_hash of the previous record in this asset's history.
+    pub prev_hash: BytesN<32>,
 }
 
 /// A pending admin proposal to permanently delete an asset's maintenance
@@ -85,6 +102,35 @@ fn prune_proposal_key(asset_id: u64) -> (Symbol, u64) {
 
 fn grace_period_key(engineer: &Address) -> (Symbol, Address) {
     (symbol_short!("GRACEEND"), engineer.clone())
+}
+
+fn chain_head_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("CHAINHD"), asset_id)
+}
+
+fn zero_hash(env: &Env) -> BytesN<32> {
+    BytesN::from_array(env, &[0u8; 32])
+}
+
+/// Computes a MaintenanceRecord's chain hash. See the doc comment on
+/// `MaintenanceRecord` for exactly which fields are covered.
+fn compute_record_hash(
+    env: &Env,
+    asset_id: u64,
+    task_type: &Symbol,
+    engineer: &Address,
+    timestamp: u64,
+    nonce: u32,
+    prev_hash: &BytesN<32>,
+) -> BytesN<32> {
+    let mut bytes = Bytes::new(env);
+    bytes.append(&Bytes::from(asset_id.to_xdr(env)));
+    bytes.append(&Bytes::from(task_type.to_xdr(env)));
+    bytes.append(&Bytes::from(engineer.to_xdr(env)));
+    bytes.append(&Bytes::from(timestamp.to_xdr(env)));
+    bytes.append(&Bytes::from(nonce.to_xdr(env)));
+    bytes.append(&Bytes::from(prev_hash.to_xdr(env)));
+    env.crypto().sha256(&bytes).into()
 }
 
 fn score_key(asset_id: u64) -> (Symbol, u64) {
@@ -243,6 +289,15 @@ impl Lifecycle {
             .unwrap_or(0);
         let signed_during_grace_period = grace_end > 0 && timestamp <= grace_end;
 
+        let nonce = history.len();
+        let prev_hash = env
+            .storage()
+            .persistent()
+            .get(&chain_head_key(asset_id))
+            .unwrap_or_else(|| zero_hash(&env));
+        let record_hash =
+            compute_record_hash(&env, asset_id, &task_type, &engineer, timestamp, nonce, &prev_hash);
+
         let record = MaintenanceRecord {
             asset_id,
             task_type: task_type.clone(),
@@ -250,12 +305,17 @@ impl Lifecycle {
             engineer: engineer.clone(),
             timestamp,
             signed_during_grace_period,
+            record_hash: record_hash.clone(),
+            prev_hash,
         };
 
         history.push_back(record);
         env.storage()
             .persistent()
             .set(&history_key(asset_id), &history);
+        env.storage()
+            .persistent()
+            .set(&chain_head_key(asset_id), &record_hash);
 
         // Update collateral score
         let score: u32 = env
@@ -361,12 +421,30 @@ impl Lifecycle {
             .unwrap_or(0);
         let signed_during_grace_period = grace_end > 0 && timestamp <= grace_end;
 
+        let mut prev_hash = env
+            .storage()
+            .persistent()
+            .get(&chain_head_key(asset_id))
+            .unwrap_or_else(|| zero_hash(&env));
+
         for record in records.iter() {
             let mut weight = get_task_weight(&env, &record.task_type);
             if signed_during_grace_period {
                 weight = weight * GRACE_PENALTY_NUM / GRACE_PENALTY_DEN;
             }
             score = (score + weight).min(100);
+
+            let nonce = history.len();
+            let record_hash = compute_record_hash(
+                &env,
+                asset_id,
+                &record.task_type,
+                &engineer,
+                timestamp,
+                nonce,
+                &prev_hash,
+            );
+
             history.push_back(MaintenanceRecord {
                 asset_id,
                 task_type: record.task_type.clone(),
@@ -374,12 +452,16 @@ impl Lifecycle {
                 engineer: engineer.clone(),
                 timestamp,
                 signed_during_grace_period,
+                record_hash: record_hash.clone(),
+                prev_hash: prev_hash.clone(),
             });
+            prev_hash = record_hash;
         }
 
         env.storage().persistent().set(&history_key(asset_id), &history);
         env.storage().persistent().set(&score_key(asset_id), &score);
         env.storage().persistent().set(&last_update_key(asset_id), &timestamp);
+        env.storage().persistent().set(&chain_head_key(asset_id), &prev_hash);
     }
 
     /// Apply time-based decay to an asset's collateral score.
@@ -532,6 +614,7 @@ impl Lifecycle {
         }
 
         env.storage().persistent().remove(&history_key(asset_id));
+        env.storage().persistent().remove(&chain_head_key(asset_id));
         env.storage()
             .temporary()
             .remove(&prune_proposal_key(asset_id));
@@ -1289,5 +1372,60 @@ mod tests {
         let history = client.get_maintenance_history(&asset_id);
         assert!(!history.get(0).unwrap().signed_during_grace_period);
         assert_eq!(client.get_collateral_score(&asset_id), 10);
+    }
+
+    // --- Issue 4: hash chain integrity ---
+
+    #[test]
+    fn test_record_hash_excludes_notes_and_is_deterministic() {
+        let env = Env::default();
+        let asset_id = 1u64;
+        let task_type = symbol_short!("OIL_CHG");
+        let engineer = Address::generate(&env);
+        let timestamp = 1000u64;
+        let prev = zero_hash(&env);
+
+        // Identical inputs (notes is not part of the hash function's
+        // signature at all) always produce the same hash.
+        let hash_a = compute_record_hash(&env, asset_id, &task_type, &engineer, timestamp, 0, &prev);
+        let hash_b = compute_record_hash(&env, asset_id, &task_type, &engineer, timestamp, 0, &prev);
+        assert_eq!(hash_a, hash_b);
+
+        // Changing the chain position (nonce) changes the hash even though
+        // every other field is identical, which is what prevents an
+        // attacker from crafting `notes` to predict or collide hashes.
+        let hash_c = compute_record_hash(&env, asset_id, &task_type, &engineer, timestamp, 1, &prev);
+        assert_ne!(hash_a, hash_c);
+    }
+
+    #[test]
+    fn test_maintenance_history_hash_chain_links_records() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "first, arbitrary notes A"),
+            &engineer,
+        );
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "second, wildly different notes!!"),
+            &engineer,
+        );
+
+        let history = client.get_maintenance_history(&asset_id);
+        let first = history.get(0).unwrap();
+        let second = history.get(1).unwrap();
+
+        assert_eq!(first.prev_hash, zero_hash(&env));
+        assert_eq!(second.prev_hash, first.record_hash);
+        assert_ne!(first.record_hash, second.record_hash);
     }
 }
