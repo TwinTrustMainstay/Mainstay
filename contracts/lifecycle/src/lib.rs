@@ -145,32 +145,6 @@ const EVENT_WEIGHT_PROP: Symbol = symbol_short!("WT_PROP");
 /// Emitted when a pending task-weight-change proposal is executed.
 const EVENT_WEIGHT_EXEC: Symbol = symbol_short!("WT_EXEC");
 
-fn history_key(asset_id: u64) -> (Symbol, u64) {
-const MAX_AGE_LEDGERS: u64 = TTL_THRESHOLD as u64;
-
-
-    (symbol_short!("HIST"), asset_id)
-
-    (symbol_short!("TL_PROP"), op)
-
-    (symbol_short!("SCORE"), asset_id)
-
-    (symbol_short!("SCHIST"), asset_id)
-
-    (symbol_short!("LUPD"), asset_id)
-
-    (symbol_short!("ENG_HIST"), engineer.clone())
-
-    (symbol_short!("ENG_AUTH"), asset_id, engineer.clone())
-
-    (symbol_short!("FROZEN"), asset_id)
-
-    (symbol_short!("FRZ_SCR"), asset_id)
-
-    (symbol_short!("HLTH_SNP"), asset_id)
-
-    (symbol_short!("XFER_HIST"), asset_id)
-}
 
 /// Key for the list of currently-authorized engineer addresses for an asset.
 /// Used by `authorize_engineer`, `revoke_engineer_authorization`, and
