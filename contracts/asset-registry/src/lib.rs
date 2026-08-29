@@ -13,6 +13,12 @@ pub enum ContractError {
     DuplicateAsset = 2,
     UnauthorizedAdmin = 3,
     UnauthorizedOwner = 4,
+    /// Caller is not the currently configured lending contract.
+    UnauthorizedLender = 5,
+    /// set_lending_contract called before the 48h timelock elapsed.
+    LendingTimelockNotElapsed = 6,
+    /// set_lending_contract called with no matching proposal on file.
+    NoLendingProposal = 7,
 }
 
 #[contracttype]
@@ -23,11 +29,27 @@ pub struct Asset {
     pub metadata: String,
     pub owner: Address,
     pub registered_at: u64,
+    /// True while a lending contract holds this asset as active collateral.
+    pub locked: bool,
+}
+
+/// A pending admin proposal to change the lending contract address.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LendingContractProposal {
+    pub new_contract: Address,
+    pub proposed_at: u64,
 }
 
 const ASSET_COUNT: Symbol = symbol_short!("A_COUNT");
 
 const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
+
+/// Address of the contract currently authorized to call `lock_asset_as_collateral`.
+const LENDING_CONTRACT_KEY: Symbol = symbol_short!("LENDCTR");
+const LENDING_PROPOSAL_KEY: Symbol = symbol_short!("LENDPROP");
+/// Timelock enforced between proposing and applying a new lending contract: 48 hours.
+const LENDING_TIMELOCK_SECS: u64 = 172800;
 
 
 #[contracterror]
@@ -69,6 +91,7 @@ impl AssetRegistry {
             metadata,
             owner: owner.clone(),
             registered_at: env.ledger().timestamp(),
+            locked: false,
         };
         env.storage().persistent().set(&asset_key(id), &asset);
         env.storage().persistent().extend_ttl(&asset_key(id), 518400, 518400); // Extend TTL for persistent storage entries to prevent data loss
@@ -204,6 +227,125 @@ impl AssetRegistry {
             (symbol_short!("TRANSFER"), asset_id),
             (current_owner, new_owner, env.ledger().timestamp()),
         );
+    }
+
+    /// Admin-only: propose a new lending contract address. Must wait
+    /// LENDING_TIMELOCK_SECS (48h) before `set_lending_contract` can apply it,
+    /// so a compromised admin key can't instantly redirect collateral-locking
+    /// authority to a malicious contract.
+    pub fn propose_lending_contract(env: Env, admin: Address, new_contract: Address) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+
+        let proposed_at = env.ledger().timestamp();
+        env.storage().instance().set(
+            &LENDING_PROPOSAL_KEY,
+            &LendingContractProposal {
+                new_contract: new_contract.clone(),
+                proposed_at,
+            },
+        );
+        env.events().publish(
+            (symbol_short!("LENDPROP"),),
+            (admin, new_contract, proposed_at),
+        );
+    }
+
+    /// Admin-only: apply a previously proposed lending contract change once
+    /// the 48h timelock has elapsed. Emits ADM_AUD, an administrative audit
+    /// event, so any change to this security-critical setting is traceable.
+    pub fn set_lending_contract(env: Env, admin: Address) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+
+        let proposal: LendingContractProposal = env
+            .storage()
+            .instance()
+            .get(&LENDING_PROPOSAL_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoLendingProposal));
+
+        let now = env.ledger().timestamp();
+        if now < proposal.proposed_at + LENDING_TIMELOCK_SECS {
+            panic_with_error!(&env, ContractError::LendingTimelockNotElapsed);
+        }
+
+        let old_contract: Option<Address> = env.storage().instance().get(&LENDING_CONTRACT_KEY);
+        env.storage()
+            .instance()
+            .set(&LENDING_CONTRACT_KEY, &proposal.new_contract);
+        env.storage().instance().remove(&LENDING_PROPOSAL_KEY);
+
+        env.events().publish(
+            (symbol_short!("ADM_AUD"),),
+            (old_contract, proposal.new_contract, now),
+        );
+    }
+
+    pub fn get_lending_contract(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&LENDING_CONTRACT_KEY)
+            .expect("lending contract not set")
+    }
+
+    /// Lending-contract-only: mark an asset as locked collateral.
+    pub fn lock_asset_as_collateral(env: Env, asset_id: u64, lender: Address) {
+        lender.require_auth();
+        Self::require_lending_contract(&env, &lender);
+
+        let mut asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+        asset.locked = true;
+        env.storage().persistent().set(&asset_key(asset_id), &asset);
+
+        env.events().publish(
+            (symbol_short!("LOCK_AST"), asset_id),
+            (lender, env.ledger().timestamp()),
+        );
+    }
+
+    /// Lending-contract-only: release an asset from collateral lock.
+    pub fn unlock_asset(env: Env, asset_id: u64, lender: Address) {
+        lender.require_auth();
+        Self::require_lending_contract(&env, &lender);
+
+        let mut asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+        asset.locked = false;
+        env.storage().persistent().set(&asset_key(asset_id), &asset);
+
+        env.events().publish(
+            (symbol_short!("UNLK_AST"), asset_id),
+            (lender, env.ledger().timestamp()),
+        );
+    }
+
+    fn require_admin(env: &Env, admin: &Address) {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .expect("admin not initialized");
+        if &stored_admin != admin {
+            panic_with_error!(env, ContractError::UnauthorizedAdmin);
+        }
+    }
+
+    fn require_lending_contract(env: &Env, lender: &Address) {
+        let lending_contract: Address = env
+            .storage()
+            .instance()
+            .get(&LENDING_CONTRACT_KEY)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::UnauthorizedLender));
+        if &lending_contract != lender {
+            panic_with_error!(env, ContractError::UnauthorizedLender);
+        }
     }
 
     /// Admin-only: upgrade the contract WASM to a new hash.
@@ -607,6 +749,126 @@ mod tests {
                 ContractError::DuplicateAsset as u32,
             ))),
         );
+    }
+
+    // --- Issue 2: lending contract timelock + audit event ---
+
+    #[test]
+    fn test_set_lending_contract_requires_timelock() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        let lender = Address::generate(&env);
+
+        client.propose_lending_contract(&admin, &lender);
+
+        // Applying immediately, before the 48h timelock elapses, must fail.
+        let result = client.try_set_lending_contract(&admin);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::LendingTimelockNotElapsed as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_set_lending_contract_succeeds_after_timelock_and_emits_adm_aud() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        let lender = Address::generate(&env);
+
+        client.propose_lending_contract(&admin, &lender);
+        env.ledger()
+            .with_mut(|li| li.timestamp = li.timestamp + LENDING_TIMELOCK_SECS + 1);
+        client.set_lending_contract(&admin);
+
+        assert_eq!(client.get_lending_contract(), lender);
+        let events = env.events().all();
+        assert!(events.len() > 0);
+    }
+
+    #[test]
+    fn test_set_lending_contract_non_admin_cannot_propose() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        let outsider = Address::generate(&env);
+        let lender = Address::generate(&env);
+
+        let result = client.try_propose_lending_contract(&outsider, &lender);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_lock_asset_as_collateral_rejects_unauthorized_caller() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &owner,
+        );
+
+        let attacker = Address::generate(&env);
+        let result = client.try_lock_asset_as_collateral(&id, &attacker);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedLender as u32,
+            ))),
+        );
+        assert!(!client.get_asset(&id).locked);
+    }
+
+    #[test]
+    fn test_lock_asset_as_collateral_succeeds_for_configured_lender() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin);
+        let lender = Address::generate(&env);
+        client.propose_lending_contract(&admin, &lender);
+        env.ledger()
+            .with_mut(|li| li.timestamp = li.timestamp + LENDING_TIMELOCK_SECS + 1);
+        client.set_lending_contract(&admin);
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &owner,
+        );
+
+        client.lock_asset_as_collateral(&id, &lender);
+        assert!(client.get_asset(&id).locked);
     }
 }
 
