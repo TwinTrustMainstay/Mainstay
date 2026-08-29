@@ -4316,7 +4316,10 @@ impl Lifecycle {
         history.len()
     }
 
-    /// Alias for [`get_eng_maint_hist_count`].
+    /// Return the total number of asset IDs recorded for an engineer.
+    ///
+    /// This explicitly named view is intended for reputation dashboards and
+    /// avoids downloading and counting the complete history client-side.
     ///
     /// # Arguments
     /// * `engineer` - The address of the engineer to query
@@ -4324,7 +4327,12 @@ impl Lifecycle {
     /// # Returns
     /// Total number of entries in the engineer's maintenance history.
     pub fn get_engineer_history_count(env: Env, engineer: Address) -> u32 {
-        Self::get_eng_maint_hist_count(env, engineer)
+        let history: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&engineer_history_key(&engineer))
+            .unwrap_or_else(|| Vec::new(&env));
+        history.len()
     }
 
     /// Alias for [`get_eng_maint_hist_count`].
