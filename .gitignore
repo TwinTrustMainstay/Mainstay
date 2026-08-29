@@ -1,2 +1,84 @@
-/target
-TODO.md
+# Build artifacts
+target/
+
+# Environment secrets
+.env
+.env.local
+.env.*.local
+
+# Test snapshots
+contracts/asset-registry/test_snapshots/
+contracts/lifecycle/test_snapshots/
+contracts/engineer-registry/test_snapshots/
+**/test_snapshots/
+**/*.snap
+
+# IDE / editor
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Wasm build output
+*.wasm
+contracts/*/target/
+
+# Rust incremental compilation cache
+**/*.d
+**/incremental/
+
+# Rust
+Cargo.lock
+
+# Soroban / Stellar CLI artifacts
+.soroban/
+stellar-cli-output/
+.stellar/
+
+# Temporary files
+*.tmp
+*.bak
+*.orig
+
+# Coverage reports
+coverage/
+lcov.info
+tarpaulin-report.html
+
+# Profiling
+*.profdata
+*.profraw
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Node / frontend
+node_modules/
+.npm/
+dist/
+.DS_Store
+
+# Coverage / profiling
+lcov.info
+*.profraw
+*.profdata
+tarpaulin-report.html
+
+# Misc editor artifacts
+*.orig
+*.rej

@@ -1,5 +1,11 @@
 # Mainstay — Proof of Maintenance for Industrial Assets
 
+[![CI](https://github.com/marvs8/Mainstay/actions/workflows/ci.yml/badge.svg)](https://github.com/marvs8/Mainstay/actions/workflows/ci.yml)
+[![WASM Size](https://img.shields.io/badge/WASM%20size-%E2%89%A4%2051%20KB-brightgreen)](https://github.com/marvs8/Mainstay/actions/workflows/ci.yml)
+[![Clippy](https://img.shields.io/badge/clippy-passing-brightgreen)](https://github.com/marvs8/Mainstay/actions/workflows/ci.yml)
+[![rustfmt](https://img.shields.io/badge/rustfmt-passing-brightgreen)](https://github.com/marvs8/Mainstay/actions/workflows/ci.yml)
+[![cargo audit](https://img.shields.io/badge/cargo%20audit-high--severity%20gate-blue)](https://github.com/marvs8/Mainstay/actions/workflows/ci.yml)
+
 A decentralized physical infrastructure network (DePIN) built on Stellar Soroban smart contracts, creating verifiable maintenance audit trails for heavy industrial machinery.
 
 Mainstay solves the **Information Asymmetry** problem in asset financing — lenders don't know the true physical condition of a machine. By anchoring every maintenance event on-chain, Mainstay creates an immutable, verifiable lifecycle record that transforms industrial assets into credible DeFi collateral.
@@ -46,8 +52,31 @@ This makes Mainstay:
 
 ### Test
 
+From the repository root, run the full workspace test suite:
+
 ```bash
 ./scripts/test.sh
+```
+
+Optional arguments are forwarded to `cargo test`, for example:
+
+```bash
+./scripts/test.sh -p lifecycle
+./scripts/test.sh -p lifecycle my_test_name -- --nocapture
+```
+
+To run the dependency audit gate used by CI:
+
+```bash
+cargo install cargo-audit --locked
+cargo audit
+```
+
+On Windows (PowerShell):
+
+```powershell
+.\scripts\test.ps1
+.\scripts\test.ps1 -p lifecycle
 ```
 
 ### Setup Environment
@@ -92,6 +121,11 @@ stellar keys generate deployer --network testnet
 ./scripts/deploy_testnet.sh
 ```
 
+## 📋 Examples
+
+- [Credential Management (bash)](examples/credential_management.sh) — register, verify, renew, and revoke engineer credentials on Linux/macOS
+- [Credential Management (PowerShell)](examples/credential_management.ps1) — equivalent workflow for Windows users
+
 ## 📖 Documentation
 
 - [Architecture Overview](docs/architecture.md)
@@ -108,7 +142,7 @@ stellar keys generate deployer --network testnet
 ```rust
 register_asset(asset_id, asset_type, metadata) -> u64
 get_asset(asset_id) -> Asset
-get_lifecycle_score(asset_id) -> u32
+get_lifecycle_score(asset_id, lifecycle_contract) -> Option<u32>  # None if no maintenance history yet
 ```
 
 ### Engineer Registry
@@ -124,7 +158,8 @@ revoke_credential(engineer_address)
 ```rust
 submit_maintenance(asset_id, task_type, notes, engineer_signature)
 get_maintenance_history(asset_id) -> Vec<MaintenanceRecord>
-get_last_service(asset_id) -> MaintenanceRecord
+get_maintenance_history_since_transfer(asset_id) -> Vec<MaintenanceRecord>
+get_last_service(asset_id) -> Option<MaintenanceRecord>
 ```
 
 ### Collateral
@@ -145,12 +180,31 @@ Comprehensive test suite covering:
 ✅ Collateral score calculation  
 ✅ Error handling and edge cases  
 ✅ TTL extension verification  
+✅ Paused-contract write rejection (all three contracts)  
 
 Run tests:
 
 ```bash
 cargo test
 ```
+
+## ⚠️ Known Limitations
+
+Mainstay v1 is a strong foundation, but there are several intentional constraints and current limitations that contributors and integrators should be aware of before filing issues or building integrations.
+
+- **No partial history recovery path**: If maintenance history is pruned (via `max_history` cap or `prune_asset_history`) or partially lost due to TTL expiry, there is currently no mechanism to reconstruct or recover the missing entries. Health snapshots (`take_health_snapshot`) mitigate data loss for scoring purposes, but the raw record detail is unrecoverable once pruned. See issue [#849](https://github.com/TwinTrustMainstay/Mainstay/issues/849).
+
+- **Hardcoded default task-type score weights**: Task type weights (e.g. `OIL_CHG` = 2, `ENGINE` = 10) have sensible defaults but the per-deployment configuration is limited to the `set_task_weight` admin call. There is no on-chain governance mechanism for weight proposals or community voting. Integrators relying on predictable scoring must pin their expected weights and monitor admin events.
+
+- **Unbounded history growth when `max_history` is high**: A large `max_history` value means per-asset history vectors can grow to hundreds of entries, making every `submit_maintenance` call increasingly expensive in compute and storage fees. Operators running production deployments should set a conservative `max_history` (≤ 200) and use `prune_asset_history` proactively.
+
+- ~~**Engineer authorization is not transferred automatically**~~ **Resolved**: `record_transfer` now automatically clears all `ENG_AUTH` entries for an asset on every ownership transfer, so engineers authorized by the previous owner must be explicitly re-authorized by the new owner. See issue [#1204](https://github.com/TwinTrustMainstay/Mainstay/issues/1204).
+
+### Planned resolution timeline
+
+- **v1.1**: Full asset transfer reconciliation in lifecycle; automatic engineer-auth invalidation on ownership change
+- **v1.2**: Partial history reconstruction via health-snapshot anchoring; configurable weight governance
+- **v2.0**: Scalable history indexing for large portfolios; on-chain weight proposals
 
 ## ⏱️ TTL (Time-To-Live) Strategy
 
@@ -220,6 +274,17 @@ See [docs/roadmap.md](docs/roadmap.md) for details.
 ## 🛡️ Security
 
 We take the security of Mainstay very seriously. If you discover a vulnerability, please refer to our [Security Policy](SECURITY.md) for reporting instructions.
+
+### Dependency Vulnerability Scanning
+- **Automated Scanning**: CI workflow runs `cargo audit` on every push and PR
+- **Failure Handling**: Build fails if `cargo audit` finds advisories at `high` severity or above
+- **Purpose**: Automatically detect known vulnerabilities in Soroban SDK and dependencies
+- **Action Required**: Review and update dependencies if audit fails
+
+### Security Best Practices
+- **Regular Updates**: Keep dependencies updated to latest secure versions
+- **Review Process**: All dependency changes undergo security review
+- **Vulnerability Disclosure**: Report security issues through responsible disclosure
 
 ## 🤝 Contributing
 

@@ -1,0 +1,41 @@
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "03:00"
+    open-pull-requests-limit: 5
+    
+    # Assign reviewers to dependency PRs for oversight
+    reviewers:
+      - "johnsaviour56-ship-it"
+    
+    # Add labels for organization and filtering
+    labels:
+      - "dependencies"
+      - "automation"
+    
+    # Customize commit messages for clarity and conventional commits
+    commit-message:
+      prefix: "build(deps)"
+      prefix-development: "build(deps-dev)"
+      include: "scope"
+    
+    # Configure auto-merge for patch and safe minor updates
+    automerged_updates:
+      - match:
+          update_type: "patch"
+          dependency_type: "all"
+      - match:
+          update_type: "minor"
+          dependency_type: "indirect"
+    
+    # Require manual review for major updates to critical dependencies
+    # Soroban SDK and Stellar crates need careful review on major versions
+    ignore:
+      - dependency-name: "soroban-sdk"
+        update_types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"

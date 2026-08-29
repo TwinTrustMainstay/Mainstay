@@ -1,0 +1,146 @@
+# Mainstay Prometheus Alerting Rules
+# These rules are evaluated by Prometheus and fire alerts when contract
+# health metrics cross predefined thresholds.
+
+groups:
+  - name: mainstay_contract_health
+    interval: 60s
+    rules:
+      # --- Availability ---
+
+      - alert: MainstayExporterDown
+        expr: mainstay_exporter_up == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Mainstay Prometheus exporter is down"
+          description: >
+            The Mainstay metrics exporter has been down for 5 minutes.
+            No contract health metrics are being collected.
+            Check the prometheus-exporter.sh process and Stellar RPC connectivity.
+
+      # --- Asset Health ---
+
+      - alert: NoNewAssets
+        expr: mainstay_assets_total == mainstay_assets_total offset 7d
+        for: 1d
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zero new assets registered in 7 days"
+          description: >
+            No new assets have been registered in the past 7 days.
+            This may indicate an onboarding issue or a problem with the
+            registration flow. Verify the Asset Registry contract is operational.
+
+      - alert: AssetsDecreasing
+        expr: mainstay_assets_total < mainstay_assets_total offset 1h
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Asset count is decreasing"
+          description: >
+            The total asset count has dropped in the past hour.
+            This typically indicates mass deregistrations, which may be
+            a sign of a security incident or data corruption.
+
+      # --- Maintenance Health ---
+
+      - alert: ZeroMaintenanceRecords
+        expr: mainstay_maintenance_records_total == 0
+        for: 24h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zero maintenance records in 24 hours"
+          description: >
+            No maintenance records have been submitted in the past 24 hours.
+            This could indicate that engineers are unable to submit records,
+            the Lifecycle contract is paused, or there is a network issue.
+
+      - alert: NoMaintenanceActivity
+        expr: mainstay_maintenance_records_total == mainstay_maintenance_records_total offset 30m
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No maintenance activity detected"
+          description: >
+            The count of maintenance records has not changed
+            for the past 30 minutes. Check the Lifecycle contract and
+            engineer credential validity.
+
+      - alert: HighMaintenanceFailureRate
+        expr: |
+          (
+            rate(mainstay_maintenance_submit_errors_total[10m])
+            /
+            (rate(mainstay_maintenance_records_total[10m]) + rate(mainstay_maintenance_submit_errors_total[10m]))
+          ) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High maintenance submission failure rate"
+          description: >
+            More than 10% of maintenance submissions may be failing.
+            Check for expired credentials, asset-lock issues, or
+            paused contracts. Note: this alert requires a separate
+            error counter (not yet exported); set up error tracking
+            from application logs.
+
+      # --- Collateral Score Health ---
+
+      - alert: AvgCollateralScoreDropping
+        expr: |
+          mainstay_avg_collateral_score < (mainstay_avg_collateral_score offset 1d) * 0.8
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Average collateral score dropped by >20% in 24 hours"
+          description: >
+            The average collateral score has dropped significantly.
+            This could be due to score decay, mass decommissioning, or
+            data corruption. Verify scoring logic and recent events.
+
+      - alert: NoScoredAssets
+        expr: mainstay_scored_assets_count == 0
+        for: 12h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Zero scored assets"
+          description: >
+            No assets have a non-zero collateral score.
+            All scores may have decayed to zero, or assets may have been
+            decommissioned.
+
+      # --- Engineer Health ---
+
+      - alert: EngineerCountDropping
+        expr: mainstay_engineers_total < mainstay_engineers_total offset 1d
+        for: 4h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Engineer count is decreasing"
+          description: >
+            The number of registered engineers has decreased over the past day.
+            This may indicate mass credential revocations or data issues.
+
+      # --- Data Freshness ---
+
+      - alert: StaleMetrics
+        expr: time() - mainstay_metrics_collection_seconds > 120
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Metrics are stale (>2 min old)"
+          description: >
+            The latest metrics collection is more than 2 minutes old.
+            The exporter may have crashed or the Stellar RPC may be
+            unreachable.

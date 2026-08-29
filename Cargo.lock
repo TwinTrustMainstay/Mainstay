@@ -154,6 +154,9 @@ dependencies = [
 name = "asset-registry"
 version = "0.1.0"
 dependencies = [
+ "engineer-registry",
+ "lifecycle",
+ "shared",
  "soroban-sdk",
 ]
 
@@ -272,6 +275,17 @@ dependencies = [
  "serde",
  "serde_derive",
  "serde_json",
+]
+
+[[package]]
+name = "cross-platform-tests"
+version = "0.1.0"
+dependencies = [
+ "asset-registry",
+ "engineer-registry",
+ "lending",
+ "lifecycle",
+ "soroban-sdk",
 ]
 
 [[package]]
@@ -540,6 +554,7 @@ dependencies = [
 name = "engineer-registry"
 version = "0.1.0"
 dependencies = [
+ "shared",
  "soroban-sdk",
 ]
 
@@ -557,9 +572,9 @@ checksum = "2bfcf67fea2815c2fc3b90873fae90957be12ff417335dfadc7f52927feb03b2"
 
 [[package]]
 name = "ethnum"
-version = "1.5.2"
+version = "1.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca81e6b4777c89fd810c25a4be2b1bd93ea034fbe58e6a75216a34c6b82c539b"
+checksum = "40404c3f5f511ec4da6fe866ddf6a717c309fdbb69fbbad7b0f3edab8f2e835f"
 
 [[package]]
 name = "ff"
@@ -775,6 +790,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lending"
+version = "0.1.0"
+dependencies = [
+ "shared",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.183"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -792,6 +815,7 @@ version = "0.1.0"
 dependencies = [
  "asset-registry",
  "engineer-registry",
+ "shared",
  "soroban-sdk",
 ]
 
@@ -1149,6 +1173,13 @@ checksum = "75872d278a8f37ef87fa0ddbda7802605cb18344497949862c0d4dcb291eba60"
 dependencies = [
  "digest",
  "keccak",
+]
+
+[[package]]
+name = "shared"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
 ]
 
 [[package]]
