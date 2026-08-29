@@ -11,6 +11,10 @@ pub enum ContractError {
     NoMaintenanceHistory = 1,
     UnauthorizedEngineer = 2,
     UnauthorizedAdmin = 3,
+    /// A prune was executed (or attempted) before the 48h timelock elapsed.
+    PruneTimelockNotElapsed = 4,
+    /// execute_prune_asset_history called with no matching proposal on file.
+    NoPrunePending = 5,
 }
 
 #[contracttype]
@@ -21,6 +25,15 @@ pub struct MaintenanceRecord {
     pub notes: String,
     pub engineer: Address,
     pub timestamp: u64,
+}
+
+/// A pending admin proposal to permanently delete an asset's maintenance
+/// history. Must sit for PRUNE_TIMELOCK_SECS before it can be executed.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PruneProposal {
+    pub asset_id: u64,
+    pub proposed_at: u64,
 }
 
 /// A point-in-time snapshot of the collateral score, recorded at each maintenance event.
@@ -53,9 +66,15 @@ const DEFAULT_MAX_HISTORY: u32 = 200;
 const DEFAULT_SCORE_INCREMENT: u32 = 5;
 const DECAY_INTERVAL: u64 = 2592000; // 30 days in seconds
 const DECAY_RATE: u32 = 5;
+/// Timelock enforced between proposing and executing a history prune: 48 hours.
+const PRUNE_TIMELOCK_SECS: u64 = 172800;
 
 fn history_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("HIST"), asset_id)
+}
+
+fn prune_proposal_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("PRUNE"), asset_id)
 }
 
 fn score_key(asset_id: u64) -> (Symbol, u64) {
@@ -410,6 +429,74 @@ impl Lifecycle {
     pub fn is_collateral_eligible(env: Env, asset_id: u64) -> bool {
         let threshold = 50u32;
         Self::get_collateral_score(env, asset_id) >= threshold
+    }
+
+    /// Admin-only: propose permanently deleting an asset's maintenance
+    /// history. Cannot be executed until PRUNE_TIMELOCK_SECS (48h) have
+    /// elapsed, giving lenders time to react to a compromised admin key.
+    pub fn propose_prune_asset_history(env: Env, admin: Address, asset_id: u64) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+
+        let proposed_at = env.ledger().timestamp();
+        env.storage().temporary().set(
+            &prune_proposal_key(asset_id),
+            &PruneProposal {
+                asset_id,
+                proposed_at,
+            },
+        );
+        // PRUNE_PROP (shortened to fit Soroban's 9-char small-symbol limit).
+        env.events().publish(
+            (symbol_short!("PRUNEPROP"), asset_id),
+            (admin, proposed_at),
+        );
+    }
+
+    /// Admin-only: cancel a pending prune proposal before it can be executed.
+    pub fn cancel_prune_asset_history(env: Env, admin: Address, asset_id: u64) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .temporary()
+            .remove(&prune_proposal_key(asset_id));
+    }
+
+    /// Admin-only: execute a previously proposed prune once the 48h timelock
+    /// has elapsed. Permanently deletes the asset's maintenance history.
+    pub fn execute_prune_asset_history(env: Env, admin: Address, asset_id: u64) {
+        admin.require_auth();
+        Self::require_admin(&env, &admin);
+
+        let proposal: PruneProposal = env
+            .storage()
+            .temporary()
+            .get(&prune_proposal_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoPrunePending));
+
+        let now = env.ledger().timestamp();
+        if now < proposal.proposed_at + PRUNE_TIMELOCK_SECS {
+            panic_with_error!(&env, ContractError::PruneTimelockNotElapsed);
+        }
+
+        env.storage().persistent().remove(&history_key(asset_id));
+        env.storage()
+            .temporary()
+            .remove(&prune_proposal_key(asset_id));
+
+        env.events()
+            .publish((symbol_short!("PRUNEXEC"), asset_id), (admin, now));
+    }
+
+    fn require_admin(env: &Env, admin: &Address) {
+        let config: Config = env
+            .storage()
+            .instance()
+            .get(&CONFIG)
+            .expect("config not set");
+        if &config.admin != admin {
+            panic_with_error!(env, ContractError::UnauthorizedAdmin);
+        }
     }
 
     /// Admin-only: upgrade the contract WASM to a new hash.
@@ -973,5 +1060,107 @@ mod tests {
                 ContractError::UnauthorizedEngineer as u32,
             ))),
         );
+    }
+
+    // --- Issue 1: prune_asset_history timelock ---
+
+    #[test]
+    fn test_prune_asset_history_requires_timelock() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "before prune"),
+            &engineer,
+        );
+
+        client.propose_prune_asset_history(&admin, &asset_id);
+
+        // Executing immediately, before the 48h timelock elapses, must fail.
+        let result = client.try_execute_prune_asset_history(&admin, &asset_id);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::PruneTimelockNotElapsed as u32,
+            ))),
+        );
+        // History must still be intact.
+        assert_eq!(client.get_maintenance_history(&asset_id).len(), 1);
+    }
+
+    #[test]
+    fn test_prune_asset_history_succeeds_after_timelock() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &String::from_str(&env, "before prune"),
+            &engineer,
+        );
+
+        client.propose_prune_asset_history(&admin, &asset_id);
+        env.ledger()
+            .with_mut(|li| li.timestamp = li.timestamp + PRUNE_TIMELOCK_SECS + 1);
+        client.execute_prune_asset_history(&admin, &asset_id);
+
+        assert_eq!(client.get_maintenance_history(&asset_id).len(), 0);
+    }
+
+    #[test]
+    fn test_prune_asset_history_no_pending_proposal() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _, admin) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+
+        let result = client.try_execute_prune_asset_history(&admin, &asset_id);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::NoPrunePending as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_prune_asset_history_non_admin_cannot_propose() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _, _) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+        let outsider = Address::generate(&env);
+
+        let result = client.try_propose_prune_asset_history(&outsider, &asset_id);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_prune_asset_history_emits_prune_prop_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _, admin) = setup(&env, 0);
+        let asset_id = register_asset(&env, &asset_registry_client);
+
+        client.propose_prune_asset_history(&admin, &asset_id);
+        let events = env.events().all();
+        assert!(events.len() > 0);
     }
 }
