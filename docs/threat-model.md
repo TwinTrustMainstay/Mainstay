@@ -111,6 +111,8 @@ Mainstay is a decentralized physical infrastructure network (DePIN) built on Ste
 | T-LC-11 | **E**levation of Privilege | Cross-contract call to AssetRegistry returns stale/false data | High | Lifecycle verifies asset existence at call time; `try_get_asset` panics on non-existent assets |
 | T-LC-12 | **E**levation of Privilege | Cross-contract call to EngineerRegistry bypassed or replayed | High | `get_credential_status` is called at submission time; fallback `verify_engineer` for non-Valid status |
 | T-LC-13 | **E**levation of Privilege | Engineer reputation score is manipulated to inflate collateral weight | Medium | Reputation is read from EngineerRegistry at submission time; not cached in Lifecycle |
+| T-LC-14 | **E**levation of Privilege | Same address passed for both registries; cross-contract calls resolve incorrectly (#1254) | High | `initialize` validates `asset_registry != engineer_registry`; returns `SameRegistryAddress` (error 13) if they match |
+| T-LC-15 | **E**levation of Privilege | Observer front-runs `initialize` to set attacker as admin (#1255) | Critical | `__constructor` stores deployer at deploy time; `initialize` requires `deployer.require_auth()` and verifies against stored `DEPLOYER_KEY` — non-deployers are rejected |
 
 ### Lending
 
@@ -189,7 +191,21 @@ The deployer key is the most critical key during deployment. If compromised, the
 
 **Mitigation:** Use a cold wallet for deployment; transfer admin to a multisig account after initialization. Store deployer key in a hardware wallet or secrets manager (HashiCorp Vault).
 
-### DI-03: Testnet → Mainnet Configuration Drift
+### DI-03: Front-Running `initialize` on the Lifecycle Contract (#1255)
+Between deployment and `initialize`, an observer watching the mempool could attempt to call `initialize` with their own `admin` address before the legitimate deployer does.
+
+**Risk:** Critical
+
+**Mitigation:** The Lifecycle contract uses a `DEPLOYER_KEY` pattern to prevent front-running:
+- The `__constructor` (called at deploy time) stores the deployer's address in instance storage under `DEPLOYER_KEY`.
+- `initialize` reads `DEPLOYER_KEY` from instance storage and requires `deployer.require_auth()` from that stored address. Any caller presenting a different address — or any call where `DEPLOYER_KEY` is absent — is rejected with `UnauthorizedAdmin` or `NotInitialized` respectively.
+- This means only the wallet that deployed the contract can call `initialize`, making front-run initialization impossible.
+
+**Residual risk:** The `__constructor` and `initialize` must still be called in close succession. A well-resourced attacker who can delay ledger inclusion of the deployer's `initialize` transaction cannot front-run initialization, but *could* attempt to prevent the deployer from initializing by spamming the network. The runbook's recommendation to initialize in the same block as deployment (or immediately after) fully eliminates this residual risk.
+
+**Verification:** See `test_initialize_deployer_restriction_non_deployer_rejected` and `test_initialize_deployer_restriction_already_initialized` in `contracts/lifecycle/src/lib.rs`.
+
+### DI-04: Testnet → Mainnet Configuration Drift
 Testnet configuration accidentally carried to mainnet (wrong admin, wrong thresholds).
 
 **Mitigation:** `scripts/deploy_testnet.sh` hard-rejects non-testnet networks. Mainnet deployment is manual with `--network mainnet`.
@@ -227,9 +243,9 @@ Testnet configuration accidentally carried to mainnet (wrong admin, wrong thresh
 ## Risk Matrix Summary
 
 | Risk Level | Count | Examples |
-|-----------|-------|----------|
-| **Critical** | 8 | TTL expiry (all contracts), pause flag expiry, front-run initialization, registry binding immutability |
-| **High** | 9 | Cross-contract state drift, unauthorized engineer maintenance, compromised issuer, loan spoofing |
+|-----------|-------|---------|
+| **Critical** | 10 | TTL expiry (all contracts), pause flag expiry, front-run initialization (DI-03 / T-LC-15), registry binding immutability |
+| **High** | 10 | Cross-contract state drift, unauthorized engineer maintenance, compromised issuer, loan spoofing, same-registry misconfiguration (T-LC-14) |
 | **Medium** | 11 | Score inflation via collusion, decay avoidance, configuration manipulation, dedup bypass |
 | **Low** | 11 | Metadata modification, history pruning, backdated credentials, griefing attacks |
 | **Informational** | 2 | Public data visibility (by design) |

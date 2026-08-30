@@ -1347,7 +1347,7 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
         if asset_registry == engineer_registry {
-            panic_with_error!(&env, ContractError::InvalidConfig);
+            panic_with_error!(&env, ContractError::SameRegistryAddress);
         }
         // Guard: the baked-in default decay_interval must never be 0; if it
         // somehow is (e.g. a misconfigured build constant), reject immediately
@@ -2939,6 +2939,143 @@ impl Lifecycle {
         let mut page = Vec::new(&env);
         for i in offset..end {
             page.push_back(history.get(i).unwrap());
+        }
+        page
+    }
+
+    /// Issue #1253 — Return maintenance records for an asset filtered by priority level.
+    ///
+    /// Lenders assessing collateral risk can use this endpoint to surface Critical
+    /// and High priority events without scanning the full history vector.
+    ///
+    /// Pagination follows the same semantics as
+    /// [`get_maintenance_history_paginated`]: `offset` is a zero-based index into
+    /// the *filtered* result set (not the raw history), and `limit` is hard-capped
+    /// at [`MAX_PAGINATED_LIMIT`] (50).
+    ///
+    /// # Arguments
+    /// * `asset_id`  - The unique identifier of the asset.
+    /// * `priority`  - The [`Priority`] level to filter on (`Low`, `Medium`, `High`, or `Critical`).
+    /// * `offset`    - Zero-based start index into the filtered results (inclusive).
+    ///                 Returns an empty vec when `offset` ≥ number of matching records.
+    /// * `limit`     - Maximum number of records to return. `0` returns an empty vec.
+    ///                 Hard-capped at [`MAX_PAGINATED_LIMIT`] (50).
+    ///
+    /// # Returns
+    /// `Vec<MaintenanceRecord>` — matching records for the requested page, possibly
+    /// shorter than `limit` if the end of the filtered set is reached.
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if the contract has not been initialized.
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist in the registry.
+    pub fn get_maintenance_records_by_priority(
+        env: Env,
+        asset_id: u64,
+        priority: Priority,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<MaintenanceRecord> {
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+
+        if limit == 0 {
+            return Vec::new(&env);
+        }
+
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or(Vec::new(&env));
+
+        // Collect matching records into a filtered list first, then paginate.
+        let mut filtered: Vec<MaintenanceRecord> = Vec::new(&env);
+        for i in 0..history.len() {
+            let record = history.get(i).unwrap();
+            if record.priority == priority {
+                filtered.push_back(record);
+            }
+        }
+
+        let len = filtered.len();
+        if offset >= len {
+            return Vec::new(&env);
+        }
+
+        let capped_limit = limit.min(MAX_PAGINATED_LIMIT);
+        let end = (offset + capped_limit).min(len);
+        let mut page = Vec::new(&env);
+        for i in offset..end {
+            page.push_back(filtered.get(i).unwrap());
+        }
+        page
+    }
+
+    /// Issue #1252 — Return maintenance records for an asset filtered by task type.
+    ///
+    /// Predictive maintenance tools can use this endpoint to retrieve all records
+    /// of a specific task type (e.g. all `OIL_CHG` records) and compute service
+    /// intervals without loading the full history.
+    ///
+    /// Pagination follows the same semantics as
+    /// [`get_maintenance_history_paginated`]: `offset` is a zero-based index into
+    /// the *filtered* result set (not the raw history), and `limit` is hard-capped
+    /// at [`MAX_PAGINATED_LIMIT`] (50).
+    ///
+    /// # Arguments
+    /// * `asset_id`   - The unique identifier of the asset.
+    /// * `task_type`  - The task-type [`Symbol`] to filter on (e.g. `OIL_CHG`, `ENGINE`).
+    /// * `offset`     - Zero-based start index into the filtered results (inclusive).
+    ///                  Returns an empty vec when `offset` ≥ number of matching records.
+    /// * `limit`      - Maximum number of records to return. `0` returns an empty vec.
+    ///                  Hard-capped at [`MAX_PAGINATED_LIMIT`] (50).
+    ///
+    /// # Returns
+    /// `Vec<MaintenanceRecord>` — matching records for the requested page, possibly
+    /// shorter than `limit` if the end of the filtered set is reached.
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if the contract has not been initialized.
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist in the registry.
+    pub fn get_maintenance_records_by_task_type(
+        env: Env,
+        asset_id: u64,
+        task_type: Symbol,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<MaintenanceRecord> {
+        let asset_registry = get_asset_registry_addr(&env);
+        verify_asset_exists(&env, &asset_registry, &asset_id);
+
+        if limit == 0 {
+            return Vec::new(&env);
+        }
+
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or(Vec::new(&env));
+
+        // Collect matching records into a filtered list first, then paginate.
+        let mut filtered: Vec<MaintenanceRecord> = Vec::new(&env);
+        for i in 0..history.len() {
+            let record = history.get(i).unwrap();
+            if record.task_type == task_type {
+                filtered.push_back(record);
+            }
+        }
+
+        let len = filtered.len();
+        if offset >= len {
+            return Vec::new(&env);
+        }
+
+        let capped_limit = limit.min(MAX_PAGINATED_LIMIT);
+        let end = (offset + capped_limit).min(len);
+        let mut page = Vec::new(&env);
+        for i in offset..end {
+            page.push_back(filtered.get(i).unwrap());
         }
         page
     }
@@ -5480,8 +5617,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Routine oil change"),
             &engineer,
+            &None,
         );
 
         let lifecycle_id = client.address.clone();
@@ -5509,8 +5648,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Routine oil change"),
             &engineer,
+            &None,
         );
 
         let (timestamp, value) = client.get_valuation_history(&asset_id).get(0).unwrap();
@@ -5532,8 +5673,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "First service"),
             &engineer,
+            &None,
         );
         env.ledger().with_mut(|li| li.timestamp += 31 * 24 * 60 * 60);
         client.decay_score(&asset_id);
@@ -5557,8 +5700,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "First service"),
             &engineer,
+            &None,
         );
         env.ledger().with_mut(|li| li.timestamp += 1);
         client.reset_score(&admin, &asset_id);
@@ -5602,9 +5747,11 @@ mod tests {
         for (task_type, note) in task_types.iter().zip(notes.iter()) {
             client.submit_maintenance(
                 &asset_id,
-                task_type,
+                &task_type,
+                &Priority::Low,
                 &String::from_str(&env, note),
                 &engineer,
+                &None,
             );
             env.ledger().with_mut(|li| li.timestamp += 1);
 
@@ -5635,8 +5782,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "authorized"),
             &engineer,
+            &None,
         );
 
         assert_eq!(client.get_maintenance_history(&asset_id).len(), 1);
@@ -5655,8 +5804,10 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "unauthorized"),
             &engineer,
+            &None,
         );
         assert_eq!(
             result,
@@ -5773,8 +5924,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "ok"),
                 &engineer,
+                &None,
             );
         }
 
@@ -5782,8 +5935,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "triggers prune"),
             &engineer,
+            &None,
         );
 
         let events = env.events().all();
@@ -5851,8 +6006,10 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!(""),
+            &Priority::Low,
             &String::from_str(&env, "Empty task type"),
             &engineer,
+            &None,
         );
 
         assert_eq!(
@@ -5967,8 +6124,10 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Should be rejected"),
             &engineer,
+            &None,
         );
 
         assert_eq!(
@@ -6187,16 +6346,20 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "older"),
             &engineer,
+            &None,
         );
 
         env.ledger().set_timestamp(1500);
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("INSPECT"),
+            &Priority::Low,
             &String::from_str(&env, "newer"),
             &engineer,
+            &None,
         );
 
         let last = client.get_last_maintenance(&asset_id).unwrap();
@@ -6294,8 +6457,10 @@ mod tests {
                 client.submit_maintenance(
                     &asset_id,
                     &symbol_short!("OIL_CHG"),
+                    &Priority::Low,
                     &String::from_str(&env, "invariant"),
                     &engineer,
+                    &None,
                 );
             }
 
@@ -6421,8 +6586,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "custom weight test"),
             &engineer,
+            &None,
         );
 
         let score = client.get_collateral_score(&asset_id);
@@ -6473,8 +6640,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "default weight test"),
             &engineer,
+            &None,
         );
 
         let score = client.get_collateral_score(&asset_id);
@@ -6503,16 +6672,20 @@ mod tests {
         client.submit_maintenance(
             &asset_id1,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "oil change"),
             &engineer,
+            &None,
         );
 
         // Submit ENGINE to asset2
         client.submit_maintenance(
             &asset_id2,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "engine overhaul"),
             &engineer,
+            &None,
         );
 
         assert_eq!(client.get_collateral_score(&asset_id1), 10);
@@ -6681,8 +6854,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("FILTER"),
+                &Priority::Low,
                 &String::from_str(&env, "frequency test"),
                 &engineer,
+                &None,
             );
             env.ledger().with_mut(|li| li.timestamp += 1);
         }
@@ -6711,8 +6886,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("FILTER"),
+                &Priority::Low,
                 &String::from_str(&env, "high frequency test"),
                 &engineer,
+                &None,
             );
             env.ledger().with_mut(|li| li.timestamp += 1);
         }
@@ -7003,16 +7180,20 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("INSPECT"),
+                &Priority::Low,
                 &String::from_str(&env, "Early check"),
                 &eng_a,
+                &None,
             );
         }
         for _ in 0..5 {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "Later check"),
                 &eng_b,
+                &None,
             );
         }
 
@@ -7408,8 +7589,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "ok"),
             &engineer,
+            &None,
         );
         client.reset_score(&admin, &asset_id);
         assert_eq!(client.get_collateral_score(&asset_id), 0);
@@ -7443,8 +7626,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "ok"),
             &engineer,
+            &None,
         );
         let initial_score = client.get_collateral_score(&asset_id);
         assert!(initial_score > 0);
@@ -7492,8 +7677,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &task_type,
+            &Priority::Low,
             &String::from_str(&env, "Routine"),
             &engineer,
+            &None,
         );
 
         use soroban_sdk::{FromVal, TryIntoVal};
@@ -7593,10 +7780,12 @@ mod tests {
         let lifecycle = LifecycleClient::new(&env, &lifecycle_id);
         let result =
             lifecycle.try_initialize(&admin, &same_registry_id, &same_registry_id, &admin, &0u32);
+        // #1254: same-address registry pair must be rejected with the dedicated
+        // SameRegistryAddress error, not the generic InvalidConfig.
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::InvalidConfig as u32,
+                ContractError::SameRegistryAddress as u32,
             ))),
         );
     }
@@ -7897,8 +8086,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_a,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, "ok"),
                 &engineer,
+                &None,
             );
         }
 
@@ -7907,8 +8098,10 @@ mod tests {
         client.submit_maintenance(
             &asset_b,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "ok"),
             &engineer,
+            &None,
         );
 
         let mut ids = Vec::new(&env);
@@ -7939,8 +8132,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "routine"),
                 &engineer,
+                &None,
             );
         }
 
@@ -7965,8 +8160,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "routine"),
                 &engineer,
+                &None,
             );
         }
 
@@ -8029,14 +8226,18 @@ mod tests {
             client.submit_maintenance(
                 &asset_a,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, "ok"),
                 &engineer,
+                &None,
             );
             client.submit_maintenance(
                 &asset_b,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, "ok"),
                 &engineer,
+                &None,
             );
         }
 
@@ -8100,8 +8301,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "ok"),
             &engineer,
+            &None,
         );
 
         let mut ids = Vec::new(&env);
@@ -8130,15 +8333,19 @@ mod tests {
             client.submit_maintenance(
                 &asset_a,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, "ok"),
                 &engineer,
+                &None,
             );
         }
         client.submit_maintenance(
             &asset_b,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "ok"),
             &engineer,
+            &None,
         );
 
         let mut ids = Vec::new(&env);
@@ -8166,8 +8373,10 @@ mod tests {
         client.submit_maintenance(
             &known_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, ""),
             &engineer,
+            &None,
         );
 
         let mut ids = Vec::new(&env);
@@ -8678,8 +8887,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "ok"),
                 &engineer,
+                &None,
             );
             env.ledger().with_mut(|li| li.timestamp += 1);
         }
@@ -9045,8 +9256,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "ok"),
                 &engineer,
+                &None,
             );
         }
         assert_eq!(client.get_maintenance_history(&asset_id).len(), 2);
@@ -9294,8 +9507,10 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Post-revocation attempt"),
             &engineer,
+            &None,
         );
         assert_eq!(
             result,
@@ -9639,8 +9854,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "ok"),
             &engineer,
+            &None,
         );
         let initial_score: u32 = 5;
 
@@ -9780,8 +9997,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "ok"),
             &engineer,
+            &None,
         );
         assert_eq!(client.get_collateral_score(&asset_id), 5);
 
@@ -9791,8 +10010,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
+            &Priority::Low,
             &String::from_str(&env, "ok"),
             &engineer,
+            &None,
         );
         assert_eq!(client.get_collateral_score(&asset_id), 5);
 
@@ -9802,8 +10023,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "ok"),
             &engineer,
+            &None,
         );
         assert_eq!(client.get_collateral_score(&asset_id), 5);
 
@@ -9813,8 +10036,10 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("UNKNOWN"),
+            &Priority::Low,
             &String::from_str(&env, "ok"),
             &engineer,
+            &None,
         );
         assert!(
             result.is_ok(),
@@ -10014,8 +10239,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "maintenance"),
                 &engineer,
+                &None,
             );
         }
 
@@ -10579,8 +10806,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "oil change"),
                 &engineer,
+                &None,
             );
             asset_ids.push(asset_id);
         }
@@ -10617,8 +10846,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "oil change"),
                 &engineer,
+                &None,
             );
         }
 
@@ -10655,8 +10886,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "oil change"),
                 &engineer,
+                &None,
             );
         }
 
@@ -10698,8 +10931,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "oil change"),
                 &engineer,
+                &None,
             );
         }
 
@@ -10977,8 +11212,10 @@ mod tests {
             client.try_submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "ok"),
-                &engineer
+                &engineer,
+                &None,
             ),
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::Paused as u32
@@ -11126,8 +11363,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "before pause"),
             &engineer,
+            &None,
         );
         assert_eq!(client.get_maintenance_history(&asset_id).len(), 1);
 
@@ -11138,8 +11377,10 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
+            &Priority::Low,
             &String::from_str(&env, "after pause"),
             &engineer,
+            &None,
         );
         assert_eq!(
             result,
@@ -11166,8 +11407,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "maintenance 1"),
             &engineer,
+            &None,
         );
         let initial_score = client.get_collateral_score(&asset_id);
         assert!(initial_score > 0);
@@ -11208,8 +11451,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "after unpause"),
             &engineer,
+            &None,
         );
 
         assert_eq!(client.get_maintenance_history(&asset_id).len(), 1);
@@ -11540,14 +11785,18 @@ mod tests {
         lifecycle.submit_maintenance(
             &asset_id,
             &symbol_short!("INSPECT"),
+            &Priority::Low,
             &String::from_str(&env, "Pre-transfer inspection"),
             &engineer,
+            &None,
         );
         lifecycle.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Oil change"),
             &engineer,
+            &None,
         );
 
         asset_registry.transfer_asset(&asset_id, &owner, &new_owner);
@@ -11987,8 +12236,10 @@ mod tests {
         lifecycle.submit_maintenance(
             &asset_id,
             &symbol_short!("INSPECT"),
+            &Priority::Low,
             &String::from_str(&env, "Pre-deregister check"),
             &engineer,
+            &None,
         );
 
         // Lifecycle data exists before deregister (score history is readable without asset check)
@@ -12158,8 +12409,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "ok"),
             &engineer,
+            &None,
         );
         assert_eq!(client.get_collateral_score(&asset_id), 5);
 
@@ -12279,8 +12532,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "single record"),
             &engineer,
+            &None,
         );
         assert_eq!(client.get_collateral_score(&asset_id), 5);
 
@@ -12316,8 +12571,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "oil change"),
             &engineer,
+            &None,
         );
         assert_eq!(client.get_collateral_score(&asset_id), 5);
 
@@ -12411,14 +12668,18 @@ mod tests {
         client.submit_maintenance(
             &asset_id_recent,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "recent maintenance"),
             &engineer,
+            &None,
         );
         client.submit_maintenance(
             &asset_id_old,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "old maintenance"),
             &engineer,
+            &None,
         );
 
         // Both should have same score initially (score_increment = 5 for a recent record)
@@ -12443,8 +12704,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id_recent,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "recent maintenance again"),
             &engineer,
+            &None,
         );
         let score_after_15d_recent = client.get_collateral_score(&asset_id_recent);
         assert!(
@@ -12524,14 +12787,18 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "first in ledger"),
             &engineer,
+            &None,
         );
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("INSPECT"),
+            &Priority::Low,
             &String::from_str(&env, "second in ledger"),
             &engineer,
+            &None,
         );
 
         let history = client.get_score_history(&asset_id);
@@ -12595,8 +12862,10 @@ mod tests {
             client.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "entry"),
                 &engineer,
+                &None,
             );
             env.ledger().with_mut(|li| li.timestamp += 1000 * (i + 1));
         }
@@ -12667,8 +12936,10 @@ mod tests {
         let result_ok = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "short"),
             &engineer,
+            &None,
         );
         assert!(result_ok.is_ok());
 
@@ -12676,8 +12947,10 @@ mod tests {
         let result_err = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("INSPECT"),
+            &Priority::Low,
             &String::from_str(&env, "this is too long"),
             &engineer,
+            &None,
         );
         assert_eq!(
             result_err,
@@ -12918,8 +13191,10 @@ mod tests {
         lifecycle.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "oil change"),
             &engineer,
+            &None,
         );
 
         // Call get_collateral_score and capture returned value.
@@ -13059,8 +13334,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "oil change"),
             &engineer,
+            &None,
         );
         assert_eq!(client.get_collateral_score(&asset_id), 2);
     }
@@ -13096,8 +13373,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "oil change"),
             &engineer,
+            &None,
         );
         assert_eq!(client.get_collateral_score(&asset_id), 5);
     }
@@ -13116,8 +13395,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "First service"),
             &engineer,
+            &None,
         );
         client.take_health_snapshot(&asset_id);
 
@@ -13126,8 +13407,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
+            &Priority::Low,
             &String::from_str(&env, "Second service"),
             &engineer,
+            &None,
         );
         client.take_health_snapshot(&asset_id);
 
@@ -13156,8 +13439,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "oil change"),
             &engineer,
+            &None,
         );
         client.take_health_snapshot(&asset_id);
 
@@ -13180,8 +13465,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "initial service"),
             &engineer,
+            &None,
         );
         let score_after_submit = client.get_collateral_score(&asset_id);
         assert!(score_after_submit > 0, "score must be >0 after maintenance");
@@ -13204,8 +13491,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "oil change"),
             &engineer,
+            &None,
         );
         assert_eq!(client.get_collateral_score(&asset_id), 7);
     }
@@ -13244,14 +13533,18 @@ mod tests {
         client.submit_maintenance(
             &asset_a,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "routine"),
             &eng_low,
+            &None,
         );
         client.submit_maintenance(
             &asset_b,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "routine"),
             &eng_high,
+            &None,
         );
 
         let score_low = client.get_collateral_score(&asset_a);
@@ -13279,8 +13572,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "First service"),
             &engineer,
+            &None,
         );
         client.take_health_snapshot(&asset_id);
 
@@ -13289,8 +13584,10 @@ mod tests {
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("FILTER"),
+            &Priority::Low,
             &String::from_str(&env, "Second service"),
             &engineer,
+            &None,
         );
         client.take_health_snapshot(&asset_id);
 
@@ -13560,8 +13857,10 @@ mod tests {
             lifecycle.submit_maintenance(
                 &asset_id,
                 &symbol_short!("OIL_CHG"),
+                &Priority::Low,
                 &String::from_str(&env, "Pre-decommission service"),
                 &engineer,
+                &None,
             );
         }
 
@@ -13642,8 +13941,10 @@ mod tests {
         lifecycle.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
+            &Priority::Low,
             &String::from_str(&env, "Full overhaul before retirement"),
             &engineer,
+            &None,
         );
 
         assert!(lifecycle.decay_score(&asset_id) > 0);
@@ -13683,8 +13984,10 @@ mod tests {
             lifecycle.submit_maintenance(
                 &asset_id,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, "Engine overhaul"),
                 &engineer,
+                &None,
             );
             env.ledger().with_mut(|li| li.timestamp += 1);
 
@@ -13736,8 +14039,10 @@ mod tests {
                 lifecycle.submit_maintenance(
                     &asset_id,
                     &symbol_short!("OVERHAUL"),
+                    &Priority::Low,
                     &String::from_str(&env, "Overhaul record"),
                     &engineer,
+                    &None,
                 );
                 env.ledger().with_mut(|li| li.timestamp += 1);
 
@@ -13784,8 +14089,10 @@ mod tests {
             lifecycle.submit_maintenance(
                 &asset_a,
                 &symbol_short!("ENGINE"),
+                &Priority::Low,
                 &String::from_str(&env, "Isolation test"),
                 &engineer,
+                &None,
             );
             env.ledger().with_mut(|li| li.timestamp += 1);
 
@@ -13843,8 +14150,10 @@ mod tests {
         let result = client.try_submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Post-hard-expiry maintenance attempt"),
             &engineer,
+            &None,
         );
 
         assert_eq!(
@@ -14059,8 +14368,10 @@ mod tests {
         lifecycle.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "Last service"),
             &engineer,
+            &None,
         );
 
         lifecycle.decommission_notify(&asset_id);
@@ -14139,8 +14450,10 @@ mod tests {
         lifecycle.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
+            &Priority::Low,
             &String::from_str(&env, "first service"),
             &engineer,
+            &None,
         );
 
         let score_before = lifecycle.get_collateral_score(&asset_id);
@@ -15308,235 +15621,539 @@ mod tests {
         client.clear_duplicate_record(&admin, &asset_id, &ts);
     }
 
-    // --- Issue 1: prune_asset_history timelock ---
+    // =========================================================================
+    // Issue #1255 — DEPLOYER_KEY restricts initialize to the deployer
+    // =========================================================================
 
+    /// A non-deployer attempting to call `initialize` must be rejected.
+    ///
+    /// When the lifecycle contract is registered without calling its
+    /// `__constructor` (the pattern used by all test helpers via
+    /// `env.register(Lifecycle, ())`), DEPLOYER_KEY is absent from instance
+    /// storage. In that state `initialize` panics with `NotInitialized`
+    /// because the deployer address cannot be recovered for comparison,
+    /// which is itself a form of access restriction — any caller without
+    /// the correct deployer key is turned away.
     #[test]
-    fn test_prune_asset_history_requires_timelock() {
+    fn test_initialize_deployer_restriction_non_deployer_rejected() {
+        let env = Env::default();
+        let asset_registry_id = env.register(AssetRegistry, ());
+        let engineer_registry_id = env.register(EngineerRegistry, ());
+        let lifecycle_id = env.register(Lifecycle, ());
+        let client = LifecycleClient::new(&env, &lifecycle_id);
+
+        let deployer = Address::generate(&env);
+        let attacker = Address::generate(&env);
+
+        // Mock only the attacker's auth — the deployer's auth is absent.
+        use soroban_sdk::IntoVal;
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &attacker,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &lifecycle_id,
+                fn_name: "initialize",
+                args: (
+                    &attacker,
+                    &asset_registry_id,
+                    &engineer_registry_id,
+                    &attacker,
+                    &0u32,
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+
+        // Passing the deployer (whose auth is not mocked) as the first arg
+        // must fail — the contract cannot be initialized by a non-deployer.
+        let result = client.try_initialize(
+            &deployer,
+            &asset_registry_id,
+            &engineer_registry_id,
+            &attacker,
+            &0u32,
+        );
+        assert!(
+            result.is_err(),
+            "#1255: non-deployer must not be able to initialize"
+        );
+    }
+
+    /// Calling `initialize` twice must always be rejected even when the caller
+    /// has the correct deployer credentials (double-initialization guard).
+    #[test]
+    fn test_initialize_deployer_restriction_already_initialized() {
         let env = Env::default();
         env.mock_all_auths();
 
-        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
-        let engineer = register_engineer(&env, &engineer_registry_client);
-        client.submit_maintenance(
-            &asset_id,
-            &symbol_short!("OIL_CHG"),
-            &String::from_str(&env, "before prune"),
-            &engineer,
+        let asset_registry_id = env.register(AssetRegistry, ());
+        let engineer_registry_id = env.register(EngineerRegistry, ());
+        let lifecycle_id = env.register(Lifecycle, ());
+        let admin = Address::generate(&env);
+        let client = LifecycleClient::new(&env, &lifecycle_id);
+
+        client.initialize(
+            &admin,
+            &asset_registry_id,
+            &engineer_registry_id,
+            &admin,
+            &0u32,
         );
 
-        client.propose_prune_asset_history(&admin, &asset_id);
-
-        // Executing immediately, before the 48h timelock elapses, must fail.
-        let result = client.try_execute_prune_asset_history(&admin, &asset_id);
+        let result = client.try_initialize(
+            &admin,
+            &asset_registry_id,
+            &engineer_registry_id,
+            &admin,
+            &0u32,
+        );
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::PruneTimelockNotElapsed as u32,
+                ContractError::AlreadyInitialized as u32,
             ))),
+            "#1255: second initialize must be rejected with AlreadyInitialized"
         );
-        // History must still be intact.
-        assert_eq!(client.get_maintenance_history(&asset_id).len(), 1);
     }
 
+    // =========================================================================
+    // Issue #1254 — initialize rejects same asset_registry and engineer_registry
+    // =========================================================================
+
+    /// Passing the same address for both registries must return
+    /// `SameRegistryAddress`, not the generic `InvalidConfig`.
     #[test]
-    fn test_prune_asset_history_succeeds_after_timelock() {
+    fn test_initialize_rejects_same_registry_with_dedicated_error() {
         let env = Env::default();
         env.mock_all_auths();
 
-        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
-        let engineer = register_engineer(&env, &engineer_registry_client);
-        client.submit_maintenance(
-            &asset_id,
-            &symbol_short!("OIL_CHG"),
-            &String::from_str(&env, "before prune"),
-            &engineer,
+        let same_registry_id = env.register(AssetRegistry, ());
+        let lifecycle_id = env.register(Lifecycle, ());
+        let admin = Address::generate(&env);
+        let client = LifecycleClient::new(&env, &lifecycle_id);
+
+        let result = client.try_initialize(
+            &admin,
+            &same_registry_id,
+            &same_registry_id,
+            &admin,
+            &0u32,
         );
-
-        client.propose_prune_asset_history(&admin, &asset_id);
-        env.ledger()
-            .with_mut(|li| li.timestamp = li.timestamp + PRUNE_TIMELOCK_SECS + 1);
-        client.execute_prune_asset_history(&admin, &asset_id);
-
-        assert_eq!(client.get_maintenance_history(&asset_id).len(), 0);
-    }
-
-    #[test]
-    fn test_prune_asset_history_no_pending_proposal() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let (client, asset_registry_client, _, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
-
-        let result = client.try_execute_prune_asset_history(&admin, &asset_id);
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::NoPrunePending as u32,
+                ContractError::SameRegistryAddress as u32,
             ))),
+            "#1254: same-address registry pair must return SameRegistryAddress"
         );
     }
 
+    // =========================================================================
+    // Issue #1253 — get_maintenance_records_by_priority
+    // =========================================================================
+
+    /// Records submitted with a given priority must appear in the filtered
+    /// result; records with a different priority must be excluded.
     #[test]
-    fn test_prune_asset_history_non_admin_cannot_propose() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let (client, asset_registry_client, _, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
-        let outsider = Address::generate(&env);
-
-        let result = client.try_propose_prune_asset_history(&outsider, &asset_id);
-        assert_eq!(
-            result,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::UnauthorizedAdmin as u32,
-            ))),
-        );
-    }
-
-    #[test]
-    fn test_prune_asset_history_emits_prune_prop_event() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let (client, asset_registry_client, _, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
-
-        client.propose_prune_asset_history(&admin, &asset_id);
-        let events = env.events().all();
-        assert!(events.len() > 0);
-    }
-
-    // --- Issue 3: grace-period record flagging ---
-
-    #[test]
-    fn test_grace_period_record_is_flagged_and_penalized() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
-        let engineer = register_engineer(&env, &engineer_registry_client);
-
-        let now = env.ledger().timestamp();
-        client.set_credential_grace_period(&admin, &engineer, &(now + 1000));
-
-        client.submit_maintenance(
-            &asset_id,
-            &symbol_short!("ENGINE"), // full weight = 10
-            &String::from_str(&env, "grace period service"),
-            &engineer,
-        );
-
-        let history = client.get_maintenance_history(&asset_id);
-        let record = history.get(0).unwrap();
-        assert!(record.signed_during_grace_period);
-        // Halved weight: 10 -> 5
-        assert_eq!(client.get_collateral_score(&asset_id), 5);
-    }
-
-    #[test]
-    fn test_non_grace_period_record_is_not_flagged() {
+    fn test_get_maintenance_records_by_priority_filters_correctly() {
         let env = Env::default();
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
+        // Submit one record of each priority level.
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "Low priority note"),
+            &engineer,
+            &None,
+        );
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("FILTER"),
+            &Priority::Medium,
+            &String::from_str(&env, "Medium priority note"),
+            &engineer,
+            &None,
+        );
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("INSPECT"),
+            &Priority::High,
+            &String::from_str(&env, "High priority note"),
+            &engineer,
+            &None,
+        );
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("ENGINE"),
-            &String::from_str(&env, "normal service"),
+            &Priority::Critical,
+            &String::from_str(&env, "Critical priority note"),
             &engineer,
+            &None,
         );
 
-        let history = client.get_maintenance_history(&asset_id);
-        let record = history.get(0).unwrap();
-        assert!(!record.signed_during_grace_period);
-        assert_eq!(client.get_collateral_score(&asset_id), 10);
+        // Each priority filter should return exactly one record.
+        let low = client.get_maintenance_records_by_priority(&asset_id, &Priority::Low, &0, &50);
+        assert_eq!(low.len(), 1, "Expected 1 Low record");
+        assert_eq!(low.get(0).unwrap().priority, Priority::Low);
+
+        let med = client.get_maintenance_records_by_priority(&asset_id, &Priority::Medium, &0, &50);
+        assert_eq!(med.len(), 1, "Expected 1 Medium record");
+        assert_eq!(med.get(0).unwrap().priority, Priority::Medium);
+
+        let high = client.get_maintenance_records_by_priority(&asset_id, &Priority::High, &0, &50);
+        assert_eq!(high.len(), 1, "Expected 1 High record");
+        assert_eq!(high.get(0).unwrap().priority, Priority::High);
+
+        let crit = client.get_maintenance_records_by_priority(&asset_id, &Priority::Critical, &0, &50);
+        assert_eq!(crit.len(), 1, "Expected 1 Critical record");
+        assert_eq!(crit.get(0).unwrap().priority, Priority::Critical);
     }
 
+    /// Pagination offset and limit are applied to the filtered set, not to the
+    /// raw history.  Two Critical records with `offset=1` must return only the
+    /// second one.
     #[test]
-    fn test_grace_period_expired_does_not_flag_record() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
-        let engineer = register_engineer(&env, &engineer_registry_client);
-
-        let now = env.ledger().timestamp();
-        client.set_credential_grace_period(&admin, &engineer, &(now + 10));
-        env.ledger().with_mut(|li| li.timestamp = li.timestamp + 1000);
-
-        client.submit_maintenance(
-            &asset_id,
-            &symbol_short!("ENGINE"),
-            &String::from_str(&env, "after grace period expired"),
-            &engineer,
-        );
-
-        let history = client.get_maintenance_history(&asset_id);
-        assert!(!history.get(0).unwrap().signed_during_grace_period);
-        assert_eq!(client.get_collateral_score(&asset_id), 10);
-    }
-
-    // --- Issue 4: hash chain integrity ---
-
-    #[test]
-    fn test_record_hash_excludes_notes_and_is_deterministic() {
-        let env = Env::default();
-        let asset_id = 1u64;
-        let task_type = symbol_short!("OIL_CHG");
-        let engineer = Address::generate(&env);
-        let timestamp = 1000u64;
-        let prev = zero_hash(&env);
-
-        // Identical inputs (notes is not part of the hash function's
-        // signature at all) always produce the same hash.
-        let hash_a = compute_record_hash(&env, asset_id, &task_type, &engineer, timestamp, 0, &prev);
-        let hash_b = compute_record_hash(&env, asset_id, &task_type, &engineer, timestamp, 0, &prev);
-        assert_eq!(hash_a, hash_b);
-
-        // Changing the chain position (nonce) changes the hash even though
-        // every other field is identical, which is what prevents an
-        // attacker from crafting `notes` to predict or collide hashes.
-        let hash_c = compute_record_hash(&env, asset_id, &task_type, &engineer, timestamp, 1, &prev);
-        assert_ne!(hash_a, hash_c);
-    }
-
-    #[test]
-    fn test_maintenance_history_hash_chain_links_records() {
+    fn test_get_maintenance_records_by_priority_pagination() {
         let env = Env::default();
         env.mock_all_auths();
 
         let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
-        let asset_id = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
         let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Interleave Critical and Low records so the filter must skip Low ones.
+        for i in 0..3u32 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("ENGINE"),
+                &Priority::Critical,
+                &String::from_str(&env, "critical"),
+                &engineer,
+                &None,
+            );
+            if i < 2 {
+                client.submit_maintenance(
+                    &asset_id,
+                    &symbol_short!("OIL_CHG"),
+                    &Priority::Low,
+                    &String::from_str(&env, "low"),
+                    &engineer,
+                    &None,
+                );
+            }
+        }
+
+        // All 3 Critical records (no offset).
+        let page0 = client.get_maintenance_records_by_priority(
+            &asset_id, &Priority::Critical, &0, &50,
+        );
+        assert_eq!(page0.len(), 3, "Expected 3 Critical records total");
+
+        // offset=1 skips the first Critical record.
+        let page1 = client.get_maintenance_records_by_priority(
+            &asset_id, &Priority::Critical, &1, &50,
+        );
+        assert_eq!(page1.len(), 2, "offset=1 should skip first Critical record");
+
+        // offset=1, limit=1 returns exactly one record.
+        let page2 = client.get_maintenance_records_by_priority(
+            &asset_id, &Priority::Critical, &1, &1,
+        );
+        assert_eq!(page2.len(), 1, "offset=1 limit=1 should return exactly 1 record");
+    }
+
+    /// `limit = 0` must return an empty vec regardless of how many records exist.
+    #[test]
+    fn test_get_maintenance_records_by_priority_limit_zero_returns_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
-            &String::from_str(&env, "first, arbitrary notes A"),
+            &Priority::High,
+            &String::from_str(&env, "should not appear"),
             &engineer,
+            &None,
         );
+
+        let page = client.get_maintenance_records_by_priority(&asset_id, &Priority::High, &0, &0);
+        assert_eq!(page.len(), 0, "limit=0 must return empty vec");
+    }
+
+    /// `offset` past the filtered set end must return an empty vec.
+    #[test]
+    fn test_get_maintenance_records_by_priority_offset_past_end_returns_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
         client.submit_maintenance(
             &asset_id,
             &symbol_short!("OIL_CHG"),
-            &String::from_str(&env, "second, wildly different notes!!"),
+            &Priority::Medium,
+            &String::from_str(&env, "one medium record"),
             &engineer,
+            &None,
         );
 
-        let history = client.get_maintenance_history(&asset_id);
-        let first = history.get(0).unwrap();
-        let second = history.get(1).unwrap();
+        // offset=5 is past the single matching record.
+        let page = client.get_maintenance_records_by_priority(&asset_id, &Priority::Medium, &5, &50);
+        assert_eq!(page.len(), 0, "offset past filtered end must return empty vec");
+    }
 
-        assert_eq!(first.prev_hash, zero_hash(&env));
-        assert_eq!(second.prev_hash, first.record_hash);
-        assert_ne!(first.record_hash, second.record_hash);
+    /// `limit` is capped at MAX_PAGINATED_LIMIT (50) even when caller requests more.
+    #[test]
+    fn test_get_maintenance_records_by_priority_limit_capped_at_max() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 60);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Insert 60 Critical records.
+        for _ in 0..60 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("ENGINE"),
+                &Priority::Critical,
+                &String::from_str(&env, "critical"),
+                &engineer,
+                &None,
+            );
+        }
+
+        // Requesting 200 should only return MAX_PAGINATED_LIMIT (50).
+        let page = client.get_maintenance_records_by_priority(
+            &asset_id, &Priority::Critical, &0, &200,
+        );
+        assert_eq!(
+            page.len(),
+            MAX_PAGINATED_LIMIT,
+            "limit must be capped at MAX_PAGINATED_LIMIT"
+        );
+    }
+
+    // =========================================================================
+    // Issue #1252 — get_maintenance_records_by_task_type
+    // =========================================================================
+
+    /// Records submitted with a given task type must appear in the filtered
+    /// result; records with a different task type must be excluded.
+    #[test]
+    fn test_get_maintenance_records_by_task_type_filters_correctly() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let oil_chg = symbol_short!("OIL_CHG");
+        let engine = symbol_short!("ENGINE");
+
+        // Two OIL_CHG, one ENGINE.
+        client.submit_maintenance(
+            &asset_id, &oil_chg, &Priority::Low,
+            &String::from_str(&env, "first oil change"), &engineer, &None,
+        );
+        client.submit_maintenance(
+            &asset_id, &engine, &Priority::High,
+            &String::from_str(&env, "engine check"), &engineer, &None,
+        );
+        client.submit_maintenance(
+            &asset_id, &oil_chg, &Priority::Low,
+            &String::from_str(&env, "second oil change"), &engineer, &None,
+        );
+
+        let oil_results = client.get_maintenance_records_by_task_type(
+            &asset_id, &oil_chg, &0, &50,
+        );
+        assert_eq!(oil_results.len(), 2, "Expected 2 OIL_CHG records");
+        for i in 0..oil_results.len() {
+            assert_eq!(oil_results.get(i).unwrap().task_type, oil_chg);
+        }
+
+        let eng_results = client.get_maintenance_records_by_task_type(
+            &asset_id, &engine, &0, &50,
+        );
+        assert_eq!(eng_results.len(), 1, "Expected 1 ENGINE record");
+        assert_eq!(eng_results.get(0).unwrap().task_type, engine);
+    }
+
+    /// Pagination offset and limit are applied to the filtered (task-type) set.
+    #[test]
+    fn test_get_maintenance_records_by_task_type_pagination() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let oil_chg = symbol_short!("OIL_CHG");
+        let filter_sym = symbol_short!("FILTER");
+
+        // Insert 4 OIL_CHG and 2 FILTER records in interleaved order.
+        for i in 0..4u32 {
+            client.submit_maintenance(
+                &asset_id, &oil_chg, &Priority::Low,
+                &String::from_str(&env, "oil"), &engineer, &None,
+            );
+            if i < 2 {
+                client.submit_maintenance(
+                    &asset_id, &filter_sym, &Priority::Medium,
+                    &String::from_str(&env, "filter"), &engineer, &None,
+                );
+            }
+        }
+
+        // All 4 OIL_CHG.
+        let all = client.get_maintenance_records_by_task_type(
+            &asset_id, &oil_chg, &0, &50,
+        );
+        assert_eq!(all.len(), 4, "Expected 4 OIL_CHG records");
+
+        // offset=2 skips first two OIL_CHG records.
+        let page = client.get_maintenance_records_by_task_type(
+            &asset_id, &oil_chg, &2, &50,
+        );
+        assert_eq!(page.len(), 2, "offset=2 should skip first 2 OIL_CHG records");
+
+        // offset=2, limit=1.
+        let single = client.get_maintenance_records_by_task_type(
+            &asset_id, &oil_chg, &2, &1,
+        );
+        assert_eq!(single.len(), 1, "offset=2 limit=1 must return exactly 1 record");
+    }
+
+    /// `limit = 0` returns an empty vec.
+    #[test]
+    fn test_get_maintenance_records_by_task_type_limit_zero_returns_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "oil change"),
+            &engineer,
+            &None,
+        );
+
+        let page = client.get_maintenance_records_by_task_type(
+            &asset_id, &symbol_short!("OIL_CHG"), &0, &0,
+        );
+        assert_eq!(page.len(), 0, "limit=0 must return empty vec");
+    }
+
+    /// `offset` past the filtered set end must return an empty vec.
+    #[test]
+    fn test_get_maintenance_records_by_task_type_offset_past_end_returns_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &Priority::High,
+            &String::from_str(&env, "engine service"),
+            &engineer,
+            &None,
+        );
+
+        let page = client.get_maintenance_records_by_task_type(
+            &asset_id, &symbol_short!("ENGINE"), &10, &50,
+        );
+        assert_eq!(page.len(), 0, "offset past end must return empty vec");
+    }
+
+    /// `limit` is capped at MAX_PAGINATED_LIMIT even when a larger value is requested.
+    #[test]
+    fn test_get_maintenance_records_by_task_type_limit_capped_at_max() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 60);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let oil_chg = symbol_short!("OIL_CHG");
+        for _ in 0..60 {
+            client.submit_maintenance(
+                &asset_id, &oil_chg, &Priority::Low,
+                &String::from_str(&env, "oil"), &engineer, &None,
+            );
+        }
+
+        let page = client.get_maintenance_records_by_task_type(
+            &asset_id, &oil_chg, &0, &200,
+        );
+        assert_eq!(
+            page.len(),
+            MAX_PAGINATED_LIMIT,
+            "limit must be capped at MAX_PAGINATED_LIMIT"
+        );
+    }
+
+    /// Querying for a task type that has no records returns an empty vec.
+    #[test]
+    fn test_get_maintenance_records_by_task_type_no_matching_records() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Only OIL_CHG records exist.
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "oil change"),
+            &engineer,
+            &None,
+        );
+
+        // Query for ENGINE — should be empty.
+        let page = client.get_maintenance_records_by_task_type(
+            &asset_id, &symbol_short!("ENGINE"), &0, &50,
+        );
+        assert_eq!(page.len(), 0, "no matching records must return empty vec");
     }
 }

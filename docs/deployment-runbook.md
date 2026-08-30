@@ -153,6 +153,17 @@ stellar contract invoke --id LC_ID --network testnet --source deployer -- initia
   --max_history 200
 ```
 
+> **Security (#1254): `asset_registry` and `engineer_registry` must be distinct addresses.**
+> The lifecycle `initialize` function validates that `AR_ID` ≠ `ER_ID`. Passing the same
+> contract address for both registries is rejected with `ContractError::SameRegistryAddress`
+> (error code 13). This prevents a class of misconfiguration where cross-contract calls to
+> asset and engineer registries would silently resolve to the same contract, returning
+> semantically incorrect data.
+>
+> If this error is returned during initialization, verify that you are passing the correct
+> Asset Registry ID and Engineer Registry ID — they must be the IDs of two different deployed
+> contracts.
+
 ### 3.4 Initialize Lending Contract
 ```bash
 stellar contract invoke --id LN_ID --network testnet --source deployer -- initialize \
@@ -320,6 +331,8 @@ stellar contract invoke --id LC_ID --network mainnet --source deployer -- initia
   --engineer_registry ER_ID \
   --admin <MULTISIG_ADMIN_ADDRESS> \
   --max_history 200
+# Note: AR_ID and ER_ID must be different addresses.
+# Passing the same address for both will return SameRegistryAddress (error 13).
 
 # Initialize Lending
 stellar contract invoke --id LN_ID --network mainnet --source deployer -- initialize \
