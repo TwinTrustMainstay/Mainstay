@@ -15308,6 +15308,123 @@ mod tests {
         client.clear_duplicate_record(&admin, &asset_id, &ts);
     }
 
+    // ---------------------------------------------------------------------------
+    //  #1292: RecurringTaskNotFound for a valid asset with no recurring tasks
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "RecurringTaskNotFound")]
+    fn test_auto_create_recurring_task_valid_asset_no_tasks_returns_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry, engineer_registry, _admin) = setup(&env, 0);
+        // The asset _exists_ (valid) but has never had recurring tasks configured.
+        let (asset_id, _owner) = register_asset(&env, &asset_registry);
+        let engineer = register_engineer(&env, &engineer_registry);
+
+        // Executing a recurring task must fail with RecurringTaskNotFound,
+        // not AssetNotFound or an empty-tasks misread.
+        client.auto_create_recurring_task(&asset_id, &1u64, &engineer);
+    }
+
+    #[test]
+    #[should_panic(expected = "RecurringTaskInactive")]
+    fn test_auto_create_recurring_task_inactive_task_returns_inactive() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry, engineer_registry, _admin) = setup(&env, 0);
+        let (asset_id, _owner) = register_asset(&env, &asset_registry);
+        let engineer = register_engineer(&env, &engineer_registry);
+
+        // Seed a recurring task that has been deactivated (is_active = false).
+        let contract_id = client.address.clone();
+        env.as_contract(&contract_id, || {
+            let mut tasks = Vec::new(&env);
+            tasks.push_back(RecurringTask {
+                task_id: 1,
+                task_type: symbol_short!("OIL_CHG"),
+                interval_type: symbol_short!("HOURS"),
+                interval_value: 3600,
+                next_due: env.ledger().timestamp().saturating_add(3600),
+                is_active: false,
+            });
+            env.storage()
+                .persistent()
+                .set(&DataKey::RecurringTasks(asset_id), &tasks);
+        });
+
+        // A deactivated task must not be executable.
+        client.auto_create_recurring_task(&asset_id, &1u64, &engineer);
+    }
+
+    // ---------------------------------------------------------------------------
+    //  #1293: collateral score read path under maximum history size + duplicates
+    // ---------------------------------------------------------------------------
+
+    /// Measure the modelled CPU instructions of a single `get_collateral_score`
+    /// call for an asset whose maintenance history is at `max_history` (200
+    /// records), optionally with a populated `DuplicateRecords` list.
+    ///
+    /// Records are aged beyond `MAX_AGE_LEDGERS` so every recency-weight
+    /// contribution is zero and `compute_decay` cannot short-circuit at the
+    /// score cap — forcing the full O(n*m) scan this regression guard targets.
+    fn collateral_score_worst_case_insns(env: &Env, mark_duplicates: bool) -> u64 {
+        let (client, asset_registry, engineer_registry, admin) = setup(env, 200);
+        let (asset_id, _owner) = register_asset(env, &asset_registry);
+        let engineer = register_engineer(env, &engineer_registry);
+
+        for _ in 0..200u32 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &String::from_str(env, "regression record"),
+                &engineer,
+            );
+            env.ledger().set_timestamp(env.ledger().timestamp() + 1);
+        }
+
+        if mark_duplicates {
+            let history = client.get_maintenance_history(&asset_id);
+            for (idx, record) in history.iter().enumerate() {
+                if idx % 4 != 0 {
+                    client.mark_maintenance_as_duplicate(&admin, &asset_id, &0u64, &record.timestamp);
+                }
+            }
+        }
+
+        // Age everything out so the scan runs over every record.
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + MAX_AGE_LEDGERS * 5 + 1);
+
+        let before = env.cost_estimate().budget().cpu_instruction_cost();
+        client.get_collateral_score(&asset_id);
+        let after = env.cost_estimate().budget().cpu_instruction_cost();
+        after.saturating_sub(before)
+    }
+
+    #[test]
+    fn test_collateral_score_worst_case_instructions_bounded() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        // Worst case: 200 records plus a large populated DuplicateRecords list,
+        // exercising the full O(n*m) scan in compute_decay.
+        let dup_insns = collateral_score_worst_case_insns(&env, true);
+
+        // The defined CI threshold. The worst case must stay well within a
+        // single transaction's CPU budget; a value at or above this limit fails
+        // the build, catching a pathological blow-up of the O(n*m) scan (for
+        // example an unboundedly growing DuplicateRecords list).
+        const WORST_CASE_INSTRUCTION_LIMIT: u64 = 100_000_000;
+        assert!(
+            dup_insns < WORST_CASE_INSTRUCTION_LIMIT,
+            "collateral score under max_history + duplicates exceeded the \
+             instruction limit ({dup_insns} >= {WORST_CASE_INSTRUCTION_LIMIT})"
+        );
+    }
+
     // --- Issue 1: prune_asset_history timelock ---
 
     #[test]
