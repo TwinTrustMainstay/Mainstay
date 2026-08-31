@@ -45,9 +45,7 @@ pub fn valuation_history_push(env: &Env, asset_id: u64, timestamp: u64, value: u
         if last.0 == timestamp {
             history.set(last_idx, (timestamp, value));
             env.storage().persistent().set(&key, &history);
-            env.storage()
-                .persistent()
-                .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
+            shared::extend_persistent_ttl(&env, &key);
             return;
         }
     }
@@ -65,9 +63,7 @@ pub fn valuation_history_push(env: &Env, asset_id: u64, timestamp: u64, value: u
     }
     history.push_back((timestamp, value));
     env.storage().persistent().set(&key, &history);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
+    shared::extend_persistent_ttl(&env, &key);
 }
 
 pub fn get_task_weight(_env: &Env, task_type: &Symbol, config: &Config) -> u32 {

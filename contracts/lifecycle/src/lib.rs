@@ -78,13 +78,6 @@ const SUBMISSION_RATE_WINDOW_SECS: u64 = 3600;
 /// read costs and persistent-TTL-extension costs on every call.
 const DEFAULT_MAX_SNAPSHOTS: u32 = 500;
 
-fn effective_min_collateral_score(config: &Config) -> u32 {
-    if config.min_collateral_score > 0 {
-        config.min_collateral_score
-    } else {
-        config.eligibility_threshold
-    }
-}
 /// Maximum collateral score exposed by the lifecycle contract.
 ///
 /// With the highest built-in task weight (`10`), a maximum-size batch can
@@ -183,7 +176,7 @@ fn weight_proposal_key(task_type: &Symbol) -> DataKey {
 /// Computes the sha256 hash of a [`MaintenanceRecord`] as it will be stored on-chain
 /// (including whatever `previous_record_hash` it already carries), so that the result
 /// can be embedded as the `previous_record_hash` of the *next* record in the chain.
-fn hash_maintenance_record(env: &Env, record: &MaintenanceRecord) -> Bytes {
+pub(crate) fn hash_maintenance_record(env: &Env, record: &MaintenanceRecord) -> Bytes {
     let digest: BytesN<32> = env.crypto().sha256(&record.clone().to_xdr(env)).into();
     digest.into()
 }
@@ -191,7 +184,7 @@ fn hash_maintenance_record(env: &Env, record: &MaintenanceRecord) -> Bytes {
 /// Returns the hash-chain link (`previous_record_hash`) for the next record to be
 /// appended to `history`: the hash of the current last record, or `None` when
 /// `history` is empty (i.e. the next record will be the first visible one).
-fn next_chain_link(env: &Env, history: &Vec<MaintenanceRecord>) -> Option<Bytes> {
+pub(crate) fn next_chain_link(env: &Env, history: &Vec<MaintenanceRecord>) -> Option<Bytes> {
     if history.is_empty() {
         None
     } else {
@@ -1407,6 +1400,7 @@ impl Lifecycle {
         set_asset_registry_addr(&env, &asset_registry);
         set_engineer_registry_addr(&env, &engineer_registry);
 
+        let min_collateral = DEFAULT_ELIGIBILITY_THRESHOLD;
         let config = Config {
             admin: admin.clone(),
             admins: Vec::new(&env),
@@ -1421,7 +1415,7 @@ impl Lifecycle {
             decay_rate: DEFAULT_DECAY_RATE,
             decay_interval: DEFAULT_DECAY_INTERVAL,
             eligibility_threshold: DEFAULT_ELIGIBILITY_THRESHOLD,
-            min_collateral_score: DEFAULT_ELIGIBILITY_THRESHOLD,
+            min_collateral_score: if min_collateral > 0 { min_collateral } else { DEFAULT_ELIGIBILITY_THRESHOLD },
             max_notes_length: DEFAULT_MAX_NOTES_LENGTH,
             task_weights: Map::new(&env),
             max_submissions_per_hour: DEFAULT_MAX_SUBMISSIONS_PER_HOUR,
@@ -1620,9 +1614,7 @@ impl Lifecycle {
         config.admins = new_admins.clone();
         config.admin_threshold = threshold;
         env.storage().persistent().set(&CONFIG, &config);
-        env.storage()
-            .persistent()
-            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &CONFIG);
 
         env.events().publish(
             (symbol_short!("SET_QRUM"), admin.clone()),
@@ -1725,10 +1717,6 @@ impl Lifecycle {
         ensure_not_paused(&env);
         admin.require_auth();
 
-        if min_collateral_score == 0 {
-            panic_with_error!(&env, ContractError::InvalidConfig);
-        }
-
         let mut config: Config = env
             .storage()
             .persistent()
@@ -1739,14 +1727,15 @@ impl Lifecycle {
         }
 
         let old_min = config.min_collateral_score;
-        config.min_collateral_score = min_collateral_score;
-        config.eligibility_threshold = min_collateral_score;
+        let normalized_score = if min_collateral_score > 0 { min_collateral_score } else { config.eligibility_threshold };
+        config.min_collateral_score = normalized_score;
+        config.eligibility_threshold = normalized_score;
         env.storage().persistent().set(&CONFIG, &config); 
         extend_persistent_ttl(&env, &CONFIG);
 
         env.events().publish(
             (symbol_short!("CFG_UPD"),),
-            (old_min, min_collateral_score),
+            (old_min, normalized_score),
         );
         env.events().publish(
             (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
@@ -1754,7 +1743,7 @@ impl Lifecycle {
                 admin,
                 env.ledger().timestamp(),
                 symbol_short!("MIN_COLL"),
-                min_collateral_score,
+                normalized_score,
             ),
         );
     }
@@ -4393,7 +4382,7 @@ impl Lifecycle {
         apply_decay(&env, asset_id, true, false, config.max_history);
 
         let effective_score = compute_read_only_collateral_score(&env, asset_id, &asset.asset_type, &config);
-        effective_score >= effective_min_collateral_score(&config)
+        effective_score >= config.min_collateral_score
     }
 
     /// Returns the timestamp of the most recent maintenance event, or None if no maintenance has been submitted.
@@ -4944,7 +4933,7 @@ impl Lifecycle {
             } else {
                 compute_read_only_collateral_score(&env, asset_id, &asset.asset_type, &config)
             };
-            results.push_back(score >= effective_min_collateral_score(&config));
+            results.push_back(score >= config.min_collateral_score);
         }
         results
     }
@@ -5095,11 +5084,7 @@ impl Lifecycle {
                     pruned.push_back(valuation_history.get(i).unwrap());
                 }
                 env.storage().persistent().set(&valuation_history_key, &pruned);
-                env.storage().persistent().extend_ttl(
-                    &valuation_history_key,
-                    TTL_THRESHOLD,
-                    TTL_TARGET,
-                );
+                extend_persistent_ttl(&env, &valuation_history_key);
             }
         }
 
