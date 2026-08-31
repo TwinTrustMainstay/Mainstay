@@ -16808,4 +16808,68 @@ mod tests {
         );
         assert_eq!(page.len(), 0, "no matching records must return empty vec");
     }
+
+    // =========================================================================
+    // Issue #1304 — apply_decay MIN_SCORE_WITH_HISTORY floor after optimization
+    // =========================================================================
+
+    /// After optimizing apply_decay to avoid reading full maintenance history,
+    /// the floor condition (MIN_SCORE_WITH_HISTORY) must still be enforced for
+    /// assets with maintenance records.
+    #[test]
+    fn test_apply_decay_enforces_floor_with_history() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, config) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Submit one maintenance record to establish history
+        let oil_chg = symbol_short!("OIL_CHG");
+        client.submit_maintenance(
+            &asset_id, &oil_chg, &Priority::Low,
+            &String::from_str(&env, "oil"), &engineer, &None,
+        );
+
+        let initial_score = client.get_collateral_score(&asset_id);
+        assert!(initial_score > 0, "initial score must be positive");
+
+        // Decay the score below the floor over multiple decay intervals
+        let decay_intervals = (initial_score / config.decay_rate) + 2;
+        let decay_time = decay_intervals as u64 * config.decay_interval;
+        env.ledger().set_timestamp(env.ledger().timestamp() + decay_time);
+
+        // Apply decay and verify floor is enforced
+        let final_score = client.get_collateral_score(&asset_id);
+        assert_eq!(
+            final_score, MIN_SCORE_WITH_HISTORY,
+            "#1304: score must be clamped at floor even after decay"
+        );
+    }
+
+    /// An asset with no maintenance history must have zero score even after decay.
+    #[test]
+    fn test_apply_decay_no_history_returns_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _engineer_registry_client, config) = setup(&env, 0);
+        let (asset_id, _asset_owner) = register_asset(&env, &asset_registry_client);
+
+        // Register but do not submit any maintenance records
+        let score = client.get_collateral_score(&asset_id);
+        assert_eq!(score, 0, "asset with no history must score zero");
+
+        // Advance time and check score remains zero
+        let time_advanced = 2 * config.decay_interval;
+        env.ledger().set_timestamp(env.ledger().timestamp() + time_advanced);
+
+        let score_after = client.get_collateral_score(&asset_id);
+        assert_eq!(
+            score_after, 0,
+            "#1304: score must remain zero when there is no maintenance history"
+        );
+    }
 }
