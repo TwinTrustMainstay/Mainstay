@@ -183,7 +183,7 @@ fn weight_proposal_key(task_type: &Symbol) -> DataKey {
 /// Computes the sha256 hash of a [`MaintenanceRecord`] as it will be stored on-chain
 /// (including whatever `previous_record_hash` it already carries), so that the result
 /// can be embedded as the `previous_record_hash` of the *next* record in the chain.
-fn hash_maintenance_record(env: &Env, record: &MaintenanceRecord) -> Bytes {
+pub(crate) fn hash_maintenance_record(env: &Env, record: &MaintenanceRecord) -> Bytes {
     let digest: BytesN<32> = env.crypto().sha256(&record.clone().to_xdr(env)).into();
     digest.into()
 }
@@ -191,7 +191,7 @@ fn hash_maintenance_record(env: &Env, record: &MaintenanceRecord) -> Bytes {
 /// Returns the hash-chain link (`previous_record_hash`) for the next record to be
 /// appended to `history`: the hash of the current last record, or `None` when
 /// `history` is empty (i.e. the next record will be the first visible one).
-fn next_chain_link(env: &Env, history: &Vec<MaintenanceRecord>) -> Option<Bytes> {
+pub(crate) fn next_chain_link(env: &Env, history: &Vec<MaintenanceRecord>) -> Option<Bytes> {
     if history.is_empty() {
         None
     } else {
@@ -16807,5 +16807,130 @@ mod tests {
             &asset_id, &symbol_short!("ENGINE"), &0, &50,
         );
         assert_eq!(page.len(), 0, "no matching records must return empty vec");
+    }
+
+    #[test]
+    fn test_hash_maintenance_record_determinism() {
+        let env = Env::default();
+        let engineer = Address::generate(&env);
+        let record = MaintenanceRecord {
+            asset_id: 123,
+            task_type: symbol_short!("OIL"),
+            priority: Priority::High,
+            notes: String::from_str(&env, "routine maintenance"),
+            engineer: engineer.clone(),
+            timestamp: 1000,
+            cost: Some(500),
+            ownership_start_ledger: Some(100),
+            previous_record_hash: None,
+        };
+
+        let hash1 = hash_maintenance_record(&env, &record);
+        let hash2 = hash_maintenance_record(&env, &record);
+        assert_eq!(hash1, hash2, "same record must always produce the same hash");
+    }
+
+    #[test]
+    fn test_hash_maintenance_record_changes_with_different_records() {
+        let env = Env::default();
+        let engineer = Address::generate(&env);
+        let record1 = MaintenanceRecord {
+            asset_id: 123,
+            task_type: symbol_short!("OIL"),
+            priority: Priority::High,
+            notes: String::from_str(&env, "routine maintenance"),
+            engineer: engineer.clone(),
+            timestamp: 1000,
+            cost: Some(500),
+            ownership_start_ledger: Some(100),
+            previous_record_hash: None,
+        };
+
+        let record2 = MaintenanceRecord {
+            asset_id: 124,
+            task_type: symbol_short!("OIL"),
+            priority: Priority::High,
+            notes: String::from_str(&env, "routine maintenance"),
+            engineer: engineer.clone(),
+            timestamp: 1000,
+            cost: Some(500),
+            ownership_start_ledger: Some(100),
+            previous_record_hash: None,
+        };
+
+        let hash1 = hash_maintenance_record(&env, &record1);
+        let hash2 = hash_maintenance_record(&env, &record2);
+        assert_ne!(hash1, hash2, "different records must produce different hashes");
+    }
+
+    #[test]
+    fn test_next_chain_link_empty_history() {
+        let env = Env::default();
+        let history: Vec<MaintenanceRecord> = Vec::new(&env);
+        let link = next_chain_link(&env, &history);
+        assert_eq!(link, None, "empty history must return None");
+    }
+
+    #[test]
+    fn test_next_chain_link_non_empty_history() {
+        let env = Env::default();
+        let engineer = Address::generate(&env);
+        let record = MaintenanceRecord {
+            asset_id: 123,
+            task_type: symbol_short!("OIL"),
+            priority: Priority::High,
+            notes: String::from_str(&env, "routine maintenance"),
+            engineer: engineer.clone(),
+            timestamp: 1000,
+            cost: Some(500),
+            ownership_start_ledger: Some(100),
+            previous_record_hash: None,
+        };
+
+        let mut history = Vec::new(&env);
+        history.push_back(record.clone());
+
+        let link = next_chain_link(&env, &history);
+        assert!(link.is_some(), "non-empty history must return Some");
+
+        let expected_hash = hash_maintenance_record(&env, &record);
+        assert_eq!(link.unwrap(), expected_hash, "chain link must be hash of last record");
+    }
+
+    #[test]
+    fn test_next_chain_link_uses_last_record() {
+        let env = Env::default();
+        let engineer = Address::generate(&env);
+        let record1 = MaintenanceRecord {
+            asset_id: 123,
+            task_type: symbol_short!("OIL"),
+            priority: Priority::High,
+            notes: String::from_str(&env, "first maintenance"),
+            engineer: engineer.clone(),
+            timestamp: 1000,
+            cost: Some(500),
+            ownership_start_ledger: Some(100),
+            previous_record_hash: None,
+        };
+
+        let record2 = MaintenanceRecord {
+            asset_id: 123,
+            task_type: symbol_short!("FILTER"),
+            priority: Priority::Medium,
+            notes: String::from_str(&env, "second maintenance"),
+            engineer: engineer.clone(),
+            timestamp: 2000,
+            cost: Some(300),
+            ownership_start_ledger: Some(100),
+            previous_record_hash: Some(hash_maintenance_record(&env, &record1)),
+        };
+
+        let mut history = Vec::new(&env);
+        history.push_back(record1);
+        history.push_back(record2.clone());
+
+        let link = next_chain_link(&env, &history);
+        let expected_hash = hash_maintenance_record(&env, &record2);
+        assert_eq!(link.unwrap(), expected_hash, "chain link must use the last record");
     }
 }
