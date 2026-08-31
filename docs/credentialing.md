@@ -17,6 +17,43 @@ The engineer credentialing system provides a decentralized, trustless way to ver
 
 ## Credential Lifecycle
 
+```
+                 ┌───────────────────┐
+                 │   1. ISSUANCE     │
+                 │  register_engineer│
+                 └─────────┬─────────┘
+                           │
+                           ▼
+                 ┌───────────────────┐
+             ┌──▶│   2. VALID        │
+             │   │  (active, not     │
+             │   │   yet expired)    │
+             │   └─────────┬─────────┘
+             │             │ expires_at reached
+             │             ▼
+             │   ┌───────────────────┐
+             │   │ 3. GRACE PERIOD   │
+     renew   │   │  (expires_at ..   │
+             │   │   expires_at+7d)  │
+             │   └─────────┬─────────┘
+             │             │ grace window elapses
+             │             ▼
+             │   ┌───────────────────┐
+             └───│ 4. HARD-EXPIRED   │
+                 │  (verify_engineer  │
+                 │   returns false)  │
+                 └─────────┬─────────┘
+                           │
+                           ▼
+                 ┌───────────────────┐
+                 │  5. REVOKED       │
+                 │  revoke_credential │
+                 │  (terminal state) │
+                 └───────────────────┘
+```
+
+Revocation can be triggered by the issuing authority from any non-terminal state (Valid, Grace Period, or Hard-Expired) and is permanent — there is no un-revoke path; a revoked engineer must be re-registered under a new credential.
+
 ### 1. Issuance
 - **Who**: Trusted issuer organizations
 - **What**: Engineer addresses with credential hashes
@@ -29,7 +66,16 @@ The engineer credentialing system provides a decentralized, trustless way to ver
 - **Result**: Boolean indicating current validity
 - **Use Case**: Maintenance contract validation
 
-### 3. Revocation
+### 3. Grace Period (7 Days Post-Expiry)
+When a credential's `expires_at` timestamp passes, the engineer does not immediately lose the ability to submit maintenance. A **7-day grace period** (`GRACE_PERIOD_SECS`, 604,800 seconds) follows expiry during which the credential is treated as valid for continued operation, but is reported as a distinct status so downstream consumers can distinguish it from a fully-valid credential.
+
+- **When it applies**: Automatically, immediately upon `expires_at` passing. No action is required from the engineer or issuer to activate it.
+- **Configurability**: The grace period is not hardcoded forever — admins can adjust it per-registry via `set_grace_period`, bounded between 1 day and 90 days (`ContractError::InvalidGracePeriod` is raised outside those bounds). If unset, the contract falls back to the 7-day default.
+- **Status detail**: `get_credential_status()` returns a granular status (`Valid`, `GracePeriod`, `HardExpired`, `Revoked`, `NotFound`) rather than a simple boolean, so callers that need to warn engineers about an impending hard-expiry can do so.
+- **Implications for maintenance submission**: The Lifecycle contract's fallback check (`verify_engineer`) still returns `true` while a credential is within its grace window, so maintenance submissions are **not blocked** during grace. However, integrators building UIs or automated fleets should treat `GracePeriod` status as a signal to prompt renewal — once the grace window elapses, the credential becomes hard-expired and all submissions from that engineer will be rejected until renewed.
+- **Renewal during grace**: Re-registering an engineer whose credential is within the grace window extends `expires_at` from the **existing** `expires_at + new_validity_period`, rather than from "now" — this avoids inadvertently shortening the effective coverage for engineers who renew early or late within the grace window. Renewal after hard-expiry instead computes the new expiry from the current timestamp.
+
+### 4. Revocation
 - **Who**: Original issuing authority only
 - **What**: Deactivates credential (sets active=false)
 - **Persistence**: Record remains for audit trail
@@ -95,6 +141,29 @@ if credential_hash == BytesN::from_array(&env, &[0u8; 32]) {
 - **Verification**: Expired credentials return false
 - **Flexibility**: Validity period set per credential
 - **Renewal**: New credentials issued after expiration
+
+## Specialization-Based Task Matching
+
+Beyond basic credential validity, engineers can hold one or more **specializations** — task-type tags (e.g. `HV_GEN` for high-voltage generators, `HVAC`, `PUMPS`) recorded on their `Engineer` record's `specializations: Vec<Symbol>` field. Specializations let asset owners and the Lifecycle contract require that maintenance be performed by an engineer qualified for the specific task type, not merely by *any* credentialed engineer.
+
+### How Matching Works
+- **Adding a specialization**: `add_specialization(issuer, engineer_address, specialization)` — only the engineer's **original issuer** may add specializations, and the value must be present in the registry's allowed-specialization list (`ContractError::InvalidSpecialization` otherwise). Duplicate additions are rejected (`ContractError::SpecializationAlreadyExists`).
+- **Verification with a required specialization**: `verify_engineer_for_task(engineer_address, required_specialization: Option<Symbol>)` performs the usual active/expiry/grace checks and, when `required_specialization` is `Some(...)`, additionally scans the engineer's `specializations` vector for a match.
+  - If the credential is otherwise valid but the required specialization is absent, the call panics with `ContractError::SpecializationNotCovered` rather than silently returning `false` — this makes specialization mismatches an explicit, distinguishable failure mode for calling contracts and off-chain tooling.
+  - Passing `None` skips the specialization check entirely, preserving backward compatibility with maintenance types that don't require a specific qualification.
+
+### Effect on Maintenance Submission
+When an asset (or asset type) is configured to require a specialization for a given maintenance/task type, the Lifecycle contract calls `verify_engineer_for_task` with that requirement at submission time, in place of the plain `verify_engineer` check:
+
+- An engineer with a **valid, non-specialized** credential can still submit general maintenance records that carry no specialization requirement.
+- An engineer attempting to submit a **specialized** task type (e.g. high-voltage generator service) without the matching specialization on file will have the submission rejected with `SpecializationNotCovered`, even though their base credential is otherwise valid and unexpired.
+- Specialization checks are evaluated **in addition to**, not instead of, the grace-period-aware validity check — a hard-expired engineer is rejected before specialization is even considered.
+- Because specializations are additive (an engineer may hold several), fleets with mixed equipment types can credential a single engineer for multiple task categories without issuing separate credentials.
+
+### Practical Guidance
+- **Issuers** should only add specializations they can actually vet (e.g. certification records for high-voltage work) — `add_specialization` carries the same trust assumptions as initial issuance.
+- **Asset owners** configuring maintenance task types should pick specialization symbols from the registry's allowed list up front, since an unrecognized symbol will cause every `add_specialization` call for it to fail.
+- **Integrators** building submission UIs should catch `SpecializationNotCovered` distinctly from `CredentialExpired`/`EngineerNotFound` so operators can tell "wrong engineer for this job" apart from "no valid engineer at all."
 
 ## API Operations
 
