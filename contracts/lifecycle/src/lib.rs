@@ -16920,10 +16920,18 @@ mod tests {
     }
 
     #[test]
-    fn test_consistent_ttl_constants() {
-        assert_eq!(TTL_THRESHOLD, 518_400, "TTL_THRESHOLD should be 518400 (30 days)");
+    fn test_ttl_threshold_and_target_values() {
+        assert_eq!(TTL_THRESHOLD, 259_200, "TTL_THRESHOLD should be 259200 (15 days)");
         assert_eq!(TTL_TARGET, 518_400, "TTL_TARGET should be 518400 (30 days)");
-        assert_eq!(TTL_THRESHOLD, TTL_TARGET, "TTL_THRESHOLD and TTL_TARGET should be consistent");
+        assert!(TTL_THRESHOLD < TTL_TARGET, "TTL_THRESHOLD should be less than TTL_TARGET for proper extension behavior");
+    }
+
+    #[test]
+    fn test_ttl_extension_skip_when_above_threshold() {
+        assert!(TTL_TARGET > TTL_THRESHOLD, "Target must be greater than threshold for extension to work");
+        let headroom = TTL_TARGET - TTL_THRESHOLD;
+        assert!(headroom > 0, "there must be headroom between threshold and target");
+        assert!(headroom >= 259_200, "headroom should be at least 15 days (259200 ledgers)");
     }
 
     #[test]

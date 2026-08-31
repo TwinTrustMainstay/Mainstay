@@ -6,8 +6,15 @@ pub mod validation;
 use soroban_sdk::{Address, Env, IntoVal, Val};
 
 /// Ledger TTL threshold and target for persistent storage entries.
-/// 1 ledger ≈ 5 seconds → 518,400 ledgers ≈ 30 days.
-pub const TTL_THRESHOLD: u32 = 518_400;
+///
+/// The Soroban TTL extension model uses threshold as the minimum remaining ledgers
+/// before extension triggers, and target as the desired TTL after extension.
+/// When remaining ledgers drops below the threshold, the entry is extended to the target value.
+///
+/// 1 ledger ≈ 5 seconds:
+/// - TTL_THRESHOLD = 259,200 ≈ 15 days (minimum before extension is triggered)
+/// - TTL_TARGET = 518,400 ≈ 30 days (desired TTL after extension)
+pub const TTL_THRESHOLD: u32 = 259_200;
 pub const TTL_TARGET: u32 = 518_400;
 
 /// Default ledger TTL for instance storage (≈ 30 days at 5 s/ledger).
