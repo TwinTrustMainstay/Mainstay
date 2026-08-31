@@ -6217,6 +6217,121 @@ mod tests {
         assert!(history.contains(&asset_ids.get(4).unwrap()));
     }
 
+    /// Issue: verify that when the engineer history sliding window is filled to
+    /// exactly `cap + 1` distinct assets, the single oldest asset_id is evicted
+    /// and every other (newer) asset_id is retained, in insertion order.
+    #[test]
+    fn test_engineer_history_evicts_oldest_at_cap_plus_one() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let cap: u32 = 4;
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, cap);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        // Fill history to cap + 1 distinct assets.
+        let mut asset_ids = Vec::new(&env);
+        for _ in 0..(cap + 1) {
+            let (asset_id, _asset_owner) = register_asset(&env, &asset_registry_client);
+            asset_ids.push_back(asset_id);
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &Priority::Low,
+                &String::from_str(&env, "service"),
+                &engineer,
+            );
+        }
+
+        let history = client.get_engineer_maintenance_history(&engineer);
+        assert_eq!(
+            history.len(),
+            cap,
+            "history length must stay capped at max_engineer_history"
+        );
+
+        // The oldest asset_id (index 0) must have been evicted.
+        assert!(
+            !history.contains(&asset_ids.get(0).unwrap()),
+            "oldest asset_id must be evicted once cap + 1 distinct assets are added"
+        );
+
+        // Every newer asset_id (indices 1..=cap) must still be present.
+        for i in 1..=cap {
+            let id = asset_ids.get(i).unwrap();
+            assert!(
+                history.contains(&id),
+                "newer asset_id at index {i} must be retained after eviction"
+            );
+        }
+
+        // The newest asset_id in particular must be retained.
+        assert!(history.contains(&asset_ids.get(cap).unwrap()));
+    }
+
+    /// Issue: with max_engineer_history == 1, the history must always contain
+    /// exactly the single most-recently-added asset_id, evicting every
+    /// previous entry as soon as a new distinct asset is added.
+    #[test]
+    fn test_engineer_history_max_history_of_one() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 1);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        let (asset_id_1, _owner1) = register_asset(&env, &asset_registry_client);
+        client.submit_maintenance(
+            &asset_id_1,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "first asset service"),
+            &engineer,
+        );
+
+        let history_after_first = client.get_engineer_maintenance_history(&engineer);
+        assert_eq!(history_after_first.len(), 1);
+        assert!(history_after_first.contains(&asset_id_1));
+
+        let (asset_id_2, _owner2) = register_asset(&env, &asset_registry_client);
+        client.submit_maintenance(
+            &asset_id_2,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "second asset service"),
+            &engineer,
+        );
+
+        let history_after_second = client.get_engineer_maintenance_history(&engineer);
+        assert_eq!(
+            history_after_second.len(),
+            1,
+            "history must stay at exactly 1 entry when max_engineer_history == 1"
+        );
+        assert!(
+            !history_after_second.contains(&asset_id_1),
+            "first asset_id must be evicted once a second distinct asset is added"
+        );
+        assert!(
+            history_after_second.contains(&asset_id_2),
+            "history must retain only the newest asset_id"
+        );
+
+        let (asset_id_3, _owner3) = register_asset(&env, &asset_registry_client);
+        client.submit_maintenance(
+            &asset_id_3,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "third asset service"),
+            &engineer,
+        );
+
+        let history_after_third = client.get_engineer_maintenance_history(&engineer);
+        assert_eq!(history_after_third.len(), 1);
+        assert!(!history_after_third.contains(&asset_id_2));
+        assert!(history_after_third.contains(&asset_id_3));
+    }
+
     #[test]
     fn test_engineer_history_no_duplicate_asset_id_on_repeated_maintenance() {
         let env = Env::default();
@@ -12091,6 +12206,167 @@ mod tests {
         assert!(
             since.get(0).unwrap().ownership_start_ledger.is_some(),
             "owner C's record must carry ownership_start_ledger"
+        );
+    }
+
+    /// Issue: after 3+ successive ownership transfers (A → B → C → D), the
+    /// endpoint must anchor strictly to the most recent transfer and return
+    /// only records submitted under the final owner (D), excluding every
+    /// earlier owner's records even though they are still present in the
+    /// full history.
+    #[test]
+    fn test_history_since_transfer_with_three_plus_transfers() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, engineer_registry, _) = setup(&env, 0);
+
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+        let owner_c = Address::generate(&env);
+        let owner_d = Address::generate(&env);
+        let asset_id = register_asset_for_owner(&env, &asset_registry, &owner_a);
+        let engineer = register_engineer_for_transfer_tests(&env, &engineer_registry);
+        lifecycle.authorize_engineer(&owner_a, &asset_id, &engineer);
+
+        // Owner A submits 1 record.
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("INSPECT"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner A inspection"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+
+        // Transfer A → B, owner B submits 1 record.
+        asset_registry.transfer_asset(&asset_id, &owner_a, &owner_b);
+        lifecycle.record_transfer(&asset_id, &owner_a, &owner_b);
+        lifecycle.authorize_engineer(&owner_b, &asset_id, &engineer);
+        env.ledger().with_mut(|li| li.timestamp += 1);
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner B oil change"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+
+        // Transfer B → C, owner C submits 2 records.
+        asset_registry.transfer_asset(&asset_id, &owner_b, &owner_c);
+        lifecycle.record_transfer(&asset_id, &owner_b, &owner_c);
+        lifecycle.authorize_engineer(&owner_c, &asset_id, &engineer);
+        env.ledger().with_mut(|li| li.timestamp += 1);
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("FILTER"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner C filter change"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("BRAKE"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner C brake service"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+
+        // Transfer C → D (third transfer), owner D submits 1 record.
+        asset_registry.transfer_asset(&asset_id, &owner_c, &owner_d);
+        lifecycle.record_transfer(&asset_id, &owner_c, &owner_d);
+        lifecycle.authorize_engineer(&owner_d, &asset_id, &engineer);
+        env.ledger().with_mut(|li| li.timestamp += 1);
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner D engine overhaul"),
+            &engineer,
+        );
+
+        // Since-transfer must return only owner D's single record.
+        let since = lifecycle.get_maintenance_history_since_transfer(&asset_id);
+        assert_eq!(
+            since.len(),
+            1,
+            "after 3 transfers, since_transfer must return only the current owner's records"
+        );
+        assert_eq!(since.get(0).unwrap().task_type, symbol_short!("ENGINE"));
+        assert!(since.get(0).unwrap().ownership_start_ledger.is_some());
+
+        // Full history must still contain everything: A(1) + XFER + B(1) + XFER
+        // + C(2) + XFER + D(1) = 8 entries.
+        let full = lifecycle.get_maintenance_history(&asset_id);
+        assert_eq!(
+            full.len(),
+            8,
+            "full history must retain all records across every transfer"
+        );
+    }
+
+    /// Issue: when the current owner has zero maintenance records after the
+    /// most recent of several transfers, since_transfer must return an empty
+    /// Vec rather than falling back to a previous owner's records.
+    #[test]
+    fn test_history_since_transfer_zero_records_for_current_owner_after_multiple_transfers() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, engineer_registry, _) = setup(&env, 0);
+
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+        let owner_c = Address::generate(&env);
+        let asset_id = register_asset_for_owner(&env, &asset_registry, &owner_a);
+        let engineer = register_engineer_for_transfer_tests(&env, &engineer_registry);
+        lifecycle.authorize_engineer(&owner_a, &asset_id, &engineer);
+
+        // Owner A submits 2 records.
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("INSPECT"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner A inspection"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner A oil change"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+
+        // Transfer A → B, owner B submits 1 record.
+        asset_registry.transfer_asset(&asset_id, &owner_a, &owner_b);
+        lifecycle.record_transfer(&asset_id, &owner_a, &owner_b);
+        lifecycle.authorize_engineer(&owner_b, &asset_id, &engineer);
+        env.ledger().with_mut(|li| li.timestamp += 1);
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("FILTER"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner B filter change"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+
+        // Transfer B → C. Owner C submits nothing.
+        asset_registry.transfer_asset(&asset_id, &owner_b, &owner_c);
+        lifecycle.record_transfer(&asset_id, &owner_b, &owner_c);
+
+        let since = lifecycle.get_maintenance_history_since_transfer(&asset_id);
+        assert_eq!(
+            since.len(),
+            0,
+            "current owner C has zero maintenance records; since_transfer must be empty, \
+             not fall back to owner A's or owner B's records"
         );
     }
 
