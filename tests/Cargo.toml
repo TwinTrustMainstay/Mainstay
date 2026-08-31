@@ -207,3 +207,23 @@ path = "test_lending_error_variants.rs"
 [[test]]
 name = "test_single_pause_code_path_1194"
 path = "test_single_pause_code_path_1194.rs"
+
+# Issue #1259: admin list size cap
+[[test]]
+name = "test_admin_list_cap_1259"
+path = "test_admin_list_cap_1259.rs"
+
+# Issue #1258: minimum max_notes_length enforcement
+[[test]]
+name = "test_max_notes_length_min_1258"
+path = "test_max_notes_length_min_1258.rs"
+
+# Issue #1257: score_increment > 0 validated in initialize
+[[test]]
+name = "test_score_increment_init_1257"
+path = "test_score_increment_init_1257.rs"
+
+# Issue #1256: registry address changes require timelock
+[[test]]
+name = "test_registry_timelock_1256"
+path = "test_registry_timelock_1256.rs"

@@ -105,6 +105,13 @@ const MAX_BUILT_IN_TASK_WEIGHT: u32 = 10;
 pub const MAX_BATCH_SIZE: u32 = 50;
 /// Hard cap on engineers accepted by one bulk authorization-revocation call.
 pub const MAX_BATCH_REVOKE_SIZE: u32 = 50;
+/// Hard cap on the number of addresses in the admin multisig set.
+///
+/// `require_quorum` performs an O(n) scan of the admins list on every
+/// protected call.  Without a bound this could approach instruction limits
+/// for large lists.  10 admins comfortably covers any realistic governance
+/// set while keeping per-call work negligible.
+pub const MAX_ADMINS: u32 = 10;
 /// Upper bound on `limit` accepted by [`LifecycleContract::get_maintenance_history_page`].
 /// Without this cap a caller could pass an arbitrarily large `limit` and reintroduce
 /// the unbounded-response failure the paginated endpoint exists to prevent.
@@ -911,10 +918,18 @@ impl Lifecycle {
         if new_config.max_notes_length == 0 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
+        // #1258: A max_notes_length below 10 trivially bypasses notes validation.
+        if new_config.max_notes_length < 10 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
         if new_config.admin_threshold > 0
             && new_config.admin_threshold as u32 > new_config.admins.len()
         {
             panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+        // #1259: Cap admin list size to prevent O(n) DoS in require_quorum.
+        if new_config.admins.len() > MAX_ADMINS {
+            panic_with_error!(&env, ContractError::TooManyAdmins);
         }
         // Store proposed config under a dedicated pending key.
         let pending_key = symbol_short!("PEND_CFG");
@@ -1356,6 +1371,13 @@ impl Lifecycle {
         if DEFAULT_DECAY_INTERVAL == 0 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
+        // #1257: Guard against a misconfigured build constant. A score_increment
+        // of 0 means maintenance events never award any score, silently breaking
+        // the collateral-scoring system. Reject at deploy time rather than
+        // producing a permanently mis-configured contract.
+        if DEFAULT_SCORE_INCREMENT == 0 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
 
         set_asset_registry_addr(&env, &asset_registry);
         set_engineer_registry_addr(&env, &engineer_registry);
@@ -1550,6 +1572,12 @@ impl Lifecycle {
         }
         if threshold > 0 && threshold as u32 > new_admins.len() {
             panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+        // #1259: Cap the admin list to MAX_ADMINS (10) to prevent O(n) scans
+        // in require_quorum from approaching instruction limits on every
+        // protected call.
+        if new_admins.len() > MAX_ADMINS {
+            panic_with_error!(&env, ContractError::TooManyAdmins);
         }
 
         // Reject any list that contains duplicate addresses.  A duplicate
@@ -4393,8 +4421,61 @@ impl Lifecycle {
         page
     }
 
+    /// Admin-only function to propose updating the asset registry address.
+    ///
+    /// Starts the 48-hour timelock that must elapse before
+    /// `execute_update_asset_registry` will accept the change.  This two-step
+    /// flow prevents a compromised or malicious admin from instantly redirecting
+    /// cross-contract calls to an attacker-controlled contract.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored config admin
+    /// * `new_registry` - The new asset registry contract address
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
+    /// - [`ContractError::ZeroAddress`] if `new_registry` is the zero address
+    /// - [`ContractError::SameRegistryAddress`] if `new_registry` equals the engineer registry
+    pub fn propose_update_asset_registry(env: Env, admin: Address, new_registry: Address) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if is_zero_address(&env, &new_registry) {
+            panic_with_error!(&env, ContractError::ZeroAddress);
+        }
+        if new_registry == get_engineer_registry_addr(&env) {
+            panic_with_error!(&env, ContractError::SameRegistryAddress);
+        }
+        // Stash the proposed address so execute can apply it after the delay.
+        env.storage()
+            .persistent()
+            .set(&symbol_short!("PEND_AST"), &new_registry);
+        extend_persistent_ttl(&env, &symbol_short!("PEND_AST"));
+        store_timelock(&env, symbol_short!("AST_REG"));
+        env.events().publish(
+            (symbol_short!("PROP_AST"), admin.clone()),
+            (new_registry.clone(), env.ledger().timestamp()),
+        );
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("PROP_AST")),
+            (admin, env.ledger().timestamp(), new_registry),
+        );
+    }
+
     /// Admin-only function to update the asset registry address.
-    /// Useful for registry migrations or updates.
+    ///
+    /// # Deprecated — prefer the timelocked two-step flow
+    /// Direct registry updates are gated behind the `AST_REG` timelock.
+    /// Call `propose_update_asset_registry` first, wait 48 hours, then call
+    /// `execute_update_asset_registry` to apply the change.
     ///
     /// # Arguments
     /// * `admin` - The admin address that must match the stored config admin
@@ -4403,8 +4484,59 @@ impl Lifecycle {
     /// # Panics
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::TimelockNotExpired`] if the `AST_REG` timelock has not elapsed
     pub fn update_asset_registry(env: Env, admin: Address, new_registry: Address) {
+        require_timelock_ready(&env, symbol_short!("AST_REG"));
         crate::admin::update_asset_registry(env, admin, new_registry);
+    }
+
+    /// Admin-only function to propose updating the engineer registry address.
+    ///
+    /// Starts the 48-hour timelock that must elapse before
+    /// `execute_update_engineer_registry` will accept the change.  This two-step
+    /// flow prevents a compromised or malicious admin from instantly redirecting
+    /// engineer verification calls to an attacker-controlled contract.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored config admin
+    /// * `new_registry` - The new engineer registry contract address
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
+    /// - [`ContractError::ZeroAddress`] if `new_registry` is the zero address
+    /// - [`ContractError::SameRegistryAddress`] if `new_registry` equals the asset registry
+    pub fn propose_update_engineer_registry(env: Env, admin: Address, new_registry: Address) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if is_zero_address(&env, &new_registry) {
+            panic_with_error!(&env, ContractError::ZeroAddress);
+        }
+        if new_registry == get_asset_registry_addr(&env) {
+            panic_with_error!(&env, ContractError::SameRegistryAddress);
+        }
+        // Stash the proposed address so execute can apply it after the delay.
+        env.storage()
+            .persistent()
+            .set(&symbol_short!("PEND_ENG"), &new_registry);
+        extend_persistent_ttl(&env, &symbol_short!("PEND_ENG"));
+        store_timelock(&env, symbol_short!("ENG_REG"));
+        env.events().publish(
+            (symbol_short!("PROP_ENG"), admin.clone()),
+            (new_registry.clone(), env.ledger().timestamp()),
+        );
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("PROP_ENG")),
+            (admin, env.ledger().timestamp(), new_registry),
+        );
     }
 
     /// Get the address of the engineer registry contract.
@@ -4419,7 +4551,11 @@ impl Lifecycle {
     }
 
     /// Admin-only function to update the engineer registry address.
-    /// Useful for registry migrations or updates.
+    ///
+    /// # Deprecated — prefer the timelocked two-step flow
+    /// Direct registry updates are gated behind the `ENG_REG` timelock.
+    /// Call `propose_update_engineer_registry` first, wait 48 hours, then call
+    /// `execute_update_engineer_registry` to apply the change.
     ///
     /// # Arguments
     /// * `admin` - The admin address that must match the stored config admin
@@ -4428,7 +4564,9 @@ impl Lifecycle {
     /// # Panics
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::TimelockNotExpired`] if the `ENG_REG` timelock has not elapsed
     pub fn update_engineer_registry(env: Env, admin: Address, new_registry: Address) {
+        require_timelock_ready(&env, symbol_short!("ENG_REG"));
         crate::admin::update_engineer_registry(env, admin, new_registry);
     }
 

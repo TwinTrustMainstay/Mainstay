@@ -20,7 +20,7 @@ use crate::{
     set_engineer_registry_addr, store_timelock, require_timelock_ready,
     CONFIG, PAUSED_KEY, PENDING_ADMIN_KEY,
     EVENT_ADMIN_SET, EVENT_PROP_ADMIN, EVENT_REG_AST, EVENT_REG_ENG, EVENT_RST_SCR,
-    TTL_THRESHOLD, TTL_TARGET,
+    TTL_THRESHOLD, TTL_TARGET, MAX_ADMINS,
 };
 use crate::events::EVENT_PRUNED;
 use shared::extend_persistent_ttl;
@@ -264,6 +264,12 @@ pub(crate) fn set_admin_quorum(env: Env, admin: Address, new_admins: Vec<Address
     if threshold > 0 && threshold > new_admins.len() {
         panic_with_error!(&env, ContractError::InvalidConfig);
     }
+    // #1259: Hard cap — admin lists must not exceed MAX_ADMINS (10).
+    // require_quorum iterates the full list; an unbounded list could push
+    // per-call compute toward Soroban instruction limits (DoS vector).
+    if new_admins.len() > MAX_ADMINS {
+        panic_with_error!(&env, ContractError::TooManyAdmins);
+    }
     // #1195: Reject lists that contain any repeated address.  A duplicate
     // inflates the apparent quorum count so that fewer real signers than
     // `threshold` could satisfy `require_quorum`, undermining the security
@@ -429,7 +435,10 @@ pub(crate) fn update_max_engineer_history(env: Env, admin: Address, new_max: u32
 pub(crate) fn update_max_notes_length(env: Env, admin: Address, new_max: u32) {
     ensure_not_paused(&env);
     admin.require_auth();
-    if new_max == 0 {
+    // #1258: A max_notes_length < 10 lets notes trivially bypass meaningful
+    // content validation. Zero in particular turns the length guard into
+    // `notes.len() > 0`, accepting any non-empty string unconditionally.
+    if new_max < 10 {
         panic_with_error!(&env, ContractError::InvalidConfig);
     }
     let mut config: Config = env.storage().persistent().get(&CONFIG)
@@ -450,7 +459,8 @@ pub(crate) fn update_max_notes_length(env: Env, admin: Address, new_max: u32) {
 pub(crate) fn set_max_notes_length(env: Env, admin: Address, length: u32) {
     ensure_not_paused(&env);
     admin.require_auth();
-    if length == 0 {
+    // #1258: Minimum 10 characters to prevent trivial bypass of notes validation.
+    if length < 10 {
         panic_with_error!(&env, ContractError::InvalidConfig);
     }
     let mut config: Config = env.storage().persistent().get(&CONFIG)
