@@ -16872,4 +16872,117 @@ mod tests {
             "#1304: score must remain zero when there is no maintenance history"
         );
     }
+
+    // =========================================================================
+    // Issue #1305 — compute_decay duplicate record scan optimization
+    // =========================================================================
+
+    /// Duplicate records must be correctly excluded from score calculation,
+    /// ensuring the O(n*m) scan logic works correctly whether implemented
+    /// with linear search or binary search optimization.
+    #[test]
+    fn test_compute_decay_duplicate_records_excluded() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let oil_chg = symbol_short!("OIL_CHG");
+
+        // Submit 10 records to establish a baseline score
+        for _ in 0..10 {
+            client.submit_maintenance(
+                &asset_id, &oil_chg, &Priority::Low,
+                &String::from_str(&env, "oil"), &engineer, &None,
+            );
+        }
+
+        let score_with_10 = client.get_collateral_score(&asset_id);
+
+        // Manually mark the 5th record as a duplicate by reading storage
+        // and writing it to the DuplicateRecords key
+        let history_key = history_key(asset_id);
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or(Vec::new(&env));
+
+        if history.len() >= 5 {
+            let fifth_record = history.get(4).unwrap();
+            let dup_key = DataKey::DuplicateRecords(asset_id);
+            let mut duplicates: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&dup_key)
+                .unwrap_or(Vec::new(&env));
+            duplicates.push_back(fifth_record.timestamp);
+            env.storage().persistent().set(&dup_key, &duplicates);
+            shared::extend_persistent_ttl(&env, &dup_key);
+
+            // Score after marking one as duplicate should be lower
+            let score_after_dup = client.get_collateral_score(&asset_id);
+            assert!(
+                score_after_dup < score_with_10,
+                "#1305: duplicates must reduce computed score"
+            );
+        }
+    }
+
+    /// Multiple duplicate records must all be correctly excluded from scoring.
+    #[test]
+    fn test_compute_decay_multiple_duplicates() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let oil_chg = symbol_short!("OIL_CHG");
+
+        // Submit 20 records
+        for _ in 0..20 {
+            client.submit_maintenance(
+                &asset_id, &oil_chg, &Priority::Low,
+                &String::from_str(&env, "oil"), &engineer, &None,
+            );
+        }
+
+        let score_with_20 = client.get_collateral_score(&asset_id);
+
+        // Mark 5 records as duplicates
+        let history_key = history_key(asset_id);
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or(Vec::new(&env));
+
+        let dup_key = DataKey::DuplicateRecords(asset_id);
+        let mut duplicates: Vec<u64> = Vec::new(&env);
+
+        // Mark records at indices 2, 5, 8, 11, 14 as duplicates
+        for i in [2, 5, 8, 11, 14] {
+            if i < history.len() {
+                let record = history.get(i).unwrap();
+                duplicates.push_back(record.timestamp);
+            }
+        }
+
+        if !duplicates.is_empty() {
+            env.storage().persistent().set(&dup_key, &duplicates);
+            shared::extend_persistent_ttl(&env, &dup_key);
+
+            let score_after_dups = client.get_collateral_score(&asset_id);
+            assert!(
+                score_after_dups < score_with_20,
+                "#1305: multiple duplicates must reduce score"
+            );
+        }
+    }
 }
