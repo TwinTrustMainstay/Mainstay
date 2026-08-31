@@ -16887,4 +16887,367 @@ mod tests {
         );
         assert_eq!(page.len(), 0, "no matching records must return empty vec");
     }
+
+    // =========================================================================
+    // Issue #1304 — apply_decay MIN_SCORE_WITH_HISTORY floor after optimization
+    // =========================================================================
+
+    /// After optimizing apply_decay to avoid reading full maintenance history,
+    /// the floor condition (MIN_SCORE_WITH_HISTORY) must still be enforced for
+    /// assets with maintenance records.
+    #[test]
+    fn test_apply_decay_enforces_floor_with_history() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, config) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Submit one maintenance record to establish history
+        let oil_chg = symbol_short!("OIL_CHG");
+        client.submit_maintenance(
+            &asset_id, &oil_chg, &Priority::Low,
+            &String::from_str(&env, "oil"), &engineer, &None,
+        );
+
+        let initial_score = client.get_collateral_score(&asset_id);
+        assert!(initial_score > 0, "initial score must be positive");
+
+        // Decay the score below the floor over multiple decay intervals
+        let decay_intervals = (initial_score / config.decay_rate) + 2;
+        let decay_time = decay_intervals as u64 * config.decay_interval;
+        env.ledger().set_timestamp(env.ledger().timestamp() + decay_time);
+
+        // Apply decay and verify floor is enforced
+        let final_score = client.get_collateral_score(&asset_id);
+        assert_eq!(
+            final_score, MIN_SCORE_WITH_HISTORY,
+            "#1304: score must be clamped at floor even after decay"
+        );
+    }
+
+    /// An asset with no maintenance history must have zero score even after decay.
+    #[test]
+    fn test_apply_decay_no_history_returns_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _engineer_registry_client, config) = setup(&env, 0);
+        let (asset_id, _asset_owner) = register_asset(&env, &asset_registry_client);
+
+        // Register but do not submit any maintenance records
+        let score = client.get_collateral_score(&asset_id);
+        assert_eq!(score, 0, "asset with no history must score zero");
+
+        // Advance time and check score remains zero
+        let time_advanced = 2 * config.decay_interval;
+        env.ledger().set_timestamp(env.ledger().timestamp() + time_advanced);
+
+        let score_after = client.get_collateral_score(&asset_id);
+        assert_eq!(
+            score_after, 0,
+            "#1304: score must remain zero when there is no maintenance history"
+        );
+    }
+
+    // =========================================================================
+    // Issue #1305 — compute_decay duplicate record scan optimization
+    // =========================================================================
+
+    /// Duplicate records must be correctly excluded from score calculation,
+    /// ensuring the O(n*m) scan logic works correctly whether implemented
+    /// with linear search or binary search optimization.
+    #[test]
+    fn test_compute_decay_duplicate_records_excluded() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let oil_chg = symbol_short!("OIL_CHG");
+
+        // Submit 10 records to establish a baseline score
+        for _ in 0..10 {
+            client.submit_maintenance(
+                &asset_id, &oil_chg, &Priority::Low,
+                &String::from_str(&env, "oil"), &engineer, &None,
+            );
+        }
+
+        let score_with_10 = client.get_collateral_score(&asset_id);
+
+        // Manually mark the 5th record as a duplicate by reading storage
+        // and writing it to the DuplicateRecords key
+        let history_key = history_key(asset_id);
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or(Vec::new(&env));
+
+        if history.len() >= 5 {
+            let fifth_record = history.get(4).unwrap();
+            let dup_key = DataKey::DuplicateRecords(asset_id);
+            let mut duplicates: Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&dup_key)
+                .unwrap_or(Vec::new(&env));
+            duplicates.push_back(fifth_record.timestamp);
+            env.storage().persistent().set(&dup_key, &duplicates);
+            shared::extend_persistent_ttl(&env, &dup_key);
+
+            // Score after marking one as duplicate should be lower
+            let score_after_dup = client.get_collateral_score(&asset_id);
+            assert!(
+                score_after_dup < score_with_10,
+                "#1305: duplicates must reduce computed score"
+            );
+        }
+    }
+
+    /// Multiple duplicate records must all be correctly excluded from scoring.
+    #[test]
+    fn test_compute_decay_multiple_duplicates() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let oil_chg = symbol_short!("OIL_CHG");
+
+        // Submit 20 records
+        for _ in 0..20 {
+            client.submit_maintenance(
+                &asset_id, &oil_chg, &Priority::Low,
+                &String::from_str(&env, "oil"), &engineer, &None,
+            );
+        }
+
+        let score_with_20 = client.get_collateral_score(&asset_id);
+
+        // Mark 5 records as duplicates
+        let history_key = history_key(asset_id);
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or(Vec::new(&env));
+
+        let dup_key = DataKey::DuplicateRecords(asset_id);
+        let mut duplicates: Vec<u64> = Vec::new(&env);
+
+        // Mark records at indices 2, 5, 8, 11, 14 as duplicates
+        for i in [2, 5, 8, 11, 14] {
+            if i < history.len() {
+                let record = history.get(i).unwrap();
+                duplicates.push_back(record.timestamp);
+            }
+        }
+
+        if !duplicates.is_empty() {
+            env.storage().persistent().set(&dup_key, &duplicates);
+            shared::extend_persistent_ttl(&env, &dup_key);
+
+            let score_after_dups = client.get_collateral_score(&asset_id);
+            assert!(
+                score_after_dups < score_with_20,
+                "#1305: multiple duplicates must reduce score"
+            );
+        }
+    }
+
+    // =========================================================================
+    // Issue #1306 — batch_submit_maintenance event optimization
+    // =========================================================================
+
+    /// A batch of maintenance records must emit only one summary event
+    /// instead of one event per record.
+    #[test]
+    fn test_batch_submit_maintenance_emits_single_summary_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Build a batch of records
+        let oil_chg = symbol_short!("OIL_CHG");
+        let mut batch = Vec::new(&env);
+        for _ in 0..10 {
+            batch.push_back(BatchRecord {
+                task_type: oil_chg,
+                priority: Priority::Low,
+                notes: String::from_str(&env, "oil"),
+            });
+        }
+
+        // Capture events before batch submit
+        let events_before = env.events().all();
+        let events_before_count = events_before.len();
+
+        // Submit batch
+        client.batch_submit_maintenance(&asset_id, &batch, &engineer);
+
+        // Check events after batch submit
+        let events_after = env.events().all();
+        let events_after_count = events_after.len();
+
+        // For #1306: should emit minimal events (1 summary event per batch)
+        // rather than 10 individual MAINT events
+        let new_events = events_after_count - events_before_count;
+        assert!(
+            new_events <= 2,
+            "#1306: batch should emit summary event not individual MAINT events per record (got {} new events)",
+            new_events
+        );
+    }
+
+    /// Batch submit with multiple records must correctly record all submissions
+    /// while emitting only a summary event.
+    #[test]
+    fn test_batch_submit_maintenance_summary_preserves_data() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let oil_chg = symbol_short!("OIL_CHG");
+        let brake = symbol_short!("BRAKE");
+
+        // Build a batch with mixed task types
+        let mut batch = Vec::new(&env);
+        for i in 0..5 {
+            batch.push_back(BatchRecord {
+                task_type: if i % 2 == 0 { oil_chg } else { brake },
+                priority: Priority::Low,
+                notes: String::from_str(&env, "maintenance"),
+            });
+        }
+
+        client.batch_submit_maintenance(&asset_id, &batch, &engineer);
+
+        // Verify all records were stored despite summary event optimization
+        let oil_chg_records = client.get_maintenance_records_by_task_type(
+            &asset_id, &oil_chg, &0, &50,
+        );
+        let brake_records = client.get_maintenance_records_by_task_type(
+            &asset_id, &brake, &0, &50,
+        );
+
+        assert_eq!(
+            oil_chg_records.len(), 3,
+            "#1306: all OIL_CHG records must be stored despite summary event"
+        );
+        assert_eq!(
+            brake_records.len(), 2,
+            "#1306: all BRAKE records must be stored despite summary event"
+        );
+    }
+
+    // =========================================================================
+    // Issue #1307 — score_history deduplication (consecutive duplicates)
+    // =========================================================================
+
+    /// score_history must not store duplicate consecutive scores to avoid
+    /// redundant entries when score does not change after maintenance.
+    #[test]
+    fn test_score_history_no_duplicate_consecutive_scores() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let oil_chg = symbol_short!("OIL_CHG");
+
+        // Submit multiple records in sequence
+        for _ in 0..5 {
+            client.submit_maintenance(
+                &asset_id, &oil_chg, &Priority::Low,
+                &String::from_str(&env, "oil"), &engineer, &None,
+            );
+        }
+
+        // Read the score history
+        let history_key = score_history_key(asset_id);
+        let score_history: Vec<ScoreEntry> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or(Vec::new(&env));
+
+        // Verify no consecutive scores are identical
+        for i in 1..score_history.len() {
+            let current = score_history.get(i).unwrap();
+            let previous = score_history.get(i - 1).unwrap();
+            assert_ne!(
+                current.score, previous.score,
+                "#1307: score history must not contain consecutive duplicate scores at index {}",
+                i
+            );
+        }
+    }
+
+    /// Decay operations must not add duplicate scores to history if score
+    /// hasn't changed.
+    #[test]
+    fn test_apply_decay_no_duplicate_score_history_entries() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, config) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let oil_chg = symbol_short!("OIL_CHG");
+
+        // Submit a single maintenance record
+        client.submit_maintenance(
+            &asset_id, &oil_chg, &Priority::Low,
+            &String::from_str(&env, "oil"), &engineer, &None,
+        );
+
+        let score_after_submit = client.get_collateral_score(&asset_id);
+
+        // Advance time by a small amount (less than one decay interval)
+        env.ledger().set_timestamp(env.ledger().timestamp() + config.decay_interval / 2);
+
+        // Call get_collateral_score again (which may trigger decay)
+        let score_after_partial_decay = client.get_collateral_score(&asset_id);
+
+        // Read score history
+        let history_key = score_history_key(asset_id);
+        let score_history: Vec<ScoreEntry> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or(Vec::new(&env));
+
+        // If score hasn't changed, we should not have added a new entry
+        if score_after_submit == score_after_partial_decay && score_history.len() > 1 {
+            let last = score_history.get(score_history.len() - 1).unwrap();
+            let prev = score_history.get(score_history.len() - 2).unwrap();
+            assert_ne!(
+                last.score, prev.score,
+                "#1307: no duplicate consecutive scores should be added to history"
+            );
+        }
+    }
 }
