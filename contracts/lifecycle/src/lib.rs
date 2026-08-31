@@ -78,13 +78,6 @@ const SUBMISSION_RATE_WINDOW_SECS: u64 = 3600;
 /// read costs and persistent-TTL-extension costs on every call.
 const DEFAULT_MAX_SNAPSHOTS: u32 = 500;
 
-fn effective_min_collateral_score(config: &Config) -> u32 {
-    if config.min_collateral_score > 0 {
-        config.min_collateral_score
-    } else {
-        config.eligibility_threshold
-    }
-}
 /// Maximum collateral score exposed by the lifecycle contract.
 ///
 /// With the highest built-in task weight (`10`), a maximum-size batch can
@@ -1407,6 +1400,7 @@ impl Lifecycle {
         set_asset_registry_addr(&env, &asset_registry);
         set_engineer_registry_addr(&env, &engineer_registry);
 
+        let min_collateral = DEFAULT_ELIGIBILITY_THRESHOLD;
         let config = Config {
             admin: admin.clone(),
             admins: Vec::new(&env),
@@ -1421,7 +1415,7 @@ impl Lifecycle {
             decay_rate: DEFAULT_DECAY_RATE,
             decay_interval: DEFAULT_DECAY_INTERVAL,
             eligibility_threshold: DEFAULT_ELIGIBILITY_THRESHOLD,
-            min_collateral_score: DEFAULT_ELIGIBILITY_THRESHOLD,
+            min_collateral_score: if min_collateral > 0 { min_collateral } else { DEFAULT_ELIGIBILITY_THRESHOLD },
             max_notes_length: DEFAULT_MAX_NOTES_LENGTH,
             task_weights: Map::new(&env),
             max_submissions_per_hour: DEFAULT_MAX_SUBMISSIONS_PER_HOUR,
@@ -1723,10 +1717,6 @@ impl Lifecycle {
         ensure_not_paused(&env);
         admin.require_auth();
 
-        if min_collateral_score == 0 {
-            panic_with_error!(&env, ContractError::InvalidConfig);
-        }
-
         let mut config: Config = env
             .storage()
             .persistent()
@@ -1737,14 +1727,15 @@ impl Lifecycle {
         }
 
         let old_min = config.min_collateral_score;
-        config.min_collateral_score = min_collateral_score;
-        config.eligibility_threshold = min_collateral_score;
+        let normalized_score = if min_collateral_score > 0 { min_collateral_score } else { config.eligibility_threshold };
+        config.min_collateral_score = normalized_score;
+        config.eligibility_threshold = normalized_score;
         env.storage().persistent().set(&CONFIG, &config); 
         extend_persistent_ttl(&env, &CONFIG);
 
         env.events().publish(
             (symbol_short!("CFG_UPD"),),
-            (old_min, min_collateral_score),
+            (old_min, normalized_score),
         );
         env.events().publish(
             (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
@@ -1752,7 +1743,7 @@ impl Lifecycle {
                 admin,
                 env.ledger().timestamp(),
                 symbol_short!("MIN_COLL"),
-                min_collateral_score,
+                normalized_score,
             ),
         );
     }
@@ -4391,7 +4382,7 @@ impl Lifecycle {
         apply_decay(&env, asset_id, true, false, config.max_history);
 
         let effective_score = compute_read_only_collateral_score(&env, asset_id, &asset.asset_type, &config);
-        effective_score >= effective_min_collateral_score(&config)
+        effective_score >= config.min_collateral_score
     }
 
     /// Returns the timestamp of the most recent maintenance event, or None if no maintenance has been submitted.
@@ -4942,7 +4933,7 @@ impl Lifecycle {
             } else {
                 compute_read_only_collateral_score(&env, asset_id, &asset.asset_type, &config)
             };
-            results.push_back(score >= effective_min_collateral_score(&config));
+            results.push_back(score >= config.min_collateral_score);
         }
         results
     }
@@ -16933,5 +16924,41 @@ mod tests {
         assert_eq!(TTL_THRESHOLD, 518_400, "TTL_THRESHOLD should be 518400 (30 days)");
         assert_eq!(TTL_TARGET, 518_400, "TTL_TARGET should be 518400 (30 days)");
         assert_eq!(TTL_THRESHOLD, TTL_TARGET, "TTL_THRESHOLD and TTL_TARGET should be consistent");
+    }
+
+    #[test]
+    fn test_min_collateral_score_normalization_at_init() {
+        let env = Env::default();
+        let asset_registry_id = env.register(AssetRegistry, ());
+        let engineer_registry_id = env.register(EngineerRegistry, ());
+        let lifecycle_id = env.register(Lifecycle, ());
+        let admin = Address::generate(&env);
+
+        let lifecycle = LifecycleClient::new(&env, &lifecycle_id);
+        lifecycle.initialize(
+            &admin,
+            &asset_registry_id,
+            &engineer_registry_id,
+            &admin,
+            &0,
+        );
+
+        let storage = env.storage();
+        let config: Config = storage.persistent().get(&CONFIG).unwrap();
+        assert_eq!(config.min_collateral_score, DEFAULT_ELIGIBILITY_THRESHOLD, "zero min_collateral_score should be normalized to eligibility_threshold");
+        assert!(config.min_collateral_score > 0, "normalized min_collateral_score must be non-zero");
+    }
+
+    #[test]
+    fn test_min_collateral_score_normalization_on_update() {
+        let env = Env::default();
+        let (lifecycle, _, _, admin) = setup(&env, 100);
+
+        lifecycle.update_config(&admin, &0);
+
+        let storage = env.storage();
+        let config: Config = storage.persistent().get(&CONFIG).unwrap();
+        assert_eq!(config.min_collateral_score, config.eligibility_threshold, "zero min_collateral_score should be normalized to eligibility_threshold");
+        assert!(config.min_collateral_score > 0, "normalized min_collateral_score must be non-zero");
     }
 }
