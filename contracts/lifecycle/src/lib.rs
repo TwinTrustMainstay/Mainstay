@@ -6831,6 +6831,85 @@ mod tests {
         assert_eq!(client.get_collateral_score(&asset_id), 100);
     }
 
+    /// Issue #839: Verify that updating score_increment retroactively affects existing assets.
+    /// After submitting maintenance and recording a score, updating score_increment should
+    /// cause re-queries of the same asset to reflect the new increment in compute_decay.
+    #[test]
+    fn test_score_increment_update_affects_existing_asset_score() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Submit one maintenance record with default score_increment (5)
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "Initial maintenance"),
+            &engineer,
+        );
+        let initial_score = client.get_collateral_score(&asset_id);
+        assert_eq!(initial_score, 5, "Initial score should be 5 with default increment");
+
+        // Update score_increment to 10
+        client.update_score_increment(&admin, &10);
+
+        // Re-query the same asset's score without submitting new maintenance
+        // The score should be recalculated using the new increment
+        let updated_score = client.get_collateral_score(&asset_id);
+        assert_eq!(
+            updated_score, 10,
+            "Score should reflect new increment (10) for existing maintenance record after config update"
+        );
+    }
+
+    /// Issue #839: Verify that old maintenance records are weighted with the new increment
+    /// during compute_decay when score_increment is updated.
+    /// Scenario: multiple old records with an old increment, then update to new increment,
+    /// and verify the re-computed score uses the new increment for all records.
+    #[test]
+    fn test_score_increment_update_weights_old_records_correctly() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, admin) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Submit 3 maintenance records with default score_increment (5)
+        // Total expected score: 5 + 5 + 5 = 15
+        for _ in 0..3 {
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &Priority::Low,
+                &String::from_str(&env, "Old maintenance record"),
+                &engineer,
+            );
+        }
+        let score_before_update = client.get_collateral_score(&asset_id);
+        assert_eq!(
+            score_before_update, 15,
+            "Score with 3 records and default increment (5) should be 15"
+        );
+
+        // Update score_increment to 8
+        client.update_score_increment(&admin, &8);
+
+        // Re-query the score: all 3 existing records should now use the new increment (8)
+        // Expected: 8 + 8 + 8 = 24
+        let score_after_update = client.get_collateral_score(&asset_id);
+        assert_eq!(
+            score_after_update, 24,
+            "Score after updating increment to 8 should be 24 (3 * 8), reflecting new weight on old records"
+        );
+    }
+
     #[test]
     fn test_collateral_score_respects_theoretical_max_for_config_variants() {
         let variants = [(1u32, 3u32), (3u32, 5u32), (5u32, 7u32), (10u32, 12u32)];
