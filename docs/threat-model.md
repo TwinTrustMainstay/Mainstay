@@ -253,9 +253,9 @@ Testnet configuration accidentally carried to mainnet (wrong admin, wrong thresh
 ## Risk Matrix Summary
 
 | Risk Level | Count | Examples |
-|-----------|-------|----------|
-| **Critical** | 8 | TTL expiry (all contracts), pause flag expiry, front-run initialization, registry binding immutability |
-| **High** | 9 | Cross-contract state drift, unauthorized engineer maintenance, compromised issuer, loan spoofing |
+|-----------|-------|---------|
+| **Critical** | 10 | TTL expiry (all contracts), pause flag expiry, front-run initialization (DI-03 / T-LC-15), registry binding immutability |
+| **High** | 10 | Cross-contract state drift, unauthorized engineer maintenance, compromised issuer, loan spoofing, same-registry misconfiguration (T-LC-14) |
 | **Medium** | 11 | Score inflation via collusion, decay avoidance, configuration manipulation, dedup bypass |
 | **Low** | 11 | Metadata modification, history pruning, backdated credentials, griefing attacks |
 | **Informational** | 2 | Public data visibility (by design) |
