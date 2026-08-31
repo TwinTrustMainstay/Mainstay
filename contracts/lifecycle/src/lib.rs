@@ -16985,4 +16985,97 @@ mod tests {
             );
         }
     }
+
+    // =========================================================================
+    // Issue #1306 — batch_submit_maintenance event optimization
+    // =========================================================================
+
+    /// A batch of maintenance records must emit only one summary event
+    /// instead of one event per record.
+    #[test]
+    fn test_batch_submit_maintenance_emits_single_summary_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        // Build a batch of records
+        let oil_chg = symbol_short!("OIL_CHG");
+        let mut batch = Vec::new(&env);
+        for _ in 0..10 {
+            batch.push_back(BatchRecord {
+                task_type: oil_chg,
+                priority: Priority::Low,
+                notes: String::from_str(&env, "oil"),
+            });
+        }
+
+        // Capture events before batch submit
+        let events_before = env.events().all();
+        let events_before_count = events_before.len();
+
+        // Submit batch
+        client.batch_submit_maintenance(&asset_id, &batch, &engineer);
+
+        // Check events after batch submit
+        let events_after = env.events().all();
+        let events_after_count = events_after.len();
+
+        // For #1306: should emit minimal events (1 summary event per batch)
+        // rather than 10 individual MAINT events
+        let new_events = events_after_count - events_before_count;
+        assert!(
+            new_events <= 2,
+            "#1306: batch should emit summary event not individual MAINT events per record (got {} new events)",
+            new_events
+        );
+    }
+
+    /// Batch submit with multiple records must correctly record all submissions
+    /// while emitting only a summary event.
+    #[test]
+    fn test_batch_submit_maintenance_summary_preserves_data() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let oil_chg = symbol_short!("OIL_CHG");
+        let brake = symbol_short!("BRAKE");
+
+        // Build a batch with mixed task types
+        let mut batch = Vec::new(&env);
+        for i in 0..5 {
+            batch.push_back(BatchRecord {
+                task_type: if i % 2 == 0 { oil_chg } else { brake },
+                priority: Priority::Low,
+                notes: String::from_str(&env, "maintenance"),
+            });
+        }
+
+        client.batch_submit_maintenance(&asset_id, &batch, &engineer);
+
+        // Verify all records were stored despite summary event optimization
+        let oil_chg_records = client.get_maintenance_records_by_task_type(
+            &asset_id, &oil_chg, &0, &50,
+        );
+        let brake_records = client.get_maintenance_records_by_task_type(
+            &asset_id, &brake, &0, &50,
+        );
+
+        assert_eq!(
+            oil_chg_records.len(), 3,
+            "#1306: all OIL_CHG records must be stored despite summary event"
+        );
+        assert_eq!(
+            brake_records.len(), 2,
+            "#1306: all BRAKE records must be stored despite summary event"
+        );
+    }
 }
