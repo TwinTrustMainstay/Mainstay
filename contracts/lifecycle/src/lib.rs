@@ -72,6 +72,11 @@ const DEFAULT_MAX_NOTES_LENGTH: u32 = 256;
 const DEFAULT_MAX_SUBMISSIONS_PER_HOUR: u32 = 20;
 /// Length of the rolling submission-rate window, in seconds.
 const SUBMISSION_RATE_WINDOW_SECS: u64 = 3600;
+/// Default cap on the number of health snapshots retained per asset. Without
+/// a cap, a misconfigured automation loop calling `take_health_snapshot` in a
+/// tight cycle can grow `HealthSnapshots(asset_id)` without bound, inflating
+/// read costs and persistent-TTL-extension costs on every call.
+const DEFAULT_MAX_SNAPSHOTS: u32 = 500;
 
 fn effective_min_collateral_score(config: &Config) -> u32 {
     if config.min_collateral_score > 0 {
@@ -661,6 +666,26 @@ pub(crate) fn store_timelock(env: &Env, op: Symbol) {
     extend_persistent_ttl(&env, &key);
 }
 
+/// Validate that a timelocked proposal is ready to execute, then mark it
+/// executed.
+///
+/// # Atomicity guarantee
+/// `proposal.executed = true` is written to persistent storage here, in this
+/// call, **before** the caller runs the guarded operation (e.g.
+/// `crate::admin::update_score_increment`). This ordering means the
+/// "executed" flag can never be observed as `true` without the corresponding
+/// guarded operation actually having run: Soroban contract invocations are
+/// all-or-nothing — every storage write performed during an invocation
+/// (including this one) is part of the same host-managed transaction, so if
+/// anything later in the same invocation panics or the transaction fails to
+/// commit for any reason, this write is rolled back along with it. There is
+/// no intermediate state, observable by another call, in which `executed`
+/// is `true` but the guarded operation did not happen. Conversely, once this
+/// call returns normally, the flag write has succeeded and the guarded
+/// operation is guaranteed to run in the remainder of the same invocation,
+/// so a second call for the same `op` always hits the `proposal.executed`
+/// check below and is rejected with `ProposalNotFound` — double-execution of
+/// the same proposal is impossible.
 pub(crate) fn require_timelock_ready(env: &Env, op: Symbol) {
     let key = timelock_key(op);
     let mut proposal: TimelockProposal = env
@@ -1401,6 +1426,7 @@ impl Lifecycle {
             task_weights: Map::new(&env),
             max_submissions_per_hour: DEFAULT_MAX_SUBMISSIONS_PER_HOUR,
             default_task_weight: 0,
+            max_snapshots: DEFAULT_MAX_SNAPSHOTS,
         };
         env.storage().persistent().set(&CONFIG, &config);
         extend_persistent_ttl(&env, &CONFIG);
@@ -1774,6 +1800,24 @@ impl Lifecycle {
         crate::admin::update_max_engineer_history(env, admin, new_max);
     }
 
+    /// Admin-only function to update the per-asset health-snapshot retention cap.
+    ///
+    /// Once `HealthSnapshots(asset_id)` reaches `new_max` entries, `take_health_snapshot`
+    /// evicts the oldest snapshot(s) before appending the new one, bounding storage,
+    /// read costs, and TTL-extension costs regardless of how often snapshots are taken.
+    ///
+    /// # Arguments
+    /// * `admin`   - The admin address that must match the stored config admin.
+    /// * `new_max` - New per-asset snapshot cap (must be > 0).
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialised.
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin.
+    /// - [`ContractError::InvalidConfig`] if `new_max` is 0.
+    pub fn update_max_snapshots(env: Env, admin: Address, new_max: u32) {
+        crate::admin::update_max_snapshots(env, admin, new_max);
+    }
+
     /// Admin-only function to update the maximum allowed notes length per maintenance record.
     ///
     /// # Arguments
@@ -2107,6 +2151,27 @@ impl Lifecycle {
         }
         if !spec_matched {
             panic_with_error!(&env, ContractError::SpecializationMismatch);
+        }
+
+        // Re-check the decommissioned/frozen state immediately before committing
+        // any history/score writes. The initial check above happens before the
+        // engineer-authorization cross-contract calls (credential status,
+        // engineer-authorized check, specialization lookup); those calls run
+        // under the reentrancy guard acquired earlier, but an admin could still
+        // decommission the asset via a separate top-level transaction that lands
+        // between when this invocation started and when it reaches this point
+        // in the ledger's transaction ordering. Re-reading the frozen flag here,
+        // directly adjacent to the first write, closes that window: either both
+        // checks observe "not decommissioned" and the write proceeds, or the
+        // second check catches a decommission and the whole invocation reverts
+        // atomically (Soroban invocations are all-or-nothing), so no maintenance
+        // record can ever be committed against a decommissioned asset.
+        if env.storage().persistent().get::<_, bool>(&frozen_key(asset_id)).unwrap_or(false) {
+            panic_with_error!(&env, ContractError::AssetDecommissioned);
+        }
+        let status = asset_client.asset_status(&asset_id);
+        if status == AssetStatus::Decommissioned {
+            panic_with_error!(&env, ContractError::AssetDecommissioned);
         }
 
         let timestamp = env.ledger().timestamp();
@@ -4976,13 +5041,14 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::AssetDecommissioned);
         }
 
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get::<_, Config>(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
         let score = {
             let stored: u32 = env.storage().persistent().get(&score_key(asset_id)).unwrap_or(0);
-            let config: Config = env
-                .storage()
-                .persistent()
-                .get::<_, Config>(&CONFIG)
-                .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
             let last_update: u64 = env
                 .storage()
                 .persistent()
@@ -5020,6 +5086,25 @@ impl Lifecycle {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
         snapshots.push_back(snapshot.clone());
+
+        // Enforce the configurable cap on retained snapshots (#max_snapshots).
+        // A misconfigured automation loop calling this in a tight cycle would
+        // otherwise grow HealthSnapshots(asset_id) without bound, inflating
+        // both read costs and persistent-TTL-extension costs on every future
+        // call. Evict the oldest entries first so the list always reflects
+        // the most recent history.
+        let cap = if config.max_snapshots == 0 {
+            DEFAULT_MAX_SNAPSHOTS
+        } else {
+            config.max_snapshots
+        };
+        if cap > 0 && snapshots.len() > cap {
+            let excess = snapshots.len() - cap;
+            for _ in 0..excess {
+                snapshots.remove(0);
+            }
+        }
+
         env.storage().persistent().set(&key, &snapshots);
         extend_persistent_ttl(&env, &key);
 
@@ -5468,6 +5553,62 @@ mod tests {
         let history = client.get_maintenance_history(&asset_id);
         assert_eq!(history.get(0).unwrap().previous_record_hash, None);
         assert!(client.verify_maintenance_chain_integrity(&asset_id));
+    }
+
+    /// Regression test for the decommission-vs-submit race window: an asset
+    /// decommissioned between the point an engineer's authorization checks
+    /// begin and the point history/score writes would commit must never end
+    /// up with a maintenance record. This simulates the "race" by
+    /// decommissioning the asset via the asset-registry admin and then
+    /// immediately calling submit_maintenance for the same asset/engineer
+    /// pair that was fully authorized beforehand — the second, adjacent-to-
+    /// the-write frozen/status check added to submit_maintenance must catch
+    /// it even though the engineer authorization itself is still valid.
+    #[test]
+    fn test_decommission_submit_race_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_id, owner, engineer) = setup_chain_test(&env);
+
+        // Engineer is fully authorized and a prior submission succeeds.
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "Pre-decommission service"),
+            &engineer,
+            &None,
+        );
+        assert_eq!(client.get_maintenance_history(&asset_id).len(), 1);
+
+        // Simulate the race: the asset is decommissioned by a separate
+        // transaction that lands after this engineer's authorization was
+        // granted, but before their next submission is processed.
+        client.decommission_asset(&owner, &asset_id);
+
+        // The submission must be rejected atomically — no partial write,
+        // no record appended — regardless of when in the invocation the
+        // decommissioned state became visible.
+        let result = client.try_submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &Priority::Low,
+            &String::from_str(&env, "Post-decommission race attempt"),
+            &engineer,
+            &None,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetDecommissioned as u32
+            )))
+        );
+        assert_eq!(
+            client.get_maintenance_history(&asset_id).len(),
+            1,
+            "no maintenance record must be committed for a decommissioned asset, \
+             even when the submitting engineer was authorized before decommission"
+        );
     }
 
     #[test]
@@ -8652,6 +8793,41 @@ mod tests {
         client.execute_pause(&admin);
 
         assert!(client.is_paused());
+    }
+
+    /// Regression test for the executed-flag atomicity guarantee documented on
+    /// `require_timelock_ready`: once a timelocked proposal has been executed,
+    /// a second call for the same operation must be rejected with
+    /// `ProposalNotFound` rather than silently re-running the guarded
+    /// operation. This verifies double-execution is impossible.
+    #[test]
+    fn test_execute_update_score_increment_rejects_double_execution() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+
+        client.propose_config_update(&admin, &symbol_short!("SC_INC"));
+        let base = env.ledger().timestamp();
+        env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+
+        // First execution succeeds and applies the new value.
+        client.execute_update_score_increment(&admin, &7);
+        assert_eq!(client.get_config().score_increment, 7);
+
+        // Second execution of the same (now-executed) proposal must be
+        // rejected — the executed flag was already committed atomically
+        // with the first run, so there is no proposal left to execute.
+        let result = client.try_execute_update_score_increment(&admin, &99);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::ProposalNotFound as u32,
+            )))
+        );
+
+        // Config value from the first (only) successful execution is unchanged.
+        assert_eq!(client.get_config().score_increment, 7);
     }
 
     #[test]
@@ -13552,6 +13728,68 @@ mod tests {
             "snapshots should be in chronological order"
         );
         assert_eq!(snapshots.get(1).unwrap().maintenance_count, 2);
+    }
+
+    /// Regression test for the unbounded-snapshot-growth issue: a misconfigured
+    /// automation loop calling `take_health_snapshot` repeatedly must not be able
+    /// to grow `HealthSnapshots(asset_id)` past the configured `max_snapshots`
+    /// cap. Oldest snapshots must be evicted first so the retained list always
+    /// reflects the most recent history.
+    #[test]
+    fn test_take_health_snapshot_enforces_max_snapshots_cap() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _, admin) = setup(&env, 0);
+        let (asset_id, _) = register_asset(&env, &asset_registry_client);
+
+        // Tighten the cap to 3 so the test doesn't need 500+ iterations.
+        client.update_max_snapshots(&admin, &3);
+
+        // Take 5 snapshots at distinct timestamps.
+        let mut timestamps = Vec::new(&env);
+        for _ in 0..5u32 {
+            let snap = client.take_health_snapshot(&asset_id);
+            timestamps.push_back(snap.snapshot_timestamp);
+            env.ledger().with_mut(|li| li.timestamp += 10);
+        }
+
+        let snapshots = client.get_health_snapshots(&asset_id);
+        assert_eq!(
+            snapshots.len(),
+            3,
+            "snapshot list must be capped at max_snapshots (3), not grow to 5"
+        );
+
+        // The retained snapshots must be the 3 most recent (oldest-first eviction).
+        let expected_oldest_retained = timestamps.get(2).unwrap();
+        assert_eq!(
+            snapshots.get(0).unwrap().snapshot_timestamp,
+            expected_oldest_retained,
+            "the two oldest snapshots must have been evicted first"
+        );
+        assert_eq!(
+            snapshots.get(2).unwrap().snapshot_timestamp,
+            timestamps.get(4).unwrap(),
+            "the most recent snapshot must always be retained"
+        );
+    }
+
+    /// `update_max_snapshots` must reject a zero cap (which would make every
+    /// `take_health_snapshot` call immediately evict its own new entry).
+    #[test]
+    fn test_update_max_snapshots_rejects_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, _, admin) = setup(&env, 0);
+
+        let result = client.try_update_max_snapshots(&admin, &0);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidConfig as u32
+            )))
+        );
     }
 
     #[test]

@@ -2352,7 +2352,16 @@ impl AssetRegistry {
             panic_with_error!(&env, ContractError::TypeInUse);
         }
 
-        let mut allowed_types = allowed_asset_types(&env);
+        // Guard: removing the last remaining allowed asset type would make
+        // `register_asset`'s allowlist check reject every future registration
+        // with no way to recover on-chain. Reject the removal instead so at
+        // least one allowed type always remains.
+        let allowed_types = allowed_asset_types(&env);
+        let contains_type = allowed_types.iter().any(|existing| existing == asset_type);
+        if contains_type && allowed_types.len() == 1 {
+            panic_with_error!(&env, ContractError::InvalidAssetType);
+        }
+
         let mut updated_types = Vec::new(&env);
         for existing in allowed_types.iter() {
             if existing != asset_type {
@@ -6022,6 +6031,34 @@ mod tests {
         client.deregister_asset(&owner, &id);
         client.remove_asset_type(&admin, &symbol_short!("GENSET"));
         assert!(!client.is_valid_asset_type(&symbol_short!("GENSET")));
+    }
+
+    #[test]
+    fn test_remove_last_asset_type_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        // Only one allowed type exists; removing it must be rejected so that
+        // register_asset never faces an empty allowlist.
+        assert_eq!(
+            client.try_remove_asset_type(&admin, &symbol_short!("GENSET")),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidAssetType as u32
+            )))
+        );
+        assert!(client.is_valid_asset_type(&symbol_short!("GENSET")));
+
+        // Adding a second type allows the first to be removed.
+        client.add_asset_type(&admin, &symbol_short!("PUMP"));
+        client.remove_asset_type(&admin, &symbol_short!("GENSET"));
+        assert!(!client.is_valid_asset_type(&symbol_short!("GENSET")));
+        assert!(client.is_valid_asset_type(&symbol_short!("PUMP")));
     }
 
     #[test]
