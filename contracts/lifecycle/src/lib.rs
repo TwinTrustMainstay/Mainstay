@@ -17078,4 +17078,97 @@ mod tests {
             "#1306: all BRAKE records must be stored despite summary event"
         );
     }
+
+    // =========================================================================
+    // Issue #1307 — score_history deduplication (consecutive duplicates)
+    // =========================================================================
+
+    /// score_history must not store duplicate consecutive scores to avoid
+    /// redundant entries when score does not change after maintenance.
+    #[test]
+    fn test_score_history_no_duplicate_consecutive_scores() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let oil_chg = symbol_short!("OIL_CHG");
+
+        // Submit multiple records in sequence
+        for _ in 0..5 {
+            client.submit_maintenance(
+                &asset_id, &oil_chg, &Priority::Low,
+                &String::from_str(&env, "oil"), &engineer, &None,
+            );
+        }
+
+        // Read the score history
+        let history_key = score_history_key(asset_id);
+        let score_history: Vec<ScoreEntry> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or(Vec::new(&env));
+
+        // Verify no consecutive scores are identical
+        for i in 1..score_history.len() {
+            let current = score_history.get(i).unwrap();
+            let previous = score_history.get(i - 1).unwrap();
+            assert_ne!(
+                current.score, previous.score,
+                "#1307: score history must not contain consecutive duplicate scores at index {}",
+                i
+            );
+        }
+    }
+
+    /// Decay operations must not add duplicate scores to history if score
+    /// hasn't changed.
+    #[test]
+    fn test_apply_decay_no_duplicate_score_history_entries() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, config) = setup(&env, 0);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+        client.authorize_engineer(&asset_owner, &asset_id, &engineer);
+
+        let oil_chg = symbol_short!("OIL_CHG");
+
+        // Submit a single maintenance record
+        client.submit_maintenance(
+            &asset_id, &oil_chg, &Priority::Low,
+            &String::from_str(&env, "oil"), &engineer, &None,
+        );
+
+        let score_after_submit = client.get_collateral_score(&asset_id);
+
+        // Advance time by a small amount (less than one decay interval)
+        env.ledger().set_timestamp(env.ledger().timestamp() + config.decay_interval / 2);
+
+        // Call get_collateral_score again (which may trigger decay)
+        let score_after_partial_decay = client.get_collateral_score(&asset_id);
+
+        // Read score history
+        let history_key = score_history_key(asset_id);
+        let score_history: Vec<ScoreEntry> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or(Vec::new(&env));
+
+        // If score hasn't changed, we should not have added a new entry
+        if score_after_submit == score_after_partial_decay && score_history.len() > 1 {
+            let last = score_history.get(score_history.len() - 1).unwrap();
+            let prev = score_history.get(score_history.len() - 2).unwrap();
+            assert_ne!(
+                last.score, prev.score,
+                "#1307: no duplicate consecutive scores should be added to history"
+            );
+        }
+    }
 }
