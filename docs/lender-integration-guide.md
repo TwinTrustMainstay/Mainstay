@@ -133,6 +133,8 @@ fn get_collateral_score_batch(env: Env, asset_ids: Vec<u64>) -> Vec<u32>;
 | 50–74 | Threshold met, moderate quality | **Accept** — standard collateral |
 | 75–100 | Strong maintenance record | **Accept** — premium collateral |
 
+> **Note:** This table applies to `get_collateral_score`. If you use `AssetRegistry::get_lifecycle_score` instead, see [`get_lifecycle_score` and the `NO_LIFECYCLE_HISTORY_SCORE` Sentinel](#get_lifecycle_score-and-the-no_lifecycle_history_score-sentinel) — it uses `u32::MAX` as a sentinel for "no history," not `0`.
+
 ### Verification Before Lending
 
 Always verify these before issuing a loan:
@@ -173,6 +175,60 @@ Scores decay over time. The decay is applied **lazily** — only when `get_colla
 - **Always call `get_collateral_score` at decision time** — never cache a score from a previous block
 - A score that was 55 yesterday might be 50 today if the decay interval boundary was crossed
 - Gas cost is modest: the read is a cross-contract call but the decay computation is local
+
+### `get_lifecycle_score` and the `NO_LIFECYCLE_HISTORY_SCORE` Sentinel
+
+`AssetRegistry::get_lifecycle_score(asset_id, lifecycle_contract)` is a convenience wrapper that cross-calls the Lifecycle contract directly from the AssetRegistry, so a lender only needs to hold one contract reference. Unlike `get_collateral_score` (which returns a plain `u32` in `[0, 100]`), `get_lifecycle_score` returns a value from a **different codomain**: it uses `NO_LIFECYCLE_HISTORY_SCORE` (`u32::MAX`, i.e. `4294967295`) as a sentinel meaning *"this asset has never had a maintenance record submitted."*
+
+**This is the single most important gotcha in this guide.** An integrator who does not check for the sentinel will observe a score of `4294967295` and may misread it as an extremely high — and therefore excellent — collateral score, when it actually means the opposite: **there is no verifiable maintenance history at all.**
+
+| Return value | Meaning | Lending Decision |
+|---|---|---|
+| `NO_LIFECYCLE_HISTORY_SCORE` (`u32::MAX`) | No maintenance record has ever been submitted for this asset | **Reject** — treat identically to a score of 0, never as a high score |
+| `0..=100` | A real collateral score, same semantics as `get_collateral_score` | Use the [Score Interpretation](#score-interpretation) table above |
+
+#### Example handling code (Rust / soroban-sdk)
+
+```rust
+use asset_registry::NO_LIFECYCLE_HISTORY_SCORE;
+
+let raw = asset_registry_client.get_lifecycle_score(&asset_id, &lifecycle_contract);
+
+let score = match raw {
+    NO_LIFECYCLE_HISTORY_SCORE => {
+        // Sentinel — do NOT treat this as a valid score.
+        return Err(LendingError::NoMaintenanceHistory);
+    }
+    valid_score => valid_score,
+};
+
+if score < 50 {
+    return Err(LendingError::CollateralScoreTooLow);
+}
+```
+
+#### Example handling code (TypeScript / Stellar SDK)
+
+```typescript
+const NO_LIFECYCLE_HISTORY_SCORE = 4294967295; // u32::MAX
+
+const rawScore = await assetRegistryContract.get_lifecycle_score({
+  asset_id: assetId,
+  lifecycle_contract: lifecycleContractId,
+});
+
+if (rawScore === NO_LIFECYCLE_HISTORY_SCORE) {
+  // Sentinel value — asset has no maintenance history. Reject, do not
+  // interpret as a high score.
+  throw new Error("Asset has no maintenance history; cannot use as collateral");
+}
+
+if (rawScore < 50) {
+  throw new Error("Collateral score below minimum threshold");
+}
+```
+
+> **Cross-reference:** See [Score Interpretation](#score-interpretation) above for the normal `0-100` score semantics used by `get_collateral_score`. Always check for `NO_LIFECYCLE_HISTORY_SCORE` **before** applying the threshold logic from that table when using `get_lifecycle_score` instead of `get_collateral_score`.
 
 ---
 

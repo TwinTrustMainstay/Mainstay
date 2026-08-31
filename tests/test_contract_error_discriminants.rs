@@ -102,7 +102,7 @@ fn test_lifecycle_discriminants_are_unique() {
         EngineerNotAuthorized, HistoryCapReached, IndexOutOfBounds, InsufficientSigners,
         InvalidConfig, InvalidTaskType, NoMaintenanceHistory, NotInitialized, NotesTooLong, Paused,
         PendingAdminAlreadyExists, ProposalNotFound, SameRegistryAddress, ScoreFrozen,
-        ScoreOverflow, TimelockNotExpired, UnauthorizedAdmin, UnauthorizedEngineer,
+        ScoreOverflow, TimelockNotExpired, TooManyAdmins, UnauthorizedAdmin, UnauthorizedEngineer,
         UnauthorizedOwner, ZeroAddress,
     };
 
@@ -132,6 +132,7 @@ fn test_lifecycle_discriminants_are_unique() {
         BatchTooLarge as u32,
         InsufficientSigners as u32,
         DuplicateAdmin as u32,
+        TooManyAdmins as u32,
     ];
 
     assert_unique_discriminants(&discriminants, "Lifecycle");

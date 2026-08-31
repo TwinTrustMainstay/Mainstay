@@ -153,6 +153,17 @@ stellar contract invoke --id LC_ID --network testnet --source deployer -- initia
   --max_history 200
 ```
 
+> **Security (#1254): `asset_registry` and `engineer_registry` must be distinct addresses.**
+> The lifecycle `initialize` function validates that `AR_ID` ≠ `ER_ID`. Passing the same
+> contract address for both registries is rejected with `ContractError::SameRegistryAddress`
+> (error code 13). This prevents a class of misconfiguration where cross-contract calls to
+> asset and engineer registries would silently resolve to the same contract, returning
+> semantically incorrect data.
+>
+> If this error is returned during initialization, verify that you are passing the correct
+> Asset Registry ID and Engineer Registry ID — they must be the IDs of two different deployed
+> contracts.
+
 ### 3.4 Initialize Lending Contract
 ```bash
 stellar contract invoke --id LN_ID --network testnet --source deployer -- initialize \
@@ -189,6 +200,43 @@ stellar contract invoke --id LC_ID --network testnet --source any -- get_collate
 ```bash
 stellar contract invoke --id LN_ID --network testnet --source any -- get_config
 ```
+
+### 4.5 Post-Deploy Configuration: `max_submissions_per_hour`
+
+The Lifecycle contract enforces a per-engineer rate limit on `submit_maintenance` calls via the `max_submissions_per_hour` config field. **`0` disables rate limiting entirely** — every submission is accepted regardless of frequency. The stock initializer sets this to a conservative default (`DEFAULT_MAX_SUBMISSIONS_PER_HOUR = 20`), but any operator who has customized initialization, restored config from a template, or called `update_max_submissions_per_hour` with `0` while testing should not assume rate limiting is active. **Always explicitly confirm and set this value as part of post-deploy configuration — do not rely on the default silently being correct for your deployment.**
+
+#### Setting the value
+```bash
+stellar contract invoke --id LC_ID --network testnet --source deployer -- \
+  update_max_submissions_per_hour --admin ADMIN_ADDRESS --new_max 30
+```
+
+#### Recommended values by fleet size
+
+| Expected fleet size (active engineers) | Recommended `max_submissions_per_hour` | Rationale |
+|---|---|---|
+| Small (< 10 engineers, pilot/testnet) | 10–15 | Tight cap; easy to spot anomalous submission bursts during early rollout |
+| Medium (10–100 engineers) | 20–30 | Matches contract default; covers routine multi-asset maintenance days without throttling legitimate work |
+| Large (100–1,000 engineers) | 40–60 | Higher ceiling for engineers servicing multiple assets per shift; pair with off-chain alerting on sustained near-cap usage |
+| Very large / fleet-management integrators (1,000+ engineers, automated IoT-triggered submissions) | 60–100, or per-engineer overrides if supported | High-volume automated submission flows need headroom; monitor `MAINT` event rate per engineer address to tune further |
+
+These are starting points, not hard rules — tune based on observed submission patterns from `MAINT` event volume (see [Section 5.1](#51-event-monitoring)) during the first weeks of operation.
+
+#### Verifying rate limiting is active
+After configuring the value, confirm it took effect and is actually enforced:
+
+```bash
+# 1. Confirm the configured value is non-zero
+stellar contract invoke --id LC_ID --network testnet --source any -- get_config
+# Inspect the returned config struct's max_submissions_per_hour field — it must not be 0.
+
+# 2. Confirm the per-engineer eligibility check reflects the configured cap
+stellar contract invoke --id LC_ID --network testnet --source any -- \
+  check_engineer_submission_rate --engineer ENGINEER_ADDRESS
+# Returns true/false based on the engineer's rolling submission count vs. max_submissions_per_hour.
+```
+
+If `get_config` reports `max_submissions_per_hour: 0`, rate limiting is **off** — treat this as a deployment gap and set an appropriate value immediately using the command above before handing the contract off to operations.
 
 ## 5. Monitoring Recommendations
 Mainstay contracts are critical for asset financing. Active monitoring is recommended.
@@ -320,6 +368,8 @@ stellar contract invoke --id LC_ID --network mainnet --source deployer -- initia
   --engineer_registry ER_ID \
   --admin <MULTISIG_ADMIN_ADDRESS> \
   --max_history 200
+# Note: AR_ID and ER_ID must be different addresses.
+# Passing the same address for both will return SameRegistryAddress (error 13).
 
 # Initialize Lending
 stellar contract invoke --id LN_ID --network mainnet --source deployer -- initialize \

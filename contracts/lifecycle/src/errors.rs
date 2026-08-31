@@ -64,6 +64,8 @@ pub enum ContractError {
     RateLimitExceeded = 37,
     /// Bulk engineer authorization revocation exceeds the maximum allowed batch size.
     BatchRevokeTooLarge = 38,
+    /// The admins list supplied to set_admin_quorum exceeds the maximum allowed size (10).
+    TooManyAdmins = 39,
 }
 
 impl From<SharedContractError> for ContractError {

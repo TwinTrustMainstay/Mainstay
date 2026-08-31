@@ -20,7 +20,7 @@ use crate::{
     set_engineer_registry_addr, store_timelock, require_timelock_ready,
     CONFIG, PAUSED_KEY, PENDING_ADMIN_KEY,
     EVENT_ADMIN_SET, EVENT_PROP_ADMIN, EVENT_REG_AST, EVENT_REG_ENG, EVENT_RST_SCR,
-    TTL_THRESHOLD, TTL_TARGET,
+    TTL_THRESHOLD, TTL_TARGET, MAX_ADMINS,
 };
 use crate::events::EVENT_PRUNED;
 use shared::extend_persistent_ttl;
@@ -264,6 +264,12 @@ pub(crate) fn set_admin_quorum(env: Env, admin: Address, new_admins: Vec<Address
     if threshold > 0 && threshold > new_admins.len() {
         panic_with_error!(&env, ContractError::InvalidConfig);
     }
+    // #1259: Hard cap — admin lists must not exceed MAX_ADMINS (10).
+    // require_quorum iterates the full list; an unbounded list could push
+    // per-call compute toward Soroban instruction limits (DoS vector).
+    if new_admins.len() > MAX_ADMINS {
+        panic_with_error!(&env, ContractError::TooManyAdmins);
+    }
     // #1195: Reject lists that contain any repeated address.  A duplicate
     // inflates the apparent quorum count so that fewer real signers than
     // `threshold` could satisfy `require_quorum`, undermining the security
@@ -426,10 +432,50 @@ pub(crate) fn update_max_engineer_history(env: Env, admin: Address, new_max: u32
     );
 }
 
-pub(crate) fn update_max_notes_length(env: Env, admin: Address, new_max: u32) {
+/// Admin-only function to update the per-asset health-snapshot retention cap.
+///
+/// # Arguments
+/// * `admin`   - The admin address that must match the stored config admin.
+/// * `new_max` - New cap on the number of snapshots kept per asset in
+///               `HealthSnapshots(asset_id)` (must be > 0). When
+///               `take_health_snapshot` would exceed this cap, the oldest
+///               snapshots are evicted first.
+///
+/// # Panics
+/// - [`ContractError::NotInitialized`] if the contract has not been initialised.
+/// - [`ContractError::UnauthorizedAdmin`] if the caller is not the admin.
+/// - [`ContractError::InvalidConfig`] if `new_max` is 0.
+pub(crate) fn update_max_snapshots(env: Env, admin: Address, new_max: u32) {
     ensure_not_paused(&env);
     admin.require_auth();
     if new_max == 0 {
+        panic_with_error!(&env, ContractError::InvalidConfig);
+    }
+    let mut config: Config = env.storage().persistent().get(&CONFIG)
+        .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+    if config.admin != admin {
+        panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+    }
+    config.max_snapshots = new_max;
+    env.storage().persistent().set(&CONFIG, &config);
+    extend_persistent_ttl(&env, &CONFIG);
+    env.events().publish(
+        (symbol_short!("UPD_SNAP"), admin.clone()),
+        new_max,
+    );
+    env.events().publish(
+        (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
+        (admin, env.ledger().timestamp(), symbol_short!("MAX_SNAP"), new_max),
+    );
+}
+
+pub(crate) fn update_max_notes_length(env: Env, admin: Address, new_max: u32) {
+    ensure_not_paused(&env);
+    admin.require_auth();
+    // #1258: A max_notes_length < 10 lets notes trivially bypass meaningful
+    // content validation. Zero in particular turns the length guard into
+    // `notes.len() > 0`, accepting any non-empty string unconditionally.
+    if new_max < 10 {
         panic_with_error!(&env, ContractError::InvalidConfig);
     }
     let mut config: Config = env.storage().persistent().get(&CONFIG)
@@ -450,7 +496,8 @@ pub(crate) fn update_max_notes_length(env: Env, admin: Address, new_max: u32) {
 pub(crate) fn set_max_notes_length(env: Env, admin: Address, length: u32) {
     ensure_not_paused(&env);
     admin.require_auth();
-    if length == 0 {
+    // #1258: Minimum 10 characters to prevent trivial bypass of notes validation.
+    if length < 10 {
         panic_with_error!(&env, ContractError::InvalidConfig);
     }
     let mut config: Config = env.storage().persistent().get(&CONFIG)

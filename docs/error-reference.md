@@ -141,6 +141,20 @@ This document lists every `ContractError` variant across the three core contract
 | 22 | `AssetDecommissioned` | The asset is decommissioned and cannot accept maintenance records. |
 | 23 | `BatchTooLarge` | Batch submission exceeds the maximum allowed batch size (DoS / gas-limit guard). |
 | 24 | `InsufficientSigners` | Fewer valid signers were provided than the configured `admin_threshold` requires. |
+| 25 | `Reentrancy` | A reentrant call was detected: the contract is already executing `submit_maintenance`. |
+| 26 | `DuplicateAdmin` | The admins list supplied to `set_admin_quorum` contains a duplicate address. |
+| 27 | `SnapshotNotFound` | The requested health snapshot index does not exist for the given asset. |
+| 28 | `InsufficientPredictionData` | Fewer than 2 matching task-type records exist; cannot compute a prediction. |
+| 29 | `WeightProposalAlreadyExists` | A weight-change proposal already exists and has not been executed yet. |
+| 30 | `SpecializationMismatch` | Engineer's specialization does not match the asset's type. |
+| 31 | `RecurringTaskNotFound` | No recurring task exists with the given `task_id` for this asset. |
+| 32 | `RecurringTaskInactive` | The recurring task exists but is not active. |
+| 33 | `DuplicateRecurringTask` | A recurring task with an equivalent schedule already exists for this asset. |
+| 34 | `InvalidRecurringSchedule` | The recurring task `interval_type`/`interval_value` combination is invalid. |
+| 35 | `DuplicateRecordNotFound` | No duplicate maintenance record exists with the given timestamp. |
+| 36 | `StandardAlreadyRegistered` | A compliance standard is already registered for this asset type. |
+| 37 | `RateLimitExceeded` | Engineer has exceeded the configured `max_submissions_per_hour` rate limit. |
+| 38 | `BatchRevokeTooLarge` | Bulk engineer authorization revocation exceeds the maximum allowed batch size. |
 
 ### Resolution guidance
 
@@ -170,6 +184,20 @@ This document lists every `ContractError` variant across the three core contract
 | `AssetDecommissioned` | The asset has been decommissioned. No new maintenance records can be submitted for decommissioned assets. |
 | `BatchTooLarge` | Split the batch into chunks of ≤ MAX_BATCH_SIZE records per call. |
 | `InsufficientSigners` | Ensure the required number of co-signers from the admin quorum have signed the transaction. Check `admin_threshold` in the contract config. |
+| `Reentrancy` | Do not call `submit_maintenance` recursively (e.g. via a callback triggered mid-execution). Wait for the outer call to complete. |
+| `DuplicateAdmin` | Remove duplicate addresses from the list passed to `set_admin_quorum`; each admin address must appear exactly once. |
+| `SnapshotNotFound` | Call `get_health_snapshots` to list valid indices before requesting a specific snapshot. |
+| `InsufficientPredictionData` | Submit at least 2 maintenance records of the same `task_type` before requesting a prediction for that type. |
+| `WeightProposalAlreadyExists` | Wait for the pending weight-change proposal to be executed or expire before proposing a new one. |
+| `SpecializationMismatch` | Verify the engineer's specializations (via the engineer registry) include the asset's `asset_type` before submitting maintenance. |
+| `RecurringTaskNotFound` | Call `get_recurring_tasks(asset_id)` to confirm the `task_id` exists before referencing it. |
+| `RecurringTaskInactive` | Reactivate the recurring task, or create a new one, before calling `execute_recurring_task`. |
+| `DuplicateRecurringTask` | Query existing recurring tasks for the asset before adding a new one with the same schedule. |
+| `InvalidRecurringSchedule` | Ensure `interval_type` is a supported unit and `interval_value` is a positive integer within the allowed range. |
+| `DuplicateRecordNotFound` | Verify the timestamp against `get_maintenance_history` before calling the duplicate-flagging function. |
+| `StandardAlreadyRegistered` | Query the asset type's registered compliance standards before attempting to register a new one. |
+| `RateLimitExceeded` | Wait until the current hourly window resets, or reduce submission frequency to stay within `max_submissions_per_hour`. |
+| `BatchRevokeTooLarge` | Split the batch into chunks within the maximum allowed batch-revoke size. |
 
 ---
 
