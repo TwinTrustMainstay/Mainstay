@@ -1620,9 +1620,7 @@ impl Lifecycle {
         config.admins = new_admins.clone();
         config.admin_threshold = threshold;
         env.storage().persistent().set(&CONFIG, &config);
-        env.storage()
-            .persistent()
-            .extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &CONFIG);
 
         env.events().publish(
             (symbol_short!("SET_QRUM"), admin.clone()),
@@ -5095,11 +5093,7 @@ impl Lifecycle {
                     pruned.push_back(valuation_history.get(i).unwrap());
                 }
                 env.storage().persistent().set(&valuation_history_key, &pruned);
-                env.storage().persistent().extend_ttl(
-                    &valuation_history_key,
-                    TTL_THRESHOLD,
-                    TTL_TARGET,
-                );
+                extend_persistent_ttl(&env, &valuation_history_key);
             }
         }
 
@@ -16932,5 +16926,12 @@ mod tests {
         let link = next_chain_link(&env, &history);
         let expected_hash = hash_maintenance_record(&env, &record2);
         assert_eq!(link.unwrap(), expected_hash, "chain link must use the last record");
+    }
+
+    #[test]
+    fn test_consistent_ttl_constants() {
+        assert_eq!(TTL_THRESHOLD, 518_400, "TTL_THRESHOLD should be 518400 (30 days)");
+        assert_eq!(TTL_TARGET, 518_400, "TTL_TARGET should be 518400 (30 days)");
+        assert_eq!(TTL_THRESHOLD, TTL_TARGET, "TTL_THRESHOLD and TTL_TARGET should be consistent");
     }
 }

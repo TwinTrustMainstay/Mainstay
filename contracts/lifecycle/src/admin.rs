@@ -294,7 +294,7 @@ pub(crate) fn set_admin_quorum(env: Env, admin: Address, new_admins: Vec<Address
     config.admins = new_admins.clone();
     config.admin_threshold = threshold;
     env.storage().persistent().set(&CONFIG, &config);
-    env.storage().persistent().extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
+    extend_persistent_ttl(&env, &CONFIG);
     env.events().publish(
         (symbol_short!("SET_QRUM"), admin.clone()),
         (new_admins, threshold),
@@ -529,7 +529,7 @@ pub(crate) fn set_eligibility_threshold(env: Env, admin: Address, value: u32) {
     let old = config.eligibility_threshold;
     config.eligibility_threshold = value;
     env.storage().persistent().set(&CONFIG, &config);
-    env.storage().persistent().extend_ttl(&CONFIG, TTL_THRESHOLD, TTL_TARGET);
+    extend_persistent_ttl(&env, &CONFIG);
     env.events().publish((symbol_short!("SET_ELIG"), admin.clone()), (old, value));
     env.events().publish(
         (symbol_short!("ADM_AUD"), symbol_short!("CFG_UPD")),
@@ -571,7 +571,7 @@ pub(crate) fn update_scoring_weights(
     }
     let key = scoring_weights_key(&env, &asset_type);
     env.storage().persistent().set(&key, &weights_json);
-    env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    extend_persistent_ttl(&env, &key);
     env.events().publish(
         (symbol_short!("SCR_WT"), asset_type.clone()),
         weights_json.clone(),
@@ -760,7 +760,7 @@ pub(crate) fn prune_asset_history(env: Env, admin: Address, asset_id: u64) {
             let mut kept: Vec<(u64, u64)> = Vec::new(&env);
             for i in start..vh.len() { kept.push_back(vh.get(i).unwrap()); }
             env.storage().persistent().set(&val_key, &kept);
-            env.storage().persistent().extend_ttl(&val_key, TTL_THRESHOLD, TTL_TARGET);
+            extend_persistent_ttl(&env, &val_key);
         }
     }
     env.events().publish((symbol_short!("PRUNE"), admin.clone()), asset_id);
