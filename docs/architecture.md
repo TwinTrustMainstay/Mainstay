@@ -1,6 +1,6 @@
 # Architecture Overview
 
-Mainstay is composed of three independent Soroban smart contracts deployed on the Stellar network. Each contract owns a distinct domain and exposes a minimal public interface. The Lifecycle contract is the only contract that makes cross-contract calls — to the other two.
+Mainstay is composed of four independent Soroban smart contracts deployed on the Stellar network: **AssetRegistry**, **EngineerRegistry**, **Lifecycle**, and **Lending**. Each contract owns a distinct domain and exposes a minimal public interface. The Lifecycle contract cross-calls AssetRegistry and EngineerRegistry; a lender integration cross-calls AssetRegistry and Lifecycle directly (see [Lending](#lending) below) rather than routing loan logic through Lifecycle.
 
 ---
 
@@ -84,6 +84,58 @@ The orchestration contract. Binds AssetRegistry and EngineerRegistry together to
 
 ---
 
+### Lending
+
+The Lending contract implements a peer-vouched, over-collateralized micro-loan system that uses assets registered in `AssetRegistry` (verified via `Lifecycle` collateral scores) as security for loans. Unlike Lifecycle, Lending does **not** cross-call the other contracts autonomously — the lender's off-chain integration is responsible for querying `AssetRegistry`/`Lifecycle` and then calling `Lending` directly. See the [Lender Integration Guide](lender-integration-guide.md) for the full lender-side sequence.
+
+**Responsibilities:**
+- Accept vouches (staked backing) for a borrower from third parties
+- Disburse loans against a borrower's staked vouches, up to `max_loan_amount`
+- Track loan status (`Active`, `Repaid`, `Defaulted`) and enforce a single active loan per borrower
+- Apply yield to vouchers on successful repayment and slash a configurable percentage on default
+- Record and release **liens** — on-chain claims that a lender holds against a specific asset for a specific loan
+- Admin-gated configuration (yield/slash basis points, minimum stake, loan duration) and pause/unpause
+
+**Key storage:**
+| Key | Type | Description |
+|-----|------|-------------|
+| `(LOAN, borrower)` | `Loan` | Active loan record (amount, status, deadline) |
+| `(VOUCHES, borrower)` | `Vec<Vouch>` | All active voucher stakes for a borrower |
+| `(V_HIST, voucher)` | `VoucherHistory` | Running yield/slash totals per voucher |
+| `(Liens, asset_id)` | `Vec<LienRecord>` | Active lien claims recorded against an asset |
+| `L_COUNT` / `(L_MAP, loan_id)` | `u64` / `Address` | Loan ID counter and loan-ID → borrower lookup |
+| `CONFIG` | `Config` | Yield BPS, slash BPS, min stake, loan duration |
+
+The full storage layout and TTL policy for every key above is documented in [docs/ttl-strategy.md](ttl-strategy.md#4-lending-contract); the full error catalogue is in [docs/error-reference.md](error-reference.md#lending).
+
+#### Lien System
+
+A **lien** (`LienRecord`) is the Lending contract's on-chain evidence that a specific lender holds a claim against a specific asset for a specific loan. Liens are keyed by `asset_id` and store `{ lender, loan_id, amount, created_at }`. They exist independently of the `is_locked` flag on the asset itself (see [Asset Lock/Unlock Lifecycle](#asset-lockunlock-lifecycle) below) — a lien is the *claim record*, while the lock is the *enforcement mechanism* that physically prevents the asset from being transferred or re-collateralized while claims exist against it.
+
+- `record_lien(admin, asset_id, lender, loan_id, amount)` — appends a `LienRecord`, guarded against duplicate `(lender, loan_id)` pairs, and extends the key's TTL.
+- `get_liens(asset_id)` — returns all active liens for an asset; used by lenders to compute total encumbrance before issuing a new loan.
+- `release_lien(admin, asset_id, lender, loan_id)` — removes the matching `LienRecord`, typically called after a loan is repaid or after slashing settles a default.
+
+#### Asset Lock/Unlock Lifecycle
+
+To prevent an asset from being double-pledged as collateral while a loan against it is outstanding, `AssetRegistry` exposes a dedicated lock mechanism, separate from the lien bookkeeping in Lending:
+
+1. **Lock** — `AssetRegistry::lock_asset_as_collateral(lender, asset_id, loan_id)` sets `Asset.is_locked = true`. Only the address registered as the authorized lending contract (stored under the dedicated lending-contract key in AssetRegistry) may call this function; any other caller is rejected. Calling it on an asset that is already locked panics with `ContractError::AssetLocked`.
+2. **Enforcement** — while `is_locked == true`, asset-mutating operations that would change ownership or metadata in ways that could undermine the lender's claim are rejected with `ContractError::AssetLocked`. This blocks a borrower from transferring or re-pledging an asset out from under an active loan.
+3. **Unlock** — `AssetRegistry::unlock_asset_from_collateral(lender, asset_id, loan_id)` sets `Asset.is_locked = false` once the corresponding loan is repaid, defaulted-and-settled, or otherwise closed. Calling it on an asset that is not locked is a no-op guard (rejected rather than silently ignored).
+4. A locked asset's `is_locked` flag is independent of any specific lien — an integration should treat `is_locked == true` as "this asset is currently pledged," and cross-check `Lending::get_liens(asset_id)` for the specific claim(s) responsible.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unlocked: register_asset
+    Unlocked --> Locked: lock_asset_as_collateral(lender, asset_id, loan_id)
+    Locked --> Locked: lock_asset_as_collateral (rejected — AssetLocked)
+    Locked --> Unlocked: unlock_asset_from_collateral(lender, asset_id, loan_id)
+    Unlocked --> [*]: deregister_asset
+```
+
+---
+
 ## Cross-Contract Call Flow
 
 The Lifecycle contract acts as the main orchestrator and is the only contract that initiates cross-contract calls. Neither `AssetRegistry` nor `EngineerRegistry` calls any other contract.
@@ -100,6 +152,10 @@ The Lifecycle contract acts as the main orchestrator and is the only contract th
 | `Lifecycle` | `record_transfer` | `AssetRegistry` | `get_asset` | Fetches the asset to verify that the `new_owner` matches the current owner in the registry. Panics with `UnauthorizedOwner` if they do not match. |
 | `Lifecycle` | `get_collateral_score` / `get_collateral_score_batch` | `AssetRegistry` | `try_get_asset` | Verifies that the asset exists. |
 | `Lifecycle` | `get_collateral_score` / `get_collateral_score_batch` | `AssetRegistry` | `get_asset` | Fetches the asset to verify that its deprecation status is `Active` (deprecated assets return `0` immediately). |
+| *(lender, off-chain)* | loan request flow | `AssetRegistry` | `get_asset` / `get_lifecycle_score` | Verifies asset state and ownership before requesting a loan. |
+| *(lender, off-chain)* | loan request flow | `Lifecycle` | `get_collateral_score` | Verifies collateral quality before requesting a loan. |
+| *(lender, off-chain)* | after `Lending::request_loan` | `AssetRegistry` | `lock_asset_as_collateral` | Locks the asset (`is_locked = true`) so it cannot be re-pledged or transferred while the loan is outstanding. |
+| *(lender, off-chain)* | after loan closure | `AssetRegistry` | `unlock_asset_from_collateral` | Unlocks the asset (`is_locked = false`) once the loan is repaid or the default is settled. |
 
 ---
 
@@ -262,6 +318,17 @@ sequenceDiagram
     Lender->>Lending: record_lien(admin, asset_id, lender, loan_id, amount)
     Note over Lending: require admin auth<br/>check no duplicate (lender, loan_id)<br/>append LienRecord; extend TTL
     Lending-->>Lender: lien recorded (on-chain claim secured)
+
+    Note over Lender: Lending contract locks the asset so it cannot<br/>be re-pledged or transferred mid-loan
+    Lender->>AssetRegistry: lock_asset_as_collateral(lender, asset_id, loan_id)
+    Note over AssetRegistry: require caller == authorized lending contract<br/>panic AssetLocked if already locked
+    AssetRegistry-->>Lender: asset.is_locked = true
+
+    Note over Lender: — later, on repayment or settled default —
+    Lender->>Lending: release_lien(admin, asset_id, lender, loan_id)
+    Lending-->>Lender: LienRecord removed
+    Lender->>AssetRegistry: unlock_asset_from_collateral(lender, asset_id, loan_id)
+    AssetRegistry-->>Lender: asset.is_locked = false
 ```
 
 ---
@@ -273,14 +340,15 @@ Each contract is deployed independently. After deployment:
 1. **AssetRegistry** — call `initialize_admin(admin)`
 2. **EngineerRegistry** — call `initialize_admin(admin)`, then `add_trusted_issuer(admin, issuer)`
 3. **Lifecycle** — call `initialize(asset_registry_address, engineer_registry_address, admin, max_history)`
+4. **Lending** — call `initialize(admin, token_address)`, then configure yield/slash BPS, min stake, and loan duration via the respective `set_*` admin calls
 
-The Lifecycle contract stores the addresses of the other two contracts at initialization time. These addresses are immutable after initialization.
+The Lifecycle contract stores the addresses of the other two contracts at initialization time. These addresses are immutable after initialization. The Lending contract is initialized independently and does not store a reference to Lifecycle or EngineerRegistry — a lender's own integration layer is responsible for orchestrating calls across all four contracts (see [Lending](#lending)).
 
 ---
 
 ## TTL Strategy
 
-All three contracts use Soroban persistent storage and extend TTL by 518,400 ledgers (~30 days) on every write. See [ttl-strategy.md](ttl-strategy.md) for full details.
+All four contracts use Soroban persistent storage and extend TTL by 518,400 ledgers (~30 days) on every write. See [ttl-strategy.md](ttl-strategy.md) for full details, including the Lending contract's lien and loan-tracking keys.
 
 ---
 

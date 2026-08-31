@@ -72,6 +72,11 @@ const DEFAULT_MAX_NOTES_LENGTH: u32 = 256;
 const DEFAULT_MAX_SUBMISSIONS_PER_HOUR: u32 = 20;
 /// Length of the rolling submission-rate window, in seconds.
 const SUBMISSION_RATE_WINDOW_SECS: u64 = 3600;
+/// Default cap on the number of health snapshots retained per asset. Without
+/// a cap, a misconfigured automation loop calling `take_health_snapshot` in a
+/// tight cycle can grow `HealthSnapshots(asset_id)` without bound, inflating
+/// read costs and persistent-TTL-extension costs on every call.
+const DEFAULT_MAX_SNAPSHOTS: u32 = 500;
 
 fn effective_min_collateral_score(config: &Config) -> u32 {
     if config.min_collateral_score > 0 {
@@ -105,6 +110,13 @@ const MAX_BUILT_IN_TASK_WEIGHT: u32 = 10;
 pub const MAX_BATCH_SIZE: u32 = 50;
 /// Hard cap on engineers accepted by one bulk authorization-revocation call.
 pub const MAX_BATCH_REVOKE_SIZE: u32 = 50;
+/// Hard cap on the number of addresses in the admin multisig set.
+///
+/// `require_quorum` performs an O(n) scan of the admins list on every
+/// protected call.  Without a bound this could approach instruction limits
+/// for large lists.  10 admins comfortably covers any realistic governance
+/// set while keeping per-call work negligible.
+pub const MAX_ADMINS: u32 = 10;
 /// Upper bound on `limit` accepted by [`LifecycleContract::get_maintenance_history_page`].
 /// Without this cap a caller could pass an arbitrarily large `limit` and reintroduce
 /// the unbounded-response failure the paginated endpoint exists to prevent.
@@ -654,6 +666,26 @@ pub(crate) fn store_timelock(env: &Env, op: Symbol) {
     extend_persistent_ttl(&env, &key);
 }
 
+/// Validate that a timelocked proposal is ready to execute, then mark it
+/// executed.
+///
+/// # Atomicity guarantee
+/// `proposal.executed = true` is written to persistent storage here, in this
+/// call, **before** the caller runs the guarded operation (e.g.
+/// `crate::admin::update_score_increment`). This ordering means the
+/// "executed" flag can never be observed as `true` without the corresponding
+/// guarded operation actually having run: Soroban contract invocations are
+/// all-or-nothing — every storage write performed during an invocation
+/// (including this one) is part of the same host-managed transaction, so if
+/// anything later in the same invocation panics or the transaction fails to
+/// commit for any reason, this write is rolled back along with it. There is
+/// no intermediate state, observable by another call, in which `executed`
+/// is `true` but the guarded operation did not happen. Conversely, once this
+/// call returns normally, the flag write has succeeded and the guarded
+/// operation is guaranteed to run in the remainder of the same invocation,
+/// so a second call for the same `op` always hits the `proposal.executed`
+/// check below and is rejected with `ProposalNotFound` — double-execution of
+/// the same proposal is impossible.
 pub(crate) fn require_timelock_ready(env: &Env, op: Symbol) {
     let key = timelock_key(op);
     let mut proposal: TimelockProposal = env
@@ -911,10 +943,18 @@ impl Lifecycle {
         if new_config.max_notes_length == 0 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
+        // #1258: A max_notes_length below 10 trivially bypasses notes validation.
+        if new_config.max_notes_length < 10 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
         if new_config.admin_threshold > 0
             && new_config.admin_threshold as u32 > new_config.admins.len()
         {
             panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+        // #1259: Cap admin list size to prevent O(n) DoS in require_quorum.
+        if new_config.admins.len() > MAX_ADMINS {
+            panic_with_error!(&env, ContractError::TooManyAdmins);
         }
         // Store proposed config under a dedicated pending key.
         let pending_key = symbol_short!("PEND_CFG");
@@ -1356,6 +1396,13 @@ impl Lifecycle {
         if DEFAULT_DECAY_INTERVAL == 0 {
             panic_with_error!(&env, ContractError::InvalidConfig);
         }
+        // #1257: Guard against a misconfigured build constant. A score_increment
+        // of 0 means maintenance events never award any score, silently breaking
+        // the collateral-scoring system. Reject at deploy time rather than
+        // producing a permanently mis-configured contract.
+        if DEFAULT_SCORE_INCREMENT == 0 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
 
         set_asset_registry_addr(&env, &asset_registry);
         set_engineer_registry_addr(&env, &engineer_registry);
@@ -1379,6 +1426,7 @@ impl Lifecycle {
             task_weights: Map::new(&env),
             max_submissions_per_hour: DEFAULT_MAX_SUBMISSIONS_PER_HOUR,
             default_task_weight: 0,
+            max_snapshots: DEFAULT_MAX_SNAPSHOTS,
         };
         env.storage().persistent().set(&CONFIG, &config);
         extend_persistent_ttl(&env, &CONFIG);
@@ -1550,6 +1598,12 @@ impl Lifecycle {
         }
         if threshold > 0 && threshold as u32 > new_admins.len() {
             panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+        // #1259: Cap the admin list to MAX_ADMINS (10) to prevent O(n) scans
+        // in require_quorum from approaching instruction limits on every
+        // protected call.
+        if new_admins.len() > MAX_ADMINS {
+            panic_with_error!(&env, ContractError::TooManyAdmins);
         }
 
         // Reject any list that contains duplicate addresses.  A duplicate
@@ -1744,6 +1798,24 @@ impl Lifecycle {
     /// - [`ContractError::InvalidConfig`] if `new_max` is 0.
     pub fn update_max_engineer_history(env: Env, admin: Address, new_max: u32) {
         crate::admin::update_max_engineer_history(env, admin, new_max);
+    }
+
+    /// Admin-only function to update the per-asset health-snapshot retention cap.
+    ///
+    /// Once `HealthSnapshots(asset_id)` reaches `new_max` entries, `take_health_snapshot`
+    /// evicts the oldest snapshot(s) before appending the new one, bounding storage,
+    /// read costs, and TTL-extension costs regardless of how often snapshots are taken.
+    ///
+    /// # Arguments
+    /// * `admin`   - The admin address that must match the stored config admin.
+    /// * `new_max` - New per-asset snapshot cap (must be > 0).
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialised.
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin.
+    /// - [`ContractError::InvalidConfig`] if `new_max` is 0.
+    pub fn update_max_snapshots(env: Env, admin: Address, new_max: u32) {
+        crate::admin::update_max_snapshots(env, admin, new_max);
     }
 
     /// Admin-only function to update the maximum allowed notes length per maintenance record.
@@ -2079,6 +2151,27 @@ impl Lifecycle {
         }
         if !spec_matched {
             panic_with_error!(&env, ContractError::SpecializationMismatch);
+        }
+
+        // Re-check the decommissioned/frozen state immediately before committing
+        // any history/score writes. The initial check above happens before the
+        // engineer-authorization cross-contract calls (credential status,
+        // engineer-authorized check, specialization lookup); those calls run
+        // under the reentrancy guard acquired earlier, but an admin could still
+        // decommission the asset via a separate top-level transaction that lands
+        // between when this invocation started and when it reaches this point
+        // in the ledger's transaction ordering. Re-reading the frozen flag here,
+        // directly adjacent to the first write, closes that window: either both
+        // checks observe "not decommissioned" and the write proceeds, or the
+        // second check catches a decommission and the whole invocation reverts
+        // atomically (Soroban invocations are all-or-nothing), so no maintenance
+        // record can ever be committed against a decommissioned asset.
+        if env.storage().persistent().get::<_, bool>(&frozen_key(asset_id)).unwrap_or(false) {
+            panic_with_error!(&env, ContractError::AssetDecommissioned);
+        }
+        let status = asset_client.asset_status(&asset_id);
+        if status == AssetStatus::Decommissioned {
+            panic_with_error!(&env, ContractError::AssetDecommissioned);
         }
 
         let timestamp = env.ledger().timestamp();
@@ -4530,8 +4623,61 @@ impl Lifecycle {
         page
     }
 
+    /// Admin-only function to propose updating the asset registry address.
+    ///
+    /// Starts the 48-hour timelock that must elapse before
+    /// `execute_update_asset_registry` will accept the change.  This two-step
+    /// flow prevents a compromised or malicious admin from instantly redirecting
+    /// cross-contract calls to an attacker-controlled contract.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored config admin
+    /// * `new_registry` - The new asset registry contract address
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
+    /// - [`ContractError::ZeroAddress`] if `new_registry` is the zero address
+    /// - [`ContractError::SameRegistryAddress`] if `new_registry` equals the engineer registry
+    pub fn propose_update_asset_registry(env: Env, admin: Address, new_registry: Address) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if is_zero_address(&env, &new_registry) {
+            panic_with_error!(&env, ContractError::ZeroAddress);
+        }
+        if new_registry == get_engineer_registry_addr(&env) {
+            panic_with_error!(&env, ContractError::SameRegistryAddress);
+        }
+        // Stash the proposed address so execute can apply it after the delay.
+        env.storage()
+            .persistent()
+            .set(&symbol_short!("PEND_AST"), &new_registry);
+        extend_persistent_ttl(&env, &symbol_short!("PEND_AST"));
+        store_timelock(&env, symbol_short!("AST_REG"));
+        env.events().publish(
+            (symbol_short!("PROP_AST"), admin.clone()),
+            (new_registry.clone(), env.ledger().timestamp()),
+        );
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("PROP_AST")),
+            (admin, env.ledger().timestamp(), new_registry),
+        );
+    }
+
     /// Admin-only function to update the asset registry address.
-    /// Useful for registry migrations or updates.
+    ///
+    /// # Deprecated — prefer the timelocked two-step flow
+    /// Direct registry updates are gated behind the `AST_REG` timelock.
+    /// Call `propose_update_asset_registry` first, wait 48 hours, then call
+    /// `execute_update_asset_registry` to apply the change.
     ///
     /// # Arguments
     /// * `admin` - The admin address that must match the stored config admin
@@ -4540,8 +4686,59 @@ impl Lifecycle {
     /// # Panics
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::TimelockNotExpired`] if the `AST_REG` timelock has not elapsed
     pub fn update_asset_registry(env: Env, admin: Address, new_registry: Address) {
+        require_timelock_ready(&env, symbol_short!("AST_REG"));
         crate::admin::update_asset_registry(env, admin, new_registry);
+    }
+
+    /// Admin-only function to propose updating the engineer registry address.
+    ///
+    /// Starts the 48-hour timelock that must elapse before
+    /// `execute_update_engineer_registry` will accept the change.  This two-step
+    /// flow prevents a compromised or malicious admin from instantly redirecting
+    /// engineer verification calls to an attacker-controlled contract.
+    ///
+    /// # Arguments
+    /// * `admin` - The admin address that must match the stored config admin
+    /// * `new_registry` - The new engineer registry contract address
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
+    /// - [`ContractError::ZeroAddress`] if `new_registry` is the zero address
+    /// - [`ContractError::SameRegistryAddress`] if `new_registry` equals the asset registry
+    pub fn propose_update_engineer_registry(env: Env, admin: Address, new_registry: Address) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if config.admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if is_zero_address(&env, &new_registry) {
+            panic_with_error!(&env, ContractError::ZeroAddress);
+        }
+        if new_registry == get_asset_registry_addr(&env) {
+            panic_with_error!(&env, ContractError::SameRegistryAddress);
+        }
+        // Stash the proposed address so execute can apply it after the delay.
+        env.storage()
+            .persistent()
+            .set(&symbol_short!("PEND_ENG"), &new_registry);
+        extend_persistent_ttl(&env, &symbol_short!("PEND_ENG"));
+        store_timelock(&env, symbol_short!("ENG_REG"));
+        env.events().publish(
+            (symbol_short!("PROP_ENG"), admin.clone()),
+            (new_registry.clone(), env.ledger().timestamp()),
+        );
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("PROP_ENG")),
+            (admin, env.ledger().timestamp(), new_registry),
+        );
     }
 
     /// Get the address of the engineer registry contract.
@@ -4556,7 +4753,11 @@ impl Lifecycle {
     }
 
     /// Admin-only function to update the engineer registry address.
-    /// Useful for registry migrations or updates.
+    ///
+    /// # Deprecated — prefer the timelocked two-step flow
+    /// Direct registry updates are gated behind the `ENG_REG` timelock.
+    /// Call `propose_update_engineer_registry` first, wait 48 hours, then call
+    /// `execute_update_engineer_registry` to apply the change.
     ///
     /// # Arguments
     /// * `admin` - The admin address that must match the stored config admin
@@ -4565,7 +4766,9 @@ impl Lifecycle {
     /// # Panics
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::TimelockNotExpired`] if the `ENG_REG` timelock has not elapsed
     pub fn update_engineer_registry(env: Env, admin: Address, new_registry: Address) {
+        require_timelock_ready(&env, symbol_short!("ENG_REG"));
         crate::admin::update_engineer_registry(env, admin, new_registry);
     }
 
@@ -4975,13 +5178,14 @@ impl Lifecycle {
             panic_with_error!(&env, ContractError::AssetDecommissioned);
         }
 
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get::<_, Config>(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+
         let score = {
             let stored: u32 = env.storage().persistent().get(&score_key(asset_id)).unwrap_or(0);
-            let config: Config = env
-                .storage()
-                .persistent()
-                .get::<_, Config>(&CONFIG)
-                .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
             let last_update: u64 = env
                 .storage()
                 .persistent()
@@ -5019,6 +5223,25 @@ impl Lifecycle {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
         snapshots.push_back(snapshot.clone());
+
+        // Enforce the configurable cap on retained snapshots (#max_snapshots).
+        // A misconfigured automation loop calling this in a tight cycle would
+        // otherwise grow HealthSnapshots(asset_id) without bound, inflating
+        // both read costs and persistent-TTL-extension costs on every future
+        // call. Evict the oldest entries first so the list always reflects
+        // the most recent history.
+        let cap = if config.max_snapshots == 0 {
+            DEFAULT_MAX_SNAPSHOTS
+        } else {
+            config.max_snapshots
+        };
+        if cap > 0 && snapshots.len() > cap {
+            let excess = snapshots.len() - cap;
+            for _ in 0..excess {
+                snapshots.remove(0);
+            }
+        }
+
         env.storage().persistent().set(&key, &snapshots);
         extend_persistent_ttl(&env, &key);
 
@@ -5467,6 +5690,62 @@ mod tests {
         let history = client.get_maintenance_history(&asset_id);
         assert_eq!(history.get(0).unwrap().previous_record_hash, None);
         assert!(client.verify_maintenance_chain_integrity(&asset_id));
+    }
+
+    /// Regression test for the decommission-vs-submit race window: an asset
+    /// decommissioned between the point an engineer's authorization checks
+    /// begin and the point history/score writes would commit must never end
+    /// up with a maintenance record. This simulates the "race" by
+    /// decommissioning the asset via the asset-registry admin and then
+    /// immediately calling submit_maintenance for the same asset/engineer
+    /// pair that was fully authorized beforehand — the second, adjacent-to-
+    /// the-write frozen/status check added to submit_maintenance must catch
+    /// it even though the engineer authorization itself is still valid.
+    #[test]
+    fn test_decommission_submit_race_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_id, owner, engineer) = setup_chain_test(&env);
+
+        // Engineer is fully authorized and a prior submission succeeds.
+        client.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "Pre-decommission service"),
+            &engineer,
+            &None,
+        );
+        assert_eq!(client.get_maintenance_history(&asset_id).len(), 1);
+
+        // Simulate the race: the asset is decommissioned by a separate
+        // transaction that lands after this engineer's authorization was
+        // granted, but before their next submission is processed.
+        client.decommission_asset(&owner, &asset_id);
+
+        // The submission must be rejected atomically — no partial write,
+        // no record appended — regardless of when in the invocation the
+        // decommissioned state became visible.
+        let result = client.try_submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &Priority::Low,
+            &String::from_str(&env, "Post-decommission race attempt"),
+            &engineer,
+            &None,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetDecommissioned as u32
+            )))
+        );
+        assert_eq!(
+            client.get_maintenance_history(&asset_id).len(),
+            1,
+            "no maintenance record must be committed for a decommissioned asset, \
+             even when the submitting engineer was authorized before decommission"
+        );
     }
 
     #[test]
@@ -6236,6 +6515,121 @@ mod tests {
         assert!(history.contains(&asset_ids.get(2).unwrap()));
         assert!(history.contains(&asset_ids.get(3).unwrap()));
         assert!(history.contains(&asset_ids.get(4).unwrap()));
+    }
+
+    /// Issue: verify that when the engineer history sliding window is filled to
+    /// exactly `cap + 1` distinct assets, the single oldest asset_id is evicted
+    /// and every other (newer) asset_id is retained, in insertion order.
+    #[test]
+    fn test_engineer_history_evicts_oldest_at_cap_plus_one() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let cap: u32 = 4;
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, cap);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        // Fill history to cap + 1 distinct assets.
+        let mut asset_ids = Vec::new(&env);
+        for _ in 0..(cap + 1) {
+            let (asset_id, _asset_owner) = register_asset(&env, &asset_registry_client);
+            asset_ids.push_back(asset_id);
+            client.submit_maintenance(
+                &asset_id,
+                &symbol_short!("OIL_CHG"),
+                &Priority::Low,
+                &String::from_str(&env, "service"),
+                &engineer,
+            );
+        }
+
+        let history = client.get_engineer_maintenance_history(&engineer);
+        assert_eq!(
+            history.len(),
+            cap,
+            "history length must stay capped at max_engineer_history"
+        );
+
+        // The oldest asset_id (index 0) must have been evicted.
+        assert!(
+            !history.contains(&asset_ids.get(0).unwrap()),
+            "oldest asset_id must be evicted once cap + 1 distinct assets are added"
+        );
+
+        // Every newer asset_id (indices 1..=cap) must still be present.
+        for i in 1..=cap {
+            let id = asset_ids.get(i).unwrap();
+            assert!(
+                history.contains(&id),
+                "newer asset_id at index {i} must be retained after eviction"
+            );
+        }
+
+        // The newest asset_id in particular must be retained.
+        assert!(history.contains(&asset_ids.get(cap).unwrap()));
+    }
+
+    /// Issue: with max_engineer_history == 1, the history must always contain
+    /// exactly the single most-recently-added asset_id, evicting every
+    /// previous entry as soon as a new distinct asset is added.
+    #[test]
+    fn test_engineer_history_max_history_of_one() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, engineer_registry_client, _) = setup(&env, 1);
+        let engineer = register_engineer(&env, &engineer_registry_client);
+
+        let (asset_id_1, _owner1) = register_asset(&env, &asset_registry_client);
+        client.submit_maintenance(
+            &asset_id_1,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "first asset service"),
+            &engineer,
+        );
+
+        let history_after_first = client.get_engineer_maintenance_history(&engineer);
+        assert_eq!(history_after_first.len(), 1);
+        assert!(history_after_first.contains(&asset_id_1));
+
+        let (asset_id_2, _owner2) = register_asset(&env, &asset_registry_client);
+        client.submit_maintenance(
+            &asset_id_2,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "second asset service"),
+            &engineer,
+        );
+
+        let history_after_second = client.get_engineer_maintenance_history(&engineer);
+        assert_eq!(
+            history_after_second.len(),
+            1,
+            "history must stay at exactly 1 entry when max_engineer_history == 1"
+        );
+        assert!(
+            !history_after_second.contains(&asset_id_1),
+            "first asset_id must be evicted once a second distinct asset is added"
+        );
+        assert!(
+            history_after_second.contains(&asset_id_2),
+            "history must retain only the newest asset_id"
+        );
+
+        let (asset_id_3, _owner3) = register_asset(&env, &asset_registry_client);
+        client.submit_maintenance(
+            &asset_id_3,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "third asset service"),
+            &engineer,
+        );
+
+        let history_after_third = client.get_engineer_maintenance_history(&engineer);
+        assert_eq!(history_after_third.len(), 1);
+        assert!(!history_after_third.contains(&asset_id_2));
+        assert!(history_after_third.contains(&asset_id_3));
     }
 
     #[test]
@@ -8608,6 +9002,41 @@ mod tests {
         client.execute_pause(&admin);
 
         assert!(client.is_paused());
+    }
+
+    /// Regression test for the executed-flag atomicity guarantee documented on
+    /// `require_timelock_ready`: once a timelocked proposal has been executed,
+    /// a second call for the same operation must be rejected with
+    /// `ProposalNotFound` rather than silently re-running the guarded
+    /// operation. This verifies double-execution is impossible.
+    #[test]
+    fn test_execute_update_score_increment_rejects_double_execution() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, _, _, admin) = setup(&env, 0);
+
+        client.propose_config_update(&admin, &symbol_short!("SC_INC"));
+        let base = env.ledger().timestamp();
+        env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+
+        // First execution succeeds and applies the new value.
+        client.execute_update_score_increment(&admin, &7);
+        assert_eq!(client.get_config().score_increment, 7);
+
+        // Second execution of the same (now-executed) proposal must be
+        // rejected — the executed flag was already committed atomically
+        // with the first run, so there is no proposal left to execute.
+        let result = client.try_execute_update_score_increment(&admin, &99);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::ProposalNotFound as u32,
+            )))
+        );
+
+        // Config value from the first (only) successful execution is unchanged.
+        assert_eq!(client.get_config().score_increment, 7);
     }
 
     #[test]
@@ -12205,6 +12634,167 @@ mod tests {
         );
     }
 
+    /// Issue: after 3+ successive ownership transfers (A → B → C → D), the
+    /// endpoint must anchor strictly to the most recent transfer and return
+    /// only records submitted under the final owner (D), excluding every
+    /// earlier owner's records even though they are still present in the
+    /// full history.
+    #[test]
+    fn test_history_since_transfer_with_three_plus_transfers() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, engineer_registry, _) = setup(&env, 0);
+
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+        let owner_c = Address::generate(&env);
+        let owner_d = Address::generate(&env);
+        let asset_id = register_asset_for_owner(&env, &asset_registry, &owner_a);
+        let engineer = register_engineer_for_transfer_tests(&env, &engineer_registry);
+        lifecycle.authorize_engineer(&owner_a, &asset_id, &engineer);
+
+        // Owner A submits 1 record.
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("INSPECT"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner A inspection"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+
+        // Transfer A → B, owner B submits 1 record.
+        asset_registry.transfer_asset(&asset_id, &owner_a, &owner_b);
+        lifecycle.record_transfer(&asset_id, &owner_a, &owner_b);
+        lifecycle.authorize_engineer(&owner_b, &asset_id, &engineer);
+        env.ledger().with_mut(|li| li.timestamp += 1);
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner B oil change"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+
+        // Transfer B → C, owner C submits 2 records.
+        asset_registry.transfer_asset(&asset_id, &owner_b, &owner_c);
+        lifecycle.record_transfer(&asset_id, &owner_b, &owner_c);
+        lifecycle.authorize_engineer(&owner_c, &asset_id, &engineer);
+        env.ledger().with_mut(|li| li.timestamp += 1);
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("FILTER"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner C filter change"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("BRAKE"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner C brake service"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+
+        // Transfer C → D (third transfer), owner D submits 1 record.
+        asset_registry.transfer_asset(&asset_id, &owner_c, &owner_d);
+        lifecycle.record_transfer(&asset_id, &owner_c, &owner_d);
+        lifecycle.authorize_engineer(&owner_d, &asset_id, &engineer);
+        env.ledger().with_mut(|li| li.timestamp += 1);
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("ENGINE"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner D engine overhaul"),
+            &engineer,
+        );
+
+        // Since-transfer must return only owner D's single record.
+        let since = lifecycle.get_maintenance_history_since_transfer(&asset_id);
+        assert_eq!(
+            since.len(),
+            1,
+            "after 3 transfers, since_transfer must return only the current owner's records"
+        );
+        assert_eq!(since.get(0).unwrap().task_type, symbol_short!("ENGINE"));
+        assert!(since.get(0).unwrap().ownership_start_ledger.is_some());
+
+        // Full history must still contain everything: A(1) + XFER + B(1) + XFER
+        // + C(2) + XFER + D(1) = 8 entries.
+        let full = lifecycle.get_maintenance_history(&asset_id);
+        assert_eq!(
+            full.len(),
+            8,
+            "full history must retain all records across every transfer"
+        );
+    }
+
+    /// Issue: when the current owner has zero maintenance records after the
+    /// most recent of several transfers, since_transfer must return an empty
+    /// Vec rather than falling back to a previous owner's records.
+    #[test]
+    fn test_history_since_transfer_zero_records_for_current_owner_after_multiple_transfers() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (lifecycle, asset_registry, engineer_registry, _) = setup(&env, 0);
+
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+        let owner_c = Address::generate(&env);
+        let asset_id = register_asset_for_owner(&env, &asset_registry, &owner_a);
+        let engineer = register_engineer_for_transfer_tests(&env, &engineer_registry);
+        lifecycle.authorize_engineer(&owner_a, &asset_id, &engineer);
+
+        // Owner A submits 2 records.
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("INSPECT"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner A inspection"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("OIL_CHG"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner A oil change"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+
+        // Transfer A → B, owner B submits 1 record.
+        asset_registry.transfer_asset(&asset_id, &owner_a, &owner_b);
+        lifecycle.record_transfer(&asset_id, &owner_a, &owner_b);
+        lifecycle.authorize_engineer(&owner_b, &asset_id, &engineer);
+        env.ledger().with_mut(|li| li.timestamp += 1);
+        lifecycle.submit_maintenance(
+            &asset_id,
+            &symbol_short!("FILTER"),
+            &Priority::Low,
+            &String::from_str(&env, "Owner B filter change"),
+            &engineer,
+        );
+        env.ledger().with_mut(|li| li.timestamp += 1);
+
+        // Transfer B → C. Owner C submits nothing.
+        asset_registry.transfer_asset(&asset_id, &owner_b, &owner_c);
+        lifecycle.record_transfer(&asset_id, &owner_b, &owner_c);
+
+        let since = lifecycle.get_maintenance_history_since_transfer(&asset_id);
+        assert_eq!(
+            since.len(),
+            0,
+            "current owner C has zero maintenance records; since_transfer must be empty, \
+             not fall back to owner A's or owner B's records"
+        );
+    }
+
     #[test]
     fn test_purge_asset_data_after_deregister() {
         let env = Env::default();
@@ -13421,6 +14011,68 @@ mod tests {
             "snapshots should be in chronological order"
         );
         assert_eq!(snapshots.get(1).unwrap().maintenance_count, 2);
+    }
+
+    /// Regression test for the unbounded-snapshot-growth issue: a misconfigured
+    /// automation loop calling `take_health_snapshot` repeatedly must not be able
+    /// to grow `HealthSnapshots(asset_id)` past the configured `max_snapshots`
+    /// cap. Oldest snapshots must be evicted first so the retained list always
+    /// reflects the most recent history.
+    #[test]
+    fn test_take_health_snapshot_enforces_max_snapshots_cap() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, asset_registry_client, _, admin) = setup(&env, 0);
+        let (asset_id, _) = register_asset(&env, &asset_registry_client);
+
+        // Tighten the cap to 3 so the test doesn't need 500+ iterations.
+        client.update_max_snapshots(&admin, &3);
+
+        // Take 5 snapshots at distinct timestamps.
+        let mut timestamps = Vec::new(&env);
+        for _ in 0..5u32 {
+            let snap = client.take_health_snapshot(&asset_id);
+            timestamps.push_back(snap.snapshot_timestamp);
+            env.ledger().with_mut(|li| li.timestamp += 10);
+        }
+
+        let snapshots = client.get_health_snapshots(&asset_id);
+        assert_eq!(
+            snapshots.len(),
+            3,
+            "snapshot list must be capped at max_snapshots (3), not grow to 5"
+        );
+
+        // The retained snapshots must be the 3 most recent (oldest-first eviction).
+        let expected_oldest_retained = timestamps.get(2).unwrap();
+        assert_eq!(
+            snapshots.get(0).unwrap().snapshot_timestamp,
+            expected_oldest_retained,
+            "the two oldest snapshots must have been evicted first"
+        );
+        assert_eq!(
+            snapshots.get(2).unwrap().snapshot_timestamp,
+            timestamps.get(4).unwrap(),
+            "the most recent snapshot must always be retained"
+        );
+    }
+
+    /// `update_max_snapshots` must reject a zero cap (which would make every
+    /// `take_health_snapshot` call immediately evict its own new entry).
+    #[test]
+    fn test_update_max_snapshots_rejects_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, _, admin) = setup(&env, 0);
+
+        let result = client.try_update_max_snapshots(&admin, &0);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidConfig as u32
+            )))
+        );
     }
 
     #[test]

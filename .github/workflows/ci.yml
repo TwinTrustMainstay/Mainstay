@@ -39,6 +39,15 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace
 
+  docs:
+    name: Validate error reference docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check ContractError variants are documented
+        run: bash scripts/check_error_reference.sh
+
       - name: Run clippy lints
         run: cargo clippy --workspace --all-targets -- -D warnings
 

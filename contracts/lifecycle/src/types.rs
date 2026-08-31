@@ -113,6 +113,13 @@ pub struct Config {
     /// eliminates the `InvalidTaskType` panic that previously blocked
     /// maintenance submissions for unknown types (see issue #1200).
     pub default_task_weight: u32,
+    /// Maximum number of health snapshots retained per asset in
+    /// `HealthSnapshots(asset_id)`. When `take_health_snapshot` would push the
+    /// list past this cap, the oldest snapshot(s) are evicted first so the
+    /// list stays bounded regardless of how often the caller snapshots.
+    /// A value of `0` is treated as "use the contract default" and is
+    /// replaced with `DEFAULT_MAX_SNAPSHOTS` at initialisation time.
+    pub max_snapshots: u32,
 }
 
 #[contracttype]

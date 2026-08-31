@@ -79,6 +79,7 @@ Mainstay is a decentralized physical infrastructure network (DePIN) built on Ste
 | T-AR-08 | **E**levation of Privilege | Unauthorized party calls admin functions | Critical | `admin.require_auth()` on all admin-gated functions |
 | T-AR-09 | **E**levation of Privilege | Front-run `initialize_admin` to set attacker as admin | Critical | Deployer signature required; same-block initialization mandated in runbook |
 | T-AR-10 | **E**levation of Privilege | Attacker bypasses timelock on admin-initiated asset transfer | Medium | 48-hour timelock with `propose`/`execute` pattern |
+| T-AR-11 | **E**levation of Privilege | Single compromised admin key proposes and executes a malicious contract upgrade, replacing contract logic entirely | Critical | Multisig admin quorum (`set_admin_quorum`) recommended for production; `propose_upgrade`/`execute_upgrade` timelock provides a detection window even if quorum is bypassed |
 
 ### Engineer Registry
 
@@ -111,8 +112,8 @@ Mainstay is a decentralized physical infrastructure network (DePIN) built on Ste
 | T-LC-11 | **E**levation of Privilege | Cross-contract call to AssetRegistry returns stale/false data | High | Lifecycle verifies asset existence at call time; `try_get_asset` panics on non-existent assets |
 | T-LC-12 | **E**levation of Privilege | Cross-contract call to EngineerRegistry bypassed or replayed | High | `get_credential_status` is called at submission time; fallback `verify_engineer` for non-Valid status |
 | T-LC-13 | **E**levation of Privilege | Engineer reputation score is manipulated to inflate collateral weight | Medium | Reputation is read from EngineerRegistry at submission time; not cached in Lifecycle |
-| T-LC-14 | **E**levation of Privilege | Same address passed for both registries; cross-contract calls resolve incorrectly (#1254) | High | `initialize` validates `asset_registry != engineer_registry`; returns `SameRegistryAddress` (error 13) if they match |
-| T-LC-15 | **E**levation of Privilege | Observer front-runs `initialize` to set attacker as admin (#1255) | Critical | `__constructor` stores deployer at deploy time; `initialize` requires `deployer.require_auth()` and verifies against stored `DEPLOYER_KEY` — non-deployers are rejected |
+| T-LC-14 | **E**levation of Privilege | Admin instantly swaps engineer/asset registry to a malicious contract (#1256) | Critical | Registry address changes now require a 48-hour timelock via `propose_update_{asset,engineer}_registry` → `execute_update_{asset,engineer}_registry`; direct `update_*_registry` calls are blocked without a prior proposal |
+| T-LC-15 | **D**enial of Service | Admin list unbounded — O(n) scan in `require_quorum` approaches instruction limits (#1259) | Medium | `set_admin_quorum` now rejects lists with more than `MAX_ADMINS` (10) addresses; error `TooManyAdmins` (39) |
 
 ### Lending
 
@@ -142,11 +143,21 @@ Mainstay is a decentralized physical infrastructure network (DePIN) built on Ste
 **Risk:** Medium
 **Mitigation:** Soroban contracts are Wasm-based and isolated. Cross-contract calls execute in the called contract's context. Re-entrancy is limited—the called contract cannot call back into the caller in the same invocation. Lifecycle performs local validation and state writes before external calls.
 
-### CC-03: Lifecycle Registry Binding Immutability
-**Description:** If the registry binding addresses (`REGISTRY`, `ENG_REG`) could be changed after initialization, an attacker could redirect Lifecycle to malicious registry contracts.
+### CC-03: Registry Address Substitution Attack
+**Description:** If the registry binding addresses (`REGISTRY`, `ENG_REG`) can be changed after initialization, a compromised or malicious admin can redirect Lifecycle to attacker-controlled contracts that return forged asset ownership or engineer credential status. Previous versions applied the change immediately on a single admin call with no delay.
 
 **Risk:** Critical
-**Mitigation:** Registry bindings are set once at `initialize` and are immutable thereafter. The `initialize` function is one-shot (cannot be called twice).
+**Mitigation (fixed in #1256):** Registry address changes now follow the same two-step timelocked pattern as all other critical config mutations:
+1. Admin calls `propose_update_asset_registry` or `propose_update_engineer_registry` — stores the pending address and starts the 48-hour timelock.
+2. After `TIMELOCK_DELAY_SECS` (172,800 seconds) has elapsed, the admin calls `execute_update_asset_registry` or `execute_update_engineer_registry` to apply the change.
+3. The legacy single-step `update_asset_registry` / `update_engineer_registry` entry points are now gated: they require an active, unexpired `AST_REG` / `ENG_REG` timelock to be present and consume it when called, preventing any instantaneous registry swap.
+
+**Trust Model for Registry Addresses:**
+- The asset registry and engineer registry addresses are set at `initialize` time by the deployer and cannot be changed without a 48-hour window visible to all chain observers.
+- The 48-hour window is intentionally longer than Stellar network upgrade cycles, giving integrators and lenders sufficient time to detect and respond to any unexpected registry change.
+- Registry address changes emit `PROP_AST` / `PROP_ENG` events (propose) and `REG_AST` / `REG_ENG` events (execute) that monitoring infrastructure should alert on.
+- For mainnet deployments, the admin should be a multisig account so no single key can unilaterally schedule a registry swap.
+- Operators running production deployments should subscribe to `ADM_AUD` events and treat any `PROP_AST` or `PROP_ENG` event as a critical alert requiring manual review before the 48-hour window expires.
 
 ### CC-04: Stale Data from Read-Only Cross-Contract Calls
 **Description:** Lifecycle reads asset data from AssetRegistry. If AssetRegistry's TTL has expired and data is stale, Lifecycle could operate on incorrect data.
@@ -191,19 +202,18 @@ The deployer key is the most critical key during deployment. If compromised, the
 
 **Mitigation:** Use a cold wallet for deployment; transfer admin to a multisig account after initialization. Store deployer key in a hardware wallet or secrets manager (HashiCorp Vault).
 
-### DI-03: Front-Running `initialize` on the Lifecycle Contract (#1255)
-Between deployment and `initialize`, an observer watching the mempool could attempt to call `initialize` with their own `admin` address before the legitimate deployer does.
+### DI-03: Admin Key Compromise + Contract Upgrade Attack
+**Description:** All four contracts (Asset Registry, Engineer Registry, Lifecycle, Lending) expose admin-gated `propose_upgrade(admin, new_wasm_hash)` / `execute_upgrade(admin)` functions that swap the contract's WASM code entirely. If a **single** admin key is compromised — via phishing, a leaked signer, a malicious dependency in a signing tool, or physical key theft — the attacker can propose an upgrade to arbitrary malicious WASM. Because contract logic is Turing-complete, a successful upgrade attack is total: the attacker could drain lending vaults, forge collateral scores, fabricate credentials, or remove all remaining access controls in one shot. This is qualitatively worse than any single-function exploit in the STRIDE tables above, because it replaces the rules those tables assume.
 
 **Risk:** Critical
 
-**Mitigation:** The Lifecycle contract uses a `DEPLOYER_KEY` pattern to prevent front-running:
-- The `__constructor` (called at deploy time) stores the deployer's address in instance storage under `DEPLOYER_KEY`.
-- `initialize` reads `DEPLOYER_KEY` from instance storage and requires `deployer.require_auth()` from that stored address. Any caller presenting a different address — or any call where `DEPLOYER_KEY` is absent — is rejected with `UnauthorizedAdmin` or `NotInitialized` respectively.
-- This means only the wallet that deployed the contract can call `initialize`, making front-run initialization impossible.
+**Mitigation — Multisig Admin Quorum (primary defense):**
+Production deployments should never run with a single admin key holding unilateral upgrade power. `set_admin_quorum(admin, new_admins, threshold)` converts the contract from single-admin mode to **M-of-N quorum mode**: once `admin_threshold > 1`, `require_quorum()` collects authorization from distinct admin addresses (deduplicated so one compromised signer cannot cast multiple votes) and blocks any admin-gated call — including `propose_upgrade`/`execute_upgrade` — until the threshold is met. A single compromised key is therefore insufficient to propose or execute an upgrade on its own; the attacker would need to separately compromise `threshold` independent keys, ideally held by different people/organizations/hardware wallets. See the runbook's [key management section](deployment-runbook.md#66-key-management-differences) for mainnet key custody guidance, and configure quorum immediately after initialization — see [DI-02](#di-02-admin-key-compromise-during-deployment) for the same principle applied to the deployer key itself.
 
-**Residual risk:** The `__constructor` and `initialize` must still be called in close succession. A well-resourced attacker who can delay ledger inclusion of the deployer's `initialize` transaction cannot front-run initialization, but *could* attempt to prevent the deployer from initializing by spamming the network. The runbook's recommendation to initialize in the same block as deployment (or immediately after) fully eliminates this residual risk.
+**Mitigation — Upgrade Timelock (defense in depth):**
+Even with quorum configured, upgrades are not instantaneous. `propose_upgrade` only records an intended `new_wasm_hash`; `execute_upgrade` is rejected until the configured timelock delay has elapsed (mirroring the 48-hour pattern used for asset deregistration in [CC-01](#cc-01-state-drift-between-contracts)). This delay exists specifically so that a malicious or erroneous upgrade proposal is **visible on-chain before it can take effect** — monitoring the `UPGRADE` event (emitted on both propose and execute, per [Section 5.1](deployment-runbook.md#51-event-monitoring) of the runbook) gives operators, auditors, and the community a window to detect an unauthorized proposal and respond (e.g., rally remaining quorum signers to avoid reaching threshold, or coordinate an off-chain response) before the malicious code goes live. The timelock does not prevent an attacker who already controls full quorum, but it removes the possibility of an instant, undetected upgrade — the two mitigations are complementary, not redundant: quorum raises the bar to *execute* an upgrade at all, and the timelock ensures that even a successful proposal is not silent.
 
-**Verification:** See `test_initialize_deployer_restriction_non_deployer_rejected` and `test_initialize_deployer_restriction_already_initialized` in `contracts/lifecycle/src/lib.rs`.
+**Residual risk:** If an attacker compromises `threshold` or more admin keys simultaneously (e.g. all keys custodied by the same operator, or a coordinated multi-party attack), both mitigations are bypassed. Operators should ensure quorum signers are held by genuinely independent parties/devices, not merely different key files on the same machine.
 
 ### DI-04: Testnet → Mainnet Configuration Drift
 Testnet configuration accidentally carried to mainnet (wrong admin, wrong thresholds).
