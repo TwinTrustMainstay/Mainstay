@@ -225,6 +225,19 @@ pub struct CostAnalytics {
     pub forecast_cost: u64,
 }
 
+/// Aggregated operating metrics for an owner's current fleet.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FleetPerformance {
+    pub asset_count: u32,
+    pub serviced_asset_count: u32,
+    pub maintenance_count: u32,
+    pub total_maintenance_cost: u64,
+    pub average_collateral_score: u32,
+    pub locked_asset_count: u32,
+    pub decommissioned_asset_count: u32,
+}
+
 /// An on-chain governance proposal to change a task-type score weight.
 ///
 /// Created by `propose_weight_change`; consumed (executed) by `execute_weight_change`

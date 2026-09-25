@@ -27,7 +27,7 @@ pub(crate) use events::{
 use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
-    AssetFullSnapshot, BatchRecord, CollateralPortfolioHealth, Config, CostAnalytics, DataKey, EngineerProductivity, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
+    AssetFullSnapshot, BatchRecord, CollateralPortfolioHealth, Config, CostAnalytics, DataKey, EngineerProductivity, FleetPerformance, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
     ScoreEntry, TimelockProposal, TransferRecord, WeightProposal,
     // Issue #1637 - Cross-Contract Score Consensus
     ExternalScoreEntry,
@@ -7671,6 +7671,58 @@ impl Lifecycle {
                 }));
                 if last_timestamp == Some(record.timestamp) {
                     last_cost = Some(cost);
+                }
+            }
+
+            /// Aggregate maintenance, cost, collateral, and lifecycle metrics for an owner fleet.
+            pub fn get_fleet_performance(env: Env, owner: Address) -> FleetPerformance {
+                let registry = get_asset_registry_addr(&env);
+                let client = asset_registry::AssetRegistryClient::new(&env, &registry);
+                let asset_ids = client.get_assets_by_owner(&owner);
+                let mut serviced = 0u32;
+                let mut maintenance_count = 0u32;
+                let mut total_cost = 0u64;
+                let mut total_score = 0u64;
+                let mut locked = 0u32;
+                let mut decommissioned = 0u32;
+
+                for asset_id in asset_ids.iter() {
+                    let asset = client.get_asset(&asset_id);
+                    let history: Vec<MaintenanceRecord> = env
+                        .storage()
+                        .persistent()
+                        .get(&history_key(asset_id))
+                        .unwrap_or_else(|| Vec::new(&env));
+                    if !history.is_empty() {
+                        serviced = serviced.saturating_add(1);
+                    }
+                    for record in history.iter() {
+                        maintenance_count = maintenance_count.saturating_add(1);
+                        total_cost = total_cost.saturating_add(record.cost.unwrap_or(0));
+                    }
+                    total_score = total_score
+                        .saturating_add(Self::get_collateral_score(env.clone(), asset_id) as u64);
+                    if asset.is_locked {
+                        locked = locked.saturating_add(1);
+                    }
+                    if asset.deprecation_status == asset_registry::DeprecationStatus::Decommissioned {
+                        decommissioned = decommissioned.saturating_add(1);
+                    }
+                }
+
+                let count = asset_ids.len();
+                FleetPerformance {
+                    asset_count: count,
+                    serviced_asset_count: serviced,
+                    maintenance_count,
+                    total_maintenance_cost: total_cost,
+                    average_collateral_score: if count == 0 {
+                        0
+                    } else {
+                        (total_score / count as u64) as u32
+                    },
+                    locked_asset_count: locked,
+                    decommissioned_asset_count: decommissioned,
                 }
             }
         }
