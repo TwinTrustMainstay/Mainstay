@@ -34,11 +34,22 @@ All fields are optional. Omitting a field applies no constraint for that dimensi
 |---|---|---|
 | `assets` | `Vec<Asset>` | Matched assets (capped at **100**). |
 | `total` | `u32` | Total match count before the 100-result cap. |
+| `facets` | `Vec<FacetCount>` | Counts by `asset_type` across the complete matched result set. |
+
+### FacetCount
+
+| Field | Type | Description |
+|---|---|---|
+| `asset_type` | `Symbol` | The asset type represented in the result set. |
+| `count` | `u32` | Number of matching assets of that type, including assets beyond the 100-result cap. |
 
 ## Limits
 
 - Maximum **100** assets returned per call.
 - `total` always reflects the full match count so callers can detect truncation.
+- `facets` are calculated before the result cap and respect every supplied filter.
+- Facets are returned in the order each asset type is first encountered; callers should
+  treat the list as an unordered set.
 
 ## Examples
 

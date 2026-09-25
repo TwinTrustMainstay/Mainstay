@@ -294,6 +294,16 @@ pub struct SearchPage {
     pub assets: Vec<Asset>,
     /// Total number of assets that matched the filter (before the 100-result cap).
     pub total: u32,
+    /// Counts for each asset type represented by the complete result set.
+    pub facets: Vec<FacetCount>,
+}
+
+/// A count of matching assets grouped by asset type.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FacetCount {
+    pub asset_type: Symbol,
+    pub count: u32,
 }
 
 /// Issue #1629: Asset usage tracking and analytics data
@@ -3073,6 +3083,7 @@ impl AssetRegistry {
 
         let mut matched: Vec<Asset> = Vec::new(&env);
         let mut total_matched: u32 = 0;
+        let mut facet_counts: Vec<(Symbol, u32)> = Vec::new(&env);
 
         for id in 1..=total_assets {
             let key = asset_key(id);
@@ -3110,6 +3121,18 @@ impl AssetRegistry {
             }
 
             total_matched += 1;
+            let mut facet_found = false;
+            for i in 0..facet_counts.len() {
+                let (facet_type, count) = facet_counts.get(i).unwrap();
+                if facet_type == asset.asset_type {
+                    facet_counts.set(i, (facet_type, count + 1));
+                    facet_found = true;
+                    break;
+                }
+            }
+            if !facet_found {
+                facet_counts.push_back((asset.asset_type.clone(), 1));
+            }
             if matched.len() < MAX_RESULTS {
                 matched.push_back(asset);
             }
@@ -3184,7 +3207,13 @@ impl AssetRegistry {
             }
         }
 
-        SearchPage { assets: matched, total: total_matched }
+        let mut facets: Vec<FacetCount> = Vec::new(&env);
+        for i in 0..facet_counts.len() {
+            let (asset_type, count) = facet_counts.get(i).unwrap();
+            facets.push_back(FacetCount { asset_type, count });
+        }
+
+        SearchPage { assets: matched, total: total_matched, facets }
     }
 
     /// Mark an asset as under maintenance.
@@ -8976,6 +9005,9 @@ mod tests {
         });
         assert_eq!(page.total, 2);
         assert_eq!(page.assets.len(), 2);
+        assert_eq!(page.facets.len(), 2);
+        assert_eq!(page.facets.get(0).unwrap().count, 1);
+        assert_eq!(page.facets.get(1).unwrap().count, 1);
     }
 
     #[test]
