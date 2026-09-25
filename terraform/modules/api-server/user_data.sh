@@ -70,10 +70,15 @@ docker run -d \
 #  - ip_limit:  100 req/min per IP
 #  - key_limit: 1000 req/day ≈ 17 req/min per API key
 cat > /etc/nginx/conf.d/mainstay-api.conf <<'NGINX'
+map $http_x_request_id $mainstay_request_id {
+    default $http_x_request_id;
+    ""      $request_id;
+}
+
 limit_req_zone $binary_remote_addr zone=ip_limit:10m rate=100r/m;
 limit_req_zone $http_x_api_key zone=key_limit:10m rate=17r/m;
 
-log_format ratelimit '$remote_addr [$time_local] "$request" $status '
+log_format ratelimit '$remote_addr [$time_local] request_id=$mainstay_request_id "$request" $status '
                      'limit_req=$limit_req_status '
                      'api_key="$http_x_api_key"';
 
@@ -121,6 +126,8 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Request-ID $mainstay_request_id;
+        add_header X-Request-ID $mainstay_request_id always;
 
         proxy_read_timeout 30s;
         proxy_connect_timeout 5s;

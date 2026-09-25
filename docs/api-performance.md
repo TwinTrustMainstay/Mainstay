@@ -23,3 +23,11 @@ service.
 `AssetRegistry::batch_get_assets(asset_ids)` resolves up to 50 asset IDs in
 one invocation and omits IDs that are not registered. API clients should use
 this endpoint for bulk hydration instead of calling `get_asset` sequentially.
+
+## Request tracing
+
+The regional Nginx proxy accepts an optional `X-Request-ID`. If the caller
+does not provide one, Nginx generates an ID and returns it on the response.
+The same value is forwarded to the API container and written to the access
+log, so clients can include it in support reports and operators can correlate
+the request across the proxy and application logs.
