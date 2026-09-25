@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `mainstay-sdk`: an official typed Rust facade for registration, asset lookup,
+  and faceted asset search.
 - `scripts/mock-soroban-rpc.py` and its fixture provide a deterministic,
   dependency-free Soroban JSON-RPC endpoint for offline integration tests.
 - `search_assets` now returns asset-type facet counts across the full matching result set,
