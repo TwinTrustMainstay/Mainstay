@@ -31,3 +31,16 @@ does not provide one, Nginx generates an ID and returns it on the response.
 The same value is forwarded to the API container and written to the access
 log, so clients can include it in support reports and operators can correlate
 the request across the proxy and application logs.
+
+## Response caching
+
+The regional proxy caches successful `GET` and `HEAD` API responses for five
+seconds and exposes `X-Cache-Status` (`HIT`, `MISS`, or `BYPASS`) for
+diagnostics. Cache keys include the API key and authorization-bearing requests
+are bypassed, preventing one caller's response from being served to another.
+Short TTLs limit exposure to stale indexed data; writes are never cached.
+
+Contract-backed decisions that require the latest ledger state must continue
+to call the contract directly, as documented in the lender integration guide.
+The external API service should publish the existing SNS/SQS invalidation
+events when its write endpoints commit successfully.
