@@ -1185,6 +1185,29 @@ impl AssetRegistry {
         asset
     }
 
+    /// Return all registered assets from `asset_ids` in one invocation.
+    ///
+    /// Missing IDs are omitted, matching the tolerant behavior of the other
+    /// batch read endpoints. The input is bounded to keep response and
+    /// instruction usage predictable for API clients.
+    pub fn batch_get_assets(env: Env, asset_ids: Vec<u64>) -> Vec<Asset> {
+        if asset_ids.len() > MAX_BATCH_SIZE {
+            panic_with_error!(&env, ContractError::BatchTooLarge);
+        }
+
+        let mut assets = Vec::new(&env);
+        for asset_id in asset_ids.iter() {
+            let key = asset_key(asset_id);
+            if let Some(asset) = env.storage().persistent().get(&key) {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+                assets.push_back(asset);
+            }
+        }
+        assets
+    }
+
     /// Look up an asset by its physical serial number.
     ///
     /// Field engineers and auditors who know a machine's manufacturer plate number

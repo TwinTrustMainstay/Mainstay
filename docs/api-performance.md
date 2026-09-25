@@ -17,3 +17,9 @@ fields. Unknown asset IDs retain the single-record endpoint's
 The deployed API image (`ghcr.io/mainstay/api-server`) is not part of this
 repository, so GraphQL schema and resolver changes must be made in that
 service.
+
+## Bulk asset reads
+
+`AssetRegistry::batch_get_assets(asset_ids)` resolves up to 50 asset IDs in
+one invocation and omits IDs that are not registered. API clients should use
+this endpoint for bulk hydration instead of calling `get_asset` sequentially.
