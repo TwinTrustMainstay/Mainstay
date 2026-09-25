@@ -192,6 +192,17 @@ pub struct AssetFullSnapshot {
     pub last_service_timestamp: u64,
 }
 
+/// Aggregated collateral health for the assets currently owned by an address.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollateralPortfolioHealth {
+    pub asset_count: u32,
+    pub eligible_asset_count: u32,
+    pub locked_asset_count: u32,
+    pub total_collateral_score: u64,
+    pub average_collateral_score: u32,
+}
+
 /// An on-chain governance proposal to change a task-type score weight.
 ///
 /// Created by `propose_weight_change`; consumed (executed) by `execute_weight_change`

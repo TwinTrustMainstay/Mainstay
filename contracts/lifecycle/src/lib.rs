@@ -27,7 +27,7 @@ pub(crate) use events::{
 use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
-    AssetFullSnapshot, BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
+    AssetFullSnapshot, BatchRecord, CollateralPortfolioHealth, Config, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
     ScoreEntry, TimelockProposal, TransferRecord, WeightProposal,
     // Issue #1637 - Cross-Contract Score Consensus
     ExternalScoreEntry,
@@ -7553,6 +7553,45 @@ impl Lifecycle {
             extend_persistent_ttl(&env, &key);
         }
         config
+    }
+
+    /// Aggregate collateral health for all assets currently owned by `owner`.
+    pub fn get_collateral_portfolio_health(
+        env: Env,
+        owner: Address,
+    ) -> CollateralPortfolioHealth {
+        let registry = get_asset_registry_addr(&env);
+        let client = asset_registry::AssetRegistryClient::new(&env, &registry);
+        let assets = client.get_assets_by_owner(&owner);
+        let config = Self::get_config(env.clone());
+        let mut eligible = 0u32;
+        let mut locked = 0u32;
+        let mut total_score = 0u64;
+
+        for asset_id in assets.iter() {
+            let asset = client.get_asset(&asset_id);
+            let score = Self::get_collateral_score(env.clone(), asset_id);
+            total_score = total_score.saturating_add(score as u64);
+            if score >= config.min_collateral_score {
+                eligible = eligible.saturating_add(1);
+            }
+            if asset.is_locked {
+                locked = locked.saturating_add(1);
+            }
+        }
+
+        let count = assets.len();
+        CollateralPortfolioHealth {
+            asset_count: count,
+            eligible_asset_count: eligible,
+            locked_asset_count: locked,
+            total_collateral_score: total_score,
+            average_collateral_score: if count == 0 {
+                0
+            } else {
+                (total_score / count as u64) as u32
+            },
+        }
     }
 }
 
