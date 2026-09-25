@@ -192,6 +192,52 @@ pub struct AssetFullSnapshot {
     pub last_service_timestamp: u64,
 }
 
+/// Aggregated collateral health for the assets currently owned by an address.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollateralPortfolioHealth {
+    pub asset_count: u32,
+    pub eligible_asset_count: u32,
+    pub locked_asset_count: u32,
+    pub total_collateral_score: u64,
+    pub average_collateral_score: u32,
+}
+
+/// Maintenance activity and cost metrics for one engineer.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EngineerProductivity {
+    pub asset_count: u32,
+    pub maintenance_count: u32,
+    pub total_cost: u64,
+    pub average_cost: u64,
+    pub last_activity: Option<u64>,
+}
+
+/// Historical maintenance cost analysis and a deterministic forward estimate.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CostAnalytics {
+    pub total_cost: u64,
+    pub recorded_cost_count: u32,
+    pub average_cost: u64,
+    pub last_cost: Option<u64>,
+    pub forecast_cost: u64,
+}
+
+/// Aggregated operating metrics for an owner's current fleet.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FleetPerformance {
+    pub asset_count: u32,
+    pub serviced_asset_count: u32,
+    pub maintenance_count: u32,
+    pub total_maintenance_cost: u64,
+    pub average_collateral_score: u32,
+    pub locked_asset_count: u32,
+    pub decommissioned_asset_count: u32,
+}
+
 /// An on-chain governance proposal to change a task-type score weight.
 ///
 /// Created by `propose_weight_change`; consumed (executed) by `execute_weight_change`

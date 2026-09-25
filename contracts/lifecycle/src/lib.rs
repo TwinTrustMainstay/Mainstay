@@ -27,7 +27,7 @@ pub(crate) use events::{
 use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
-    AssetFullSnapshot, BatchRecord, Config, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
+    AssetFullSnapshot, BatchRecord, CollateralPortfolioHealth, Config, CostAnalytics, DataKey, EngineerProductivity, FleetPerformance, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
     ScoreEntry, TimelockProposal, TransferRecord, WeightProposal,
     // Issue #1637 - Cross-Contract Score Consensus
     ExternalScoreEntry,
@@ -7553,6 +7553,199 @@ impl Lifecycle {
             extend_persistent_ttl(&env, &key);
         }
         config
+    }
+
+    /// Aggregate collateral health for all assets currently owned by `owner`.
+    pub fn get_collateral_portfolio_health(
+        env: Env,
+        owner: Address,
+    ) -> CollateralPortfolioHealth {
+        let registry = get_asset_registry_addr(&env);
+        let client = asset_registry::AssetRegistryClient::new(&env, &registry);
+        let assets = client.get_assets_by_owner(&owner);
+        let config = Self::get_config(env.clone());
+        let mut eligible = 0u32;
+        let mut locked = 0u32;
+        let mut total_score = 0u64;
+
+        for asset_id in assets.iter() {
+            let asset = client.get_asset(&asset_id);
+            let score = Self::get_collateral_score(env.clone(), asset_id);
+            total_score = total_score.saturating_add(score as u64);
+            if score >= config.min_collateral_score {
+                eligible = eligible.saturating_add(1);
+            }
+            if asset.is_locked {
+                locked = locked.saturating_add(1);
+            }
+        }
+
+        let count = assets.len();
+        CollateralPortfolioHealth {
+            asset_count: count,
+            eligible_asset_count: eligible,
+            locked_asset_count: locked,
+            total_collateral_score: total_score,
+            average_collateral_score: if count == 0 {
+                0
+            } else {
+                (total_score / count as u64) as u32
+            },
+        }
+    }
+
+    /// Return maintenance productivity metrics for an engineer since a timestamp.
+    pub fn get_engineer_productivity(
+        env: Env,
+        engineer: Address,
+        since_timestamp: u64,
+    ) -> EngineerProductivity {
+        let asset_ids = Self::get_engineer_maintenance_history(env.clone(), engineer.clone());
+        let mut asset_count = 0u32;
+        let mut maintenance_count = 0u32;
+        let mut total_cost = 0u64;
+        let mut last_activity = None;
+
+        for asset_id in asset_ids.iter() {
+            let records = Self::get_maintenance_history_by_engineer(
+                env.clone(),
+                asset_id,
+                engineer.clone(),
+            );
+            let mut counted_asset = false;
+            for record in records.iter() {
+                if record.timestamp < since_timestamp {
+                    continue;
+                }
+                counted_asset = true;
+                maintenance_count = maintenance_count.saturating_add(1);
+                total_cost = total_cost.saturating_add(record.cost.unwrap_or(0));
+                if last_activity.is_none_or(|timestamp| record.timestamp > timestamp) {
+                    last_activity = Some(record.timestamp);
+                }
+            }
+            if counted_asset {
+                asset_count = asset_count.saturating_add(1);
+            }
+        }
+
+        EngineerProductivity {
+            asset_count,
+            maintenance_count,
+            total_cost,
+            average_cost: if maintenance_count == 0 {
+                0
+            } else {
+                total_cost / maintenance_count as u64
+            },
+            last_activity,
+        }
+    }
+
+    /// Analyze recorded maintenance costs and estimate cost over a future period.
+    pub fn get_cost_analytics(
+        env: Env,
+        asset_id: u64,
+        forecast_period_secs: u64,
+    ) -> CostAnalytics {
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut total_cost = 0u64;
+        let mut count = 0u32;
+        let mut first_timestamp = None;
+        let mut last_timestamp = None;
+        let mut last_cost = None;
+
+        for record in history.iter() {
+            if let Some(cost) = record.cost {
+                total_cost = total_cost.saturating_add(cost);
+                count = count.saturating_add(1);
+                first_timestamp = Some(first_timestamp.map_or(record.timestamp, |value| {
+                    value.min(record.timestamp)
+                }));
+                last_timestamp = Some(last_timestamp.map_or(record.timestamp, |value| {
+                    value.max(record.timestamp)
+                }));
+                if last_timestamp == Some(record.timestamp) {
+                    last_cost = Some(cost);
+                }
+            }
+
+            /// Aggregate maintenance, cost, collateral, and lifecycle metrics for an owner fleet.
+            pub fn get_fleet_performance(env: Env, owner: Address) -> FleetPerformance {
+                let registry = get_asset_registry_addr(&env);
+                let client = asset_registry::AssetRegistryClient::new(&env, &registry);
+                let asset_ids = client.get_assets_by_owner(&owner);
+                let mut serviced = 0u32;
+                let mut maintenance_count = 0u32;
+                let mut total_cost = 0u64;
+                let mut total_score = 0u64;
+                let mut locked = 0u32;
+                let mut decommissioned = 0u32;
+
+                for asset_id in asset_ids.iter() {
+                    let asset = client.get_asset(&asset_id);
+                    let history: Vec<MaintenanceRecord> = env
+                        .storage()
+                        .persistent()
+                        .get(&history_key(asset_id))
+                        .unwrap_or_else(|| Vec::new(&env));
+                    if !history.is_empty() {
+                        serviced = serviced.saturating_add(1);
+                    }
+                    for record in history.iter() {
+                        maintenance_count = maintenance_count.saturating_add(1);
+                        total_cost = total_cost.saturating_add(record.cost.unwrap_or(0));
+                    }
+                    total_score = total_score
+                        .saturating_add(Self::get_collateral_score(env.clone(), asset_id) as u64);
+                    if asset.is_locked {
+                        locked = locked.saturating_add(1);
+                    }
+                    if asset.deprecation_status == asset_registry::DeprecationStatus::Decommissioned {
+                        decommissioned = decommissioned.saturating_add(1);
+                    }
+                }
+
+                let count = asset_ids.len();
+                FleetPerformance {
+                    asset_count: count,
+                    serviced_asset_count: serviced,
+                    maintenance_count,
+                    total_maintenance_cost: total_cost,
+                    average_collateral_score: if count == 0 {
+                        0
+                    } else {
+                        (total_score / count as u64) as u32
+                    },
+                    locked_asset_count: locked,
+                    decommissioned_asset_count: decommissioned,
+                }
+            }
+        }
+
+        let average_cost = if count == 0 {
+            0
+        } else {
+            total_cost / count as u64
+        };
+        let forecast_cost = match (first_timestamp, last_timestamp) {
+            (Some(first), Some(last)) if last > first => total_cost
+                .saturating_mul(forecast_period_secs)
+                / (last - first),
+            _ => average_cost,
+        };
+
+        CostAnalytics {
+            total_cost,
+            recorded_cost_count: count,
+            average_cost,
+            last_cost,
+            forecast_cost,
+        }
     }
 }
 
