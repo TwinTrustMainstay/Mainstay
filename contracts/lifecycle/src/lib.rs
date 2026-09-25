@@ -27,7 +27,7 @@ pub(crate) use events::{
 use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
-    AssetFullSnapshot, BatchRecord, CollateralPortfolioHealth, Config, DataKey, EngineerProductivity, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
+    AssetFullSnapshot, BatchRecord, CollateralPortfolioHealth, Config, CostAnalytics, DataKey, EngineerProductivity, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
     ScoreEntry, TimelockProposal, TransferRecord, WeightProposal,
     // Issue #1637 - Cross-Contract Score Consensus
     ExternalScoreEntry,
@@ -7639,6 +7639,60 @@ impl Lifecycle {
                 total_cost / maintenance_count as u64
             },
             last_activity,
+        }
+    }
+
+    /// Analyze recorded maintenance costs and estimate cost over a future period.
+    pub fn get_cost_analytics(
+        env: Env,
+        asset_id: u64,
+        forecast_period_secs: u64,
+    ) -> CostAnalytics {
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut total_cost = 0u64;
+        let mut count = 0u32;
+        let mut first_timestamp = None;
+        let mut last_timestamp = None;
+        let mut last_cost = None;
+
+        for record in history.iter() {
+            if let Some(cost) = record.cost {
+                total_cost = total_cost.saturating_add(cost);
+                count = count.saturating_add(1);
+                first_timestamp = Some(first_timestamp.map_or(record.timestamp, |value| {
+                    value.min(record.timestamp)
+                }));
+                last_timestamp = Some(last_timestamp.map_or(record.timestamp, |value| {
+                    value.max(record.timestamp)
+                }));
+                if last_timestamp == Some(record.timestamp) {
+                    last_cost = Some(cost);
+                }
+            }
+        }
+
+        let average_cost = if count == 0 {
+            0
+        } else {
+            total_cost / count as u64
+        };
+        let forecast_cost = match (first_timestamp, last_timestamp) {
+            (Some(first), Some(last)) if last > first => total_cost
+                .saturating_mul(forecast_period_secs)
+                / (last - first),
+            _ => average_cost,
+        };
+
+        CostAnalytics {
+            total_cost,
+            recorded_cost_count: count,
+            average_cost,
+            last_cost,
+            forecast_cost,
         }
     }
 }
