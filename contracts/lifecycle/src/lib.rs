@@ -96,6 +96,8 @@ const FEE_CRITICAL: u64 = 5_000;
 /// tight cycle can grow `HealthSnapshots(asset_id)` without bound, inflating
 /// read costs and persistent-TTL-extension costs on every call.
 const DEFAULT_MAX_SNAPSHOTS: u32 = 500;
+/// Maximum number of asset snapshots returned by one aggregate read.
+pub const MAX_SNAPSHOT_BATCH_SIZE: u32 = 50;
 /// Default retirement review period: 7 days in seconds.
 const DEFAULT_RETIREMENT_REVIEW_PERIOD: u64 = 604_800;
 /// Default coordinated task timeout: 30 days in seconds.
@@ -4487,6 +4489,27 @@ impl Lifecycle {
             total_maintenance_records,
             last_service_timestamp,
         }
+    }
+
+    /// Return complete snapshots for multiple assets in one contract invocation.
+    ///
+    /// This is the contract-side aggregation primitive for API gateways and
+    /// GraphQL resolvers. It keeps clients from issuing one RPC request per
+    /// related asset while preserving the same snapshot shape and validation
+    /// semantics as `get_asset_full_snapshot`.
+    ///
+    /// The batch is bounded so a caller cannot create an unbounded response or
+    /// exceed Soroban instruction and data limits.
+    pub fn get_asset_full_snapshots(env: Env, asset_ids: Vec<u64>) -> Vec<AssetFullSnapshot> {
+        if asset_ids.len() > MAX_SNAPSHOT_BATCH_SIZE {
+            panic_with_error!(&env, ContractError::BatchTooLarge);
+        }
+
+        let mut snapshots = Vec::new(&env);
+        for asset_id in asset_ids.iter() {
+            snapshots.push_back(Self::get_asset_full_snapshot(env.clone(), asset_id));
+        }
+        snapshots
     }
 
     /// Return the chronological collateral valuation history for an asset.
