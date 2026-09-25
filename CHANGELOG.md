@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `scripts/export-assets.py` exports backed-up asset records to CSV and
+  dependency-free Excel `.xlsx` workbooks.
 - `mainstay-sdk`: an official typed Rust facade for registration, asset lookup,
   and faceted asset search.
 - `scripts/mock-soroban-rpc.py` and its fixture provide a deterministic,
