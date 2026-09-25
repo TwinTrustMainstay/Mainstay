@@ -203,6 +203,17 @@ pub struct CollateralPortfolioHealth {
     pub average_collateral_score: u32,
 }
 
+/// Maintenance activity and cost metrics for one engineer.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EngineerProductivity {
+    pub asset_count: u32,
+    pub maintenance_count: u32,
+    pub total_cost: u64,
+    pub average_cost: u64,
+    pub last_activity: Option<u64>,
+}
+
 /// An on-chain governance proposal to change a task-type score weight.
 ///
 /// Created by `propose_weight_change`; consumed (executed) by `execute_weight_change`

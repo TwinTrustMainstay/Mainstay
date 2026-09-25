@@ -27,7 +27,7 @@ pub(crate) use events::{
 use crate::errors::ContractError;
 use crate::scoring::{apply_decay, compute_decay, get_task_weight, score_history_push, valuation_history_push};
 use crate::types::{
-    AssetFullSnapshot, BatchRecord, CollateralPortfolioHealth, Config, DataKey, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
+    AssetFullSnapshot, BatchRecord, CollateralPortfolioHealth, Config, DataKey, EngineerProductivity, HealthSnapshot, MaintenanceRecord, Priority, RecurringTask,
     ScoreEntry, TimelockProposal, TransferRecord, WeightProposal,
     // Issue #1637 - Cross-Contract Score Consensus
     ExternalScoreEntry,
@@ -7591,6 +7591,54 @@ impl Lifecycle {
             } else {
                 (total_score / count as u64) as u32
             },
+        }
+    }
+
+    /// Return maintenance productivity metrics for an engineer since a timestamp.
+    pub fn get_engineer_productivity(
+        env: Env,
+        engineer: Address,
+        since_timestamp: u64,
+    ) -> EngineerProductivity {
+        let asset_ids = Self::get_engineer_maintenance_history(env.clone(), engineer.clone());
+        let mut asset_count = 0u32;
+        let mut maintenance_count = 0u32;
+        let mut total_cost = 0u64;
+        let mut last_activity = None;
+
+        for asset_id in asset_ids.iter() {
+            let records = Self::get_maintenance_history_by_engineer(
+                env.clone(),
+                asset_id,
+                engineer.clone(),
+            );
+            let mut counted_asset = false;
+            for record in records.iter() {
+                if record.timestamp < since_timestamp {
+                    continue;
+                }
+                counted_asset = true;
+                maintenance_count = maintenance_count.saturating_add(1);
+                total_cost = total_cost.saturating_add(record.cost.unwrap_or(0));
+                if last_activity.is_none_or(|timestamp| record.timestamp > timestamp) {
+                    last_activity = Some(record.timestamp);
+                }
+            }
+            if counted_asset {
+                asset_count = asset_count.saturating_add(1);
+            }
+        }
+
+        EngineerProductivity {
+            asset_count,
+            maintenance_count,
+            total_cost,
+            average_cost: if maintenance_count == 0 {
+                0
+            } else {
+                total_cost / maintenance_count as u64
+            },
+            last_activity,
         }
     }
 }
