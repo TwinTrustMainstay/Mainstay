@@ -383,6 +383,68 @@ jobs:
       - name: Audit dependencies
         run: cargo audit
 
+  security-scan:
+    name: Automated Security Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Semgrep
+        run: |
+          pip install semgrep
+
+      - name: Run Semgrep SAST scan
+        run: |
+          semgrep --config=p/owasp-top-ten --config=p/security-audit \
+            --json -o semgrep-results.json . || echo "Semgrep scan completed with issues"
+          cat semgrep-results.json || true
+
+      - name: Block on critical findings
+        run: |
+          if grep -q '"severity": "CRITICAL"' semgrep-results.json 2>/dev/null; then
+            echo "❌ Critical security issues found"
+            exit 1
+          fi
+          echo "✓ No critical security issues detected"
+
+      - name: Upload security scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-results
+          path: semgrep-results.json
+
+  dependency-scan:
+    name: Dependency Vulnerability Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Audit Rust dependencies
+        run: |
+          cargo audit --json -o audit-results.json || echo "Audit completed with vulnerabilities"
+          cat audit-results.json || true
+
+      - name: Block on critical vulnerabilities
+        run: |
+          if grep -q '"severity": "critical"' audit-results.json 2>/dev/null; then
+            echo "❌ Critical vulnerabilities found in dependencies"
+            exit 1
+          fi
+          echo "✓ No critical dependency vulnerabilities detected"
+
+      - name: Upload audit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-audit-results
+          path: audit-results.json
+
   secret-scan:
     name: Secret Scan
     runs-on: ubuntu-latest
