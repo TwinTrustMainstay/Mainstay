@@ -61,6 +61,77 @@ pub struct MaintenanceRecord {
     pub reconstructed: bool,
 }
 
+/// Return-on-investment metrics for an asset's maintenance program.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceRoi {
+    pub asset_id: u64,
+    pub maintenance_cost: u64,
+    pub avoided_loss: u64,
+    /// ROI in basis points: 10,000 represents a 100% return.
+    pub roi_basis_points: i64,
+    pub maintenance_count: u32,
+}
+
+/// An anonymized aggregate of maintenance outcomes for one asset category.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndustryBenchmark {
+    pub asset_type: Symbol,
+    pub member_count: u32,
+    pub mean_score: u32,
+    pub mean_maintenance_count: u32,
+    pub mean_maintenance_cost: u64,
+}
+
+/// A compliance and audit summary generated from on-chain lifecycle data.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComplianceReport {
+    pub asset_id: u64,
+    pub standard_registered: bool,
+    pub total_maintenance_records: u32,
+    pub compliant_records: u32,
+    pub non_compliant_records: u32,
+    pub compliance_percentage: u32,
+    pub total_cost: u64,
+    pub chain_integrity: bool,
+    pub generated_at: u64,
+}
+
+/// An immutable audit entry for a maintenance record.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceAuditEntry {
+    pub asset_id: u64,
+    pub record_timestamp: u64,
+    pub actor: Address,
+    pub action: Symbol,
+    pub record_hash: Bytes,
+    pub timestamp: u64,
+}
+
+/// A third-party verification of a maintenance record.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceAttestation {
+    pub asset_id: u64,
+    pub record_timestamp: u64,
+    pub attestor: Address,
+    pub statement: Bytes,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceSignature {
+    pub asset_id: u64,
+    pub record_timestamp: u64,
+    pub signer: Address,
+    pub public_key: BytesN<32>,
+    pub signature: BytesN<64>,
+}
+
 /// A point-in-time snapshot of the collateral score, recorded at each maintenance event.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -444,6 +515,11 @@ pub enum DataKey {
     WeightProposal(Symbol),
     /// Stores `Vec<DisputeRecord>` for a given asset (issue #1319).
     Disputes(u64),
+    MaintenanceAudit(u64),
+    MaintenanceAttestations(u64),
+    AttestorAuth(u64, Address),
+    MaintenanceSignatures(u64),
+    CompressedHistory(u64),
 }
 
 /// A dispute record for challenging maintenance record authenticity (issue #1319).

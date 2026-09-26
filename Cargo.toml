@@ -6,6 +6,7 @@ members = [
     "contracts/lifecycle",
     "contracts/lending",
     "tests",
+    "sdk/rust",
 ]
 resolver = "2"
 

@@ -16,6 +16,21 @@ pub(crate) fn history_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("HIST"), asset_id)
 }
 
+/// Environmental impact measurements keyed by asset and history index.
+pub(crate) fn environmental_impact_key(asset_id: u64, record_index: u32) -> (Symbol, u64, u32) {
+    (symbol_short!("ENV_IMP"), asset_id, record_index)
+}
+
+/// Addresses interested in real-time lifecycle updates for an asset.
+pub(crate) fn update_subscribers_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("UPD_SUB"), asset_id)
+}
+
+/// Append-only corrections for an asset's maintenance record.
+pub(crate) fn maintenance_corrections_key(asset_id: u64, record_index: u32) -> (Symbol, u64, u32) {
+    (symbol_short!("MNT_CORR"), asset_id, record_index)
+}
+
 /// Current collateral score for an asset: `u32`.
 pub(crate) fn score_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("SCORE"), asset_id)
@@ -58,6 +73,18 @@ pub(crate) fn transfer_hist_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("XFER_HIST"), asset_id)
 }
 
+pub(crate) fn maintenance_audit_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("MNT_AUD"), asset_id)
+}
+
+pub(crate) fn maintenance_attestations_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("MNT_ATT"), asset_id)
+}
+
+pub(crate) fn attestor_auth_key(asset_id: u64, attestor: &Address) -> (Symbol, u64, Address) {
+    (symbol_short!("ATT_AUTH"), asset_id, attestor.clone())
+}
+
 // ---------------------------------------------------------------------------
 // Per-engineer keys
 // ---------------------------------------------------------------------------
@@ -75,6 +102,11 @@ pub(crate) fn engineer_auth_key(asset_id: u64, engineer: &Address) -> (Symbol, u
 /// Rolling-hour submission rate window for an engineer: `(window_start: u64, count: u32)`.
 pub(crate) fn submission_window_key(engineer: &Address) -> (Symbol, Address) {
     (symbol_short!("SUB_WIN"), engineer.clone())
+}
+
+/// Optional per-user override for the rolling-hour submission limit.
+pub(crate) fn user_submission_limit_key(user: &Address) -> (Symbol, Address) {
+    (symbol_short!("USR_RATE"), user.clone())
 }
 
 /// Timelock proposal for revoking an engineer's auth on an asset: `TimelockProposal`.

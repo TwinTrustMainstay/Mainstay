@@ -1,0 +1,10 @@
+[package]
+name = "mainstay-sdk"
+version = "0.1.0"
+edition = "2021"
+description = "Typed Rust client helpers for Mainstay Soroban contracts"
+license = "MIT"
+
+[dependencies]
+asset-registry = { path = "../../contracts/asset-registry" }
+soroban-sdk = { workspace = true }
