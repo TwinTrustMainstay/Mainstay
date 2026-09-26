@@ -29,6 +29,14 @@ A hash of maintenance documentation that proves an asset's maintenance history c
 
 ## Smart Contract Functions
 
+### 0. Generate an Audit Report
+
+`generate_compliance_report(asset_id, compliance_proof_hash)` returns an
+auditable summary containing the registered-standard status, total and
+compliant record counts, compliance percentage, total recorded cost, and
+maintenance hash-chain integrity. The report is deterministic for the
+provided proof and can be archived by compliance systems as an audit result.
+
 ### 1. Register Maintenance Standard
 
 Register a maintenance standard for a specific asset type.

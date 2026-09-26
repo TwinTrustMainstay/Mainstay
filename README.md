@@ -151,6 +151,7 @@ stellar keys generate deployer --network testnet
 - [Architecture Overview](docs/architecture.md)
 - [Life-Cycle Contract Design](docs/lifecycle-contract.md)
 - [Engineer Credentialing](docs/credentialing.md)
+- [Engineer Operations](docs/engineer-operations.md)
 - [Collateral Scoring Model](docs/collateral-scoring.md)
 - [Threat Model & Security](docs/threat-model.md)
 - [Roadmap](docs/roadmap.md)

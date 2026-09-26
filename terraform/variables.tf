@@ -62,6 +62,24 @@ variable "network_passphrase" {
   default     = "Public Global Stellar Network ; September 2015"
 }
 
+variable "allowed_origins" {
+  description = "Browser origins allowed to call the API"
+  type        = list(string)
+  default     = ["https://app.mainstay.io"]
+}
+
+variable "log_retention_days" {
+  description = "Number of days to retain API access and error logs"
+  type        = number
+  default     = 30
+}
+
+variable "request_retention_seconds" {
+  description = "Maximum retention for data-subject request messages"
+  type        = number
+  default     = 604800
+}
+
 # ── SQS queues for cross-region cache invalidation ──────────
 resource "aws_sqs_queue" "cache_invalidation" {
   for_each = var.regions
