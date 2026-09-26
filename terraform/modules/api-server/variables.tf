@@ -39,6 +39,24 @@ variable "network_passphrase" {
   type        = string
 }
 
+variable "allowed_origins" {
+  description = "Browser origins allowed to call the API"
+  type        = list(string)
+  default     = ["https://app.mainstay.io"]
+}
+
+variable "log_retention_days" {
+  description = "Number of days to retain API access and error logs"
+  type        = number
+  default     = 30
+}
+
+variable "request_retention_seconds" {
+  description = "Maximum retention for data-subject request messages"
+  type        = number
+  default     = 604800
+}
+
 # Data source for AZs in the region
 data "aws_availability_zones" "available" {
   state = "available"

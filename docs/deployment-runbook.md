@@ -7,6 +7,21 @@ Note: `scripts/deploy_testnet.sh` hard-requires `STELLAR_NETWORK=testnet` (from 
 ## Prerequisites
 - Stellar CLI installed and configured.
 - A functional identity (`deployer`) with enough lumens.
+- HashiCorp Vault configured with AWS IAM auth and a KV secret at the configured
+  `vault_secret_path`. The secret must contain `stellar_rpc_url` and
+  `third_party_api_key` fields.
+
+API instances authenticate to Vault with their EC2 instance profile. Do not put
+Vault tokens, API keys, or signing keys in Terraform variables, user data, or
+Docker command-line arguments. Vault Agent renders `/run/mainstay/mainstay.env`
+with mode `0600`; rotating the KV value is picked up by the agent template
+without changing Terraform state.
+
+Create the Vault AWS-auth role with the least-privilege policy in
+`terraform/vault-api-policy.hcl`. Store third-party credentials under the KV
+path configured by `vault_secret_path`, rotate them in Vault, and revoke the
+old value after the agent has rendered the replacement. The API proxy does not
+include `X-API-Key` values in access logs.
 
 ---
 

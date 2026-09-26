@@ -7,13 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Added invoice cost reconciliation, task grouping, maintenance dispute resolution,
+  and hash-based maintenance evidence attachments to the lifecycle contract.
+
 ### Added
+- `scripts/export-assets.py` exports backed-up asset records to CSV and
+  dependency-free Excel `.xlsx` workbooks.
+- `mainstay-sdk`: an official typed Rust facade for registration, asset lookup,
+  and faceted asset search.
+- `scripts/mock-soroban-rpc.py` and its fixture provide a deterministic,
+  dependency-free Soroban JSON-RPC endpoint for offline integration tests.
+- `search_assets` now returns asset-type facet counts across the full matching result set,
+  enabling clients to build advanced filters without a second query.
+- `calculate_maintenance_roi` and `MaintenanceRoi` expose auditable maintenance cost, avoided-loss, and ROI metrics (basis points).
+- `get_industry_benchmark` and `IndustryBenchmark` provide anonymized cross-tenant maintenance aggregates by asset type.
+- `record_score_baseline` now automatically persists and emits score anomalies when a new observation exceeds the configured two-standard-deviation threshold.
+- `generate_compliance_report` and `ComplianceReport` provide on-chain audit summaries with proof status, cost, record counts, and hash-chain integrity.
 - `.github/CODEOWNERS`: required-reviewer rules gate all PRs touching `contracts/`, CI workflows, `SECURITY.md`, and the threat-model doc (closes [#781](https://github.com/TwinTrustMainstay/Mainstay/issues/781))
 - `CONTRIBUTING.md`: documented branch-protection requirements (1 approval + passing CI, no force-push) and the CODEOWNERS review expectation for `contracts/` (closes [#781](https://github.com/TwinTrustMainstay/Mainstay/issues/781))
 - `test_cross_owner_duplicate_serial_rejected` in `asset-registry`: verifies that the global serial-number dedup key blocks a second owner from registering the same physical machine (closes [#782](https://github.com/TwinTrustMainstay/Mainstay/issues/782))
 - `test_decay_score_never_drops_to_zero_with_history` in `lifecycle`: verifies that calling `decay_score` on an asset with maintenance records never stores or returns 0 (closes [#784](https://github.com/TwinTrustMainstay/Mainstay/issues/784))
 - `ContractError` (`lifecycle/src/errors.rs`) variants added since 1.0.0: `ScoreOverflow` (19), `NotesTooLong` (20), `ScoreFrozen` (21), `AssetDecommissioned` (22), `BatchTooLarge` (23), `InsufficientSigners` (24), `Reentrancy` (25), `DuplicateAdmin` (26), `SnapshotNotFound` (27), `InsufficientPredictionData` (28), `WeightProposalAlreadyExists` (29), `SpecializationMismatch` (30), `RecurringTaskNotFound` (31), `RecurringTaskInactive` (32), `DuplicateRecurringTask` (33), `InvalidRecurringSchedule` (34), `DuplicateRecordNotFound` (35), `StandardAlreadyRegistered` (36), `RateLimitExceeded` (37), `BatchRevokeTooLarge` (38)
 - `Config` (`lifecycle/src/types.rs`) fields added since 1.0.0: `admins` and `admin_threshold` (multisig admin quorum), `max_engineer_history` (per-engineer history cap), `min_collateral_score`, `max_notes_length`, `task_weights`, `max_submissions_per_hour` (engineer rate limiting)
+- Regional encrypted DSAR tables and queues, with the privacy processing contract documented in `docs/privacy.md`.
 - Storage keys (`lifecycle/src/storage.rs`) added since 1.0.0: `SCHIST` (score history), `LUPD` (last score update timestamp), `FROZEN` / `FRZ_SCR` (decommission freeze flag and frozen score), `HLTH_SNP` (health snapshots), `XFER_HIST` (ownership transfer history), `ENG_HIST` / `ENG_AUTH` (per-engineer history and per-asset authorization), `SUB_WIN` (rolling-hour submission rate window), `RVK_TL` / `TL_PROP` (timelocked engineer-revocation and generic admin proposals), `MSTD` / `SCR_WGT` (per-asset-type maintenance standards and scoring weights)
 
 ### Fixed
@@ -23,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 - `initialize_admin` in `asset-registry` already required `deployer.require_auth()`, preventing front-run attacks; the existing `test_initialize_admin_rejects_non_deployer` test and deployment-runbook section 3 now explicitly document this protection (closes [#783](https://github.com/TwinTrustMainstay/Mainstay/issues/783))
+- API Nginx now emits baseline security headers, restricts CORS to configured origins, and omits API keys from access logs.
+- API instances now run in private subnets and accept port 8080 traffic only from the public load balancer security group.
+- API logs and data-subject messages now have configurable maximum retention, and API root volumes are encrypted at rest.
 
 ## [1.0.0] - 2026-06-02
 

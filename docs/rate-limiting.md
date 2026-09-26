@@ -38,6 +38,15 @@ Retry-After: 60
 }
 ```
 
+## Contract-level per-user limits
+
+Maintenance submissions are protected by a rolling-hour limit per engineer.
+The administrator can set an individual override with
+`update_user_submission_limit(admin, user, limit)`. This limit is checked for
+both single and batch submissions, so one user cannot bypass throttling by
+using batches. Passing `0` removes the override and returns the user to the
+contract-wide `max_submissions_per_hour` default.
+
 ## Nginx Configuration
 
 ### Main Configuration (`/etc/nginx/nginx.conf` additions)

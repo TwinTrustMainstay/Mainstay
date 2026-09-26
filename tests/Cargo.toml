@@ -227,3 +227,19 @@ path = "test_score_increment_init_1257.rs"
 [[test]]
 name = "test_registry_timelock_1256"
 path = "test_registry_timelock_1256.rs"
+
+[[test]]
+name = "test_security_regressions"
+path = "test_security_regressions.rs"
+
+[[test]]
+name = "test_concurrent_operations"
+path = "test_concurrent_operations.rs"
+
+[[test]]
+name = "test_storage_growth"
+path = "test_storage_growth.rs"
+
+[[test]]
+name = "test_state_snapshots"
+path = "test_state_snapshots.rs"

@@ -144,6 +144,11 @@ export_assets() {
     log "Exported $exported / $total assets"
 }
 
+export_analysis_formats() {
+    log "Exporting analysis formats..."
+    python3 "$ROOT/scripts/export-assets.py" "$BACKUP_DIR" --format both
+}
+
 export_engineers() {
     log "Exporting engineer credentials..."
 
@@ -295,16 +300,19 @@ main() {
     # 3. Export all assets
     export_assets "$total"
 
-    # 4. Export engineer credentials
+    # 4. Export analysis-friendly asset formats
+    export_analysis_formats
+
+    # 5. Export engineer credentials
     export_engineers
 
-    # 5. Export maintenance history and scores
+    # 6. Export maintenance history and scores
     export_maintenance_history "$total"
 
-    # 6. Generate manifest and checksums
+    # 7. Generate manifest and checksums
     generate_manifest
 
-    # 7. Upload to S3 (if configured)
+    # 8. Upload to S3 (if configured)
     upload_to_s3
 
     log "=== Backup complete ==="
