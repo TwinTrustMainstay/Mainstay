@@ -316,6 +316,7 @@ Use this checklist when responding to any Mainstay incident:
 
 ## Related Documents
 
+- [Operations Runbook](operations-runbook.md)
 - [Backup Procedures](backup-procedures.md)
 - [Deployment Runbook](deployment-runbook.md)
 - [Monitoring Guide](monitoring-guide.md)
