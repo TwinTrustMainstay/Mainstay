@@ -638,6 +638,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "engineer-bond"
+version = "0.1.0"
+dependencies = [
+ "shared",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "engineer-registry"
 version = "0.1.0"
 dependencies = [

@@ -6,6 +6,7 @@ members = [
     "contracts/lifecycle",
     "contracts/lending",
     "contracts/incident-management",
+    "contracts/engineer-bond",
     "tests",
     "sdk/rust",
 ]
