@@ -5,6 +5,7 @@ members = [
     "contracts/engineer-registry",
     "contracts/lifecycle",
     "contracts/lending",
+    "contracts/marketplace",
     "tests",
     "sdk/rust",
 ]
