@@ -57,6 +57,12 @@ jobs:
       - name: Test backup verification and retention tooling
         run: bash scripts/test_backup_tooling.sh
 
+      - name: Check metrics catalog is in sync with emitting scripts
+        run: bash scripts/check_metrics_catalog.sh
+
+      - name: Test FinOps cost tracker
+        run: python3 -m unittest discover -s scripts/finops -p 'test_*.py' -v
+
       - name: Run clippy lints
         run: cargo clippy --workspace --all-targets -- -D warnings
 

@@ -82,3 +82,6 @@ tarpaulin-report.html
 # Misc editor artifacts
 *.orig
 *.rej
+
+# FinOps cost ledger (operational data; keep out of git)
+costs/

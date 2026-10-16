@@ -27,6 +27,14 @@ metrics:
     source: scripts/monitoring/prometheus-exporter.sh
     description: Total RPC call time in the latest collection (response time = sum / requests).
 
+  - name: mainstay_operation_gas_stroops_total
+    type: counter
+    unit: stroops
+    labels: [operation, department]
+    retention: daily
+    source: scripts/finops/cost_tracker.py
+    description: Cumulative gas (fee) spend per contract operation and department.
+
   - name: mainstay_assets_total
     type: gauge
     unit: assets
