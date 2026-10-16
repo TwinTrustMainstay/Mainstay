@@ -12,6 +12,7 @@ This document lists every `ContractError` variant across the three core contract
 - [Lending](#lending)
 - [MobileApi](#mobileapi)
 - [ZkPrivacy](#zkprivacy)
+- [Timestamping](#timestamping)
 
 ---
 
@@ -321,6 +322,36 @@ Errors returned by the `zk-privacy` contract (`contracts/zk-privacy`).
 
 - **`InvalidProof`** – regenerate the proof from the current commitment, roster order, asset id, and threshold. Proofs are bound to all of these, so a stale or copied proof fails.
 - **`SessionNotFound` / `IncompleteProof`** – the collateral flow is begin, then bit chunks in order, then finalize. Resume from the `verified` count in `get_collateral_session`.
+
+## Timestamping
+
+Errors returned by the `timestamping` contract (`contracts/timestamping`).
+
+| Code | Variant | Description |
+|------|---------|-------------|
+| 1 | `NotInitialized` | The contract has not been initialized. |
+| 2 | `AlreadyInitialized` | `initialize` was called a second time. |
+| 3 | `UnauthorizedAdmin` | The caller is not the stored admin. |
+| 4 | `AuthorityNotFound` | No timestamp authority is registered under this key. |
+| 5 | `AuthorityAlreadyExists` | An authority with this key is already registered, including a revoked one. |
+| 6 | `AuthorityRevoked` | The authority has been revoked and can no longer attest. |
+| 7 | `AuthorityExpired` | The attested time is past the authority's validity window. |
+| 8 | `RecordExists` | A timestamp is already recorded for this record id. |
+| 9 | `RecordNotFound` | No timestamp record exists for this id. |
+| 10 | `FutureTimestamp` | The attested time is more than `MAX_CLOCK_SKEW_SECS` (300 s) ahead of the ledger clock. |
+| 11 | `StaleRenewal` | A renewal's time is not later than the record's latest timestamp. |
+| 12 | `RecordExpired` | The record's validity has ended, so it can no longer be renewed. |
+| 13 | `InvalidValidity` | The record validity period is outside the allowed range (1 to 20 years). |
+| 14 | `InvalidAuthorityValidity` | The authority's validity end is not in the future. |
+| 15 | `HistoryFull` | The authority history has reached `MAX_HISTORY_ENTRIES` (200). |
+| 16 | `InvalidRevocationTime` | A revocation was set to take effect in the future. |
+
+### Resolution guidance
+
+- **`AuthorityExpired`** – the TSA key's window has ended. Renew the authority (`renew_authority`) or use a current key.
+- **`AuthorityRevoked`** – the key is revoked. Obtain attestations from the replacement authority. Revoked keys cannot be re-registered.
+- **`FutureTimestamp`** – the TSA's clock is ahead of the ledger. Check the relayer's clock sync.
+- **`HistoryFull`** – archive `get_authority_history` off-chain, then start a new deployment if the log has to be reset.
 
 ## Common patterns across all contracts
 

@@ -21,6 +21,7 @@ ERROR_SOURCE_FILES=(
   "contracts/lending/src/errors.rs"
   "contracts/mobile-api/src/lib.rs"
   "contracts/zk-privacy/src/lib.rs"
+  "contracts/timestamping/src/lib.rs"
 )
 
 missing=0
