@@ -10,6 +10,7 @@ This document lists every `ContractError` variant across the three core contract
 - [EngineerRegistry](#engineerregistry)
 - [Lifecycle](#lifecycle)
 - [Lending](#lending)
+- [MobileApi](#mobileapi)
 
 ---
 
@@ -274,6 +275,30 @@ The lending error codes are unique. In particular, `TimelockNotExpired` and `Pro
 | `InsuranceVerificationFailed` | Verify the policy details with the insurer and retry with valid coverage information. |
 
 ---
+
+## MobileApi
+
+Errors returned by the `mobile-api` contract (`contracts/mobile-api`).
+
+| Code | Variant | Description |
+|------|---------|-------------|
+| 1 | `NotInitialized` | The contract has not been initialized. |
+| 2 | `AlreadyInitialized` | `initialize` was called a second time. |
+| 3 | `UnauthorizedAdmin` | The caller is not the stored admin for an admin-only call. |
+| 4 | `ClientNotRegistered` | The client must call `register_client` before reading the feed or subscribing. |
+| 5 | `UnsupportedApiVersion` | The client's API version is below `MIN_API_VERSION`. Upgrade the client app. |
+| 6 | `RateLimitExceeded` | The client used its request budget for the current window. Retry after the window resets. |
+| 7 | `InvalidLimit` | `limit` was 0 or above `MAX_PAGE_SIZE` (100). |
+| 8 | `InvalidTopics` | A subscription must have between 1 and `MAX_SUBSCRIPTION_TOPICS` (16) topics. |
+| 9 | `InvalidRateLimitConfig` | Rate-limit settings were outside the allowed bounds. |
+| 10 | `ChangeNotFound` | The sequence number is outside the retained change log. |
+| 11 | `NoSubscription` | `pull_notifications` was called before `subscribe`. |
+
+### Resolution guidance
+
+- **`UnsupportedApiVersion`** – the app is too old to talk to this server. Ship an update.
+- **`RateLimitExceeded`** – back off until the window resets (`get_rate_limit` returns the window length). Batch reads where possible.
+- **`ChangeNotFound`** – the cursor is outside the retained log. Use `sync` and check `full_resync_required` instead of calling `get_change` directly.
 
 ## Common patterns across all contracts
 

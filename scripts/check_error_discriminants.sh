@@ -12,7 +12,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 violations=0
 
 # Process each contract
-for contract in asset-registry engineer-registry lifecycle lending; do
+for contract in asset-registry engineer-registry lifecycle lending mobile-api; do
   contract_path="${REPO_ROOT}/contracts/${contract}"
   [ -d "$contract_path" ] || continue
 
