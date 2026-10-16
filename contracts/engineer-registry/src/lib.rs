@@ -51,6 +51,8 @@ pub enum ContractError {
     InvalidWorkWindow = 34,
     EngineerUnavailable = 35,
     WorkAssignmentNotFound = 36,
+    /// Quality bonus is zero or exceeds `MAX_QUALITY_BONUS` (#1742).
+    InvalidReputationBonus = 37,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -63,6 +65,7 @@ impl From<SharedContractError> for ContractError {
             SharedContractError::TimelockNotExpired => ContractError::TimelockNotExpired,
             SharedContractError::ProposalNotFound => ContractError::ProposalNotFound,
             SharedContractError::PendingAdminAlreadyExists => ContractError::PendingAdminAlreadyExists,
+            SharedContractError::InvalidSuspensionPeriod => ContractError::InvalidSuspensionPeriod,
         }
     }
 }
@@ -253,6 +256,11 @@ const NEXT_ASSIGNMENT_ID_KEY: Symbol = symbol_short!("NXT_ASG");
 const DEFAULT_DECAY_INTERVAL_SECS: u64 = 90 * 86_400;
 /// Default decay rate: 5% per interval (#1315)
 const DEFAULT_DECAY_RATE_BPS: u32 = 500; // 5% in basis points
+/// Maximum reputation score an engineer can reach (#1742 cap).
+const MAX_REPUTATION: u32 = 1000;
+/// Largest single quality bonus an admin may award in one call (#1742).
+const MAX_QUALITY_BONUS: u32 = 50;
+const QUALITY_BONUS_EVENT: Symbol = symbol_short!("QUAL_BON");
 
 fn is_paused(env: &Env) -> bool {
     env.storage().persistent().get(&PAUSED_KEY).unwrap_or(false)
@@ -1031,7 +1039,7 @@ impl EngineerRegistry {
             (admin.clone(), env.ledger().timestamp()),
         );
         env.events().publish(
-            (symbol_short!("ADM_CANCEL"),),
+            (symbol_short!("ADM_CNCL"),),
             (admin,),
         );
     }
@@ -1642,17 +1650,73 @@ impl EngineerRegistry {
             .persistent()
             .get(&engineer_key(&engineer))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
-        let new_rep = (record.reputation_score as i64)
+        let now = env.ledger().timestamp();
+        // Apply any inactivity decay before adding the delta, otherwise the
+        // write below would persist the undecayed score and erase the decay.
+        let decayed = apply_reputation_decay(&record, now) as i64;
+        let new_rep = decayed
             .saturating_add(delta as i64)
-            .clamp(0, 1000) as u32;
+            .clamp(0, MAX_REPUTATION as i64) as u32;
         record.reputation_score = new_rep;
-        record.last_active_at = env.ledger().timestamp();
+        record.last_active_at = now;
         env.storage()
             .persistent()
             .set(&engineer_key(&engineer), &record);
         env.storage()
             .persistent()
             .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
+    }
+
+    /// Award a one-off quality bonus to an engineer for high-quality work (#1742).
+    /// Only the admin can award bonuses. Any pending inactivity decay is applied
+    /// first, and the result is capped at `MAX_REPUTATION`.
+    ///
+    /// # Arguments
+    /// * `admin` - The current admin address (must authorize the call)
+    /// * `engineer` - The address of the engineer receiving the bonus
+    /// * `bonus` - Points to award, in the range `1..=MAX_QUALITY_BONUS`
+    ///
+    /// # Panics
+    /// - [`ContractError::Paused`] if the contract is paused
+    /// - [`ContractError::NotInitialized`] if the admin has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if the caller is not the admin
+    /// - [`ContractError::InvalidReputationBonus`] if `bonus` is 0 or above `MAX_QUALITY_BONUS`
+    /// - [`ContractError::EngineerNotFound`] if the engineer record does not exist
+    pub fn award_quality_bonus(env: Env, admin: Address, engineer: Address, bonus: u32) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&admin_key())
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if stored_admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if bonus == 0 || bonus > MAX_QUALITY_BONUS {
+            panic_with_error!(&env, ContractError::InvalidReputationBonus);
+        }
+
+        let key = engineer_key(&engineer);
+        let mut record: Engineer = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+
+        let now = env.ledger().timestamp();
+        let old_rep = apply_reputation_decay(&record, now);
+        let new_rep = old_rep.saturating_add(bonus).min(MAX_REPUTATION);
+
+        record.reputation_score = new_rep;
+        record.last_active_at = now;
+        env.storage().persistent().set(&key, &record);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events()
+            .publish((QUALITY_BONUS_EVENT,), (engineer, old_rep, new_rep));
     }
 
     /// Get an engineer's current reputation score (range: 0–1000).
@@ -2142,7 +2206,7 @@ impl EngineerRegistry {
         }
         env.storage()
             .persistent()
-            .set(&(CE_REQUIREMENT_KEY, specialization), &(hours, frequency_secs));
+            .set(&(CE_REQUIREMENT_KEY, specialization.clone()), &(hours, frequency_secs));
         extend_persistent_ttl(&env, &(CE_REQUIREMENT_KEY, specialization));
     }
 
@@ -2233,7 +2297,7 @@ impl EngineerRegistry {
         record.tier = EngineerTier::Apprentice;
         env.storage().persistent().set(&engineer_key(&apprentice), &record);
         extend_persistent_ttl(&env, &engineer_key(&apprentice));
-        let key = (APP_KEY, apprentice);
+        let key = (APP_KEY, apprentice.clone());
         env.storage().persistent().set(
             &key,
             &Apprenticeship {
@@ -2245,14 +2309,14 @@ impl EngineerRegistry {
         );
         extend_persistent_ttl(&env, &key);
         env.events().publish(
-            (symbol_short!("MENTOR_START"), apprentice),
+            (symbol_short!("MNT_START"), apprentice.clone()),
             (env.ledger().timestamp(), hours_required),
         );
     }
 
     pub fn record_apprenticeship_hours(env: Env, apprentice: Address, hours: u32) {
         ensure_not_paused(&env);
-        let key = (APP_KEY, apprentice);
+        let key = (APP_KEY, apprentice.clone());
         let mut apprenticeship: Apprenticeship = env
             .storage()
             .persistent()
@@ -2266,7 +2330,7 @@ impl EngineerRegistry {
         env.storage().persistent().set(&key, &apprenticeship);
         extend_persistent_ttl(&env, &key);
         env.events().publish(
-            (symbol_short!("MENTOR_HOURS"), apprentice),
+            (symbol_short!("MNT_HOURS"), apprentice.clone()),
             (hours, apprenticeship.hours_completed),
         );
     }
@@ -2293,7 +2357,7 @@ impl EngineerRegistry {
         env.storage().persistent().remove(&key);
         extend_persistent_ttl(&env, &engineer_key(&apprentice));
         env.events().publish(
-            (symbol_short!("MENTOR_DONE"), apprentice),
+            (symbol_short!("MNT_DONE"), apprentice.clone()),
             env.ledger().timestamp(),
         );
     }
@@ -5845,12 +5909,27 @@ mod tests {
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::InvalidSuspensionPeriod as u32
             ))),
-            )))
         );
     }
 
     #[test]
     fn test_batch_revoke_credentials_non_admin_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+
+        let outsider = Address::generate(&env);
+        let batch = Vec::new(&env);
+        let result = client.try_batch_revoke_credentials(&outsider, &batch);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
+    }
+
+    #[test]
     fn test_suspend_with_current_timestamp_fails() {
         let env = Env::default();
         env.mock_all_auths();

@@ -110,6 +110,7 @@ This document lists every `ContractError` variant across the three core contract
 | `TimelockNotExpired` | Call `propose_revoke_credential` first; then wait 48 hours before calling `execute_revoke_credential`. |
 | `ProposalNotFound` | Call `propose_revoke_credential` before `execute_revoke_credential`. If already executed, create a new proposal. |
 | `BatchRevokeTooLarge` | Split the batch into chunks of ≤ 50 engineers per call. |
+| `InvalidReputationBonus` | `award_quality_bonus` was called with a `bonus` of 0 or above 50 (`MAX_QUALITY_BONUS`). Pass a value in `1..=50`. |
 
 ---
 
