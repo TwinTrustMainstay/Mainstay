@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contracttype, Address, Bytes, String, Symbol, Map, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, String, Symbol, Map, Vec};
 
 /// A single ownership-transfer event recorded in the on-chain transfer history.
 #[contracttype]
@@ -130,6 +130,39 @@ pub struct MaintenanceSignature {
     pub signer: Address,
     pub public_key: BytesN<32>,
     pub signature: BytesN<64>,
+}
+
+/// A notary accredited to certify maintenance records (issue #1754).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NotaryInfo {
+    pub notary: Address,
+    /// Ed25519 key that notarizations are verified against.
+    pub public_key: BytesN<32>,
+    /// Reference to the notary's accreditation, such as a licence number or the
+    /// hash of the credential document held off-chain.
+    pub credential_ref: String,
+    /// Revoked notaries can no longer notarize, but their past notarizations remain.
+    pub active: bool,
+    pub registered_at: u64,
+}
+
+/// A notarization of one maintenance record (issue #1754).
+///
+/// `record_hash` is the sha256 hash of the record as stored; the notary's
+/// `signature` is an Ed25519 signature over it. `certificate_hash` is the hash of
+/// the certificate the notary service issued, so the certificate can be matched
+/// off-chain without storing it on-chain.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NotarizationRecord {
+    pub asset_id: u64,
+    pub record_timestamp: u64,
+    pub notary: Address,
+    pub record_hash: Bytes,
+    pub signature: BytesN<64>,
+    pub certificate_hash: BytesN<32>,
+    pub notarized_at: u64,
 }
 
 /// A point-in-time snapshot of the collateral score, recorded at each maintenance event.
@@ -520,6 +553,10 @@ pub enum DataKey {
     AttestorAuth(u64, Address),
     MaintenanceSignatures(u64),
     CompressedHistory(u64),
+    /// Accredited notary registration, keyed by notary address (issue #1754).
+    Notary(Address),
+    /// Notarizations for an asset's maintenance records: `Vec<NotarizationRecord>` (issue #1754).
+    Notarizations(u64),
 }
 
 /// A dispute record for challenging maintenance record authenticity (issue #1319).

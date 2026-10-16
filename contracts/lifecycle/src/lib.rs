@@ -33,6 +33,8 @@ use crate::types::{
     MaintenanceRecord, MaintenanceRoi, Priority, RecurringTask,
     ScoreEntry, TimelockProposal, TransferRecord, WeightProposal, MaintenanceAuditEntry,
     MaintenanceAttestation, MaintenanceSignature,
+    // Issue #1754 - Maintenance Record Notarization
+    NotarizationRecord, NotaryInfo,
     // Issue #1637 - Cross-Contract Score Consensus
     ExternalScoreEntry,
     // Issue #1639 - Score Anomaly Detection
@@ -1333,6 +1335,175 @@ impl Lifecycle {
             env.storage().persistent().set(&list_key, &list);
             extend_persistent_ttl(&env, &list_key);
         }
+    }
+
+    /// Register a notary accredited to notarize maintenance records (admin only).
+    ///
+    /// `public_key` is the notary's Ed25519 key. `credential_ref` identifies the
+    /// notary's accreditation, for example a licence number or a document hash.
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if `admin` is not the contract admin
+    /// - [`ContractError::InvalidNotaryCredential`] if `credential_ref` is empty
+    pub fn register_notary(
+        env: Env,
+        admin: Address,
+        notary: Address,
+        public_key: BytesN<32>,
+        credential_ref: String,
+    ) {
+        ensure_not_paused(&env);
+        require_admin(&env, &admin);
+        if credential_ref.is_empty() {
+            panic_with_error!(&env, ContractError::InvalidNotaryCredential);
+        }
+        let key = DataKey::Notary(notary.clone());
+        let info = NotaryInfo {
+            notary: notary.clone(),
+            public_key,
+            credential_ref,
+            active: true,
+            registered_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&key, &info);
+        extend_persistent_ttl(&env, &key);
+        env.events().publish((symbol_short!("NTRY_REG"),), notary);
+    }
+
+    /// Revoke a notary's accreditation (admin only). Past notarizations remain valid history.
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if `admin` is not the contract admin
+    /// - [`ContractError::NotaryNotRegistered`] if `notary` was never registered
+    pub fn revoke_notary(env: Env, admin: Address, notary: Address) {
+        ensure_not_paused(&env);
+        require_admin(&env, &admin);
+        let key = DataKey::Notary(notary.clone());
+        let mut info: NotaryInfo = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotaryNotRegistered));
+        info.active = false;
+        env.storage().persistent().set(&key, &info);
+        extend_persistent_ttl(&env, &key);
+        env.events().publish((symbol_short!("NTRY_REV"),), notary);
+    }
+
+    /// Look up a notary registration, or `None` if the address was never registered.
+    pub fn get_notary(env: Env, notary: Address) -> Option<NotaryInfo> {
+        env.storage().persistent().get(&DataKey::Notary(notary))
+    }
+
+    /// Notarize a maintenance record (admin only, issue #1754).
+    ///
+    /// The notary service signs the record's sha256 hash off-chain with the
+    /// notary's Ed25519 key and returns the signature plus the hash of the
+    /// certificate it issued. This call verifies the signature against the
+    /// notary's registered key and stores the notarization for the record.
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if `admin` is not the contract admin
+    /// - [`ContractError::NotaryNotRegistered`] / [`ContractError::NotaryRevoked`] for an unknown or revoked notary
+    /// - [`ContractError::RecordNotFound`] if no record has `record_timestamp` for `asset_id`
+    /// - [`ContractError::RecordAlreadyNotarized`] if the record is already notarized
+    /// - a host error if the Ed25519 signature does not verify against the notary's key
+    pub fn notarize_maintenance_record(
+        env: Env,
+        admin: Address,
+        asset_id: u64,
+        record_timestamp: u64,
+        notary: Address,
+        certificate_hash: BytesN<32>,
+        signature: BytesN<64>,
+    ) {
+        ensure_not_paused(&env);
+        require_admin(&env, &admin);
+
+        let notary_info: NotaryInfo = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Notary(notary.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotaryNotRegistered));
+        if !notary_info.active {
+            panic_with_error!(&env, ContractError::NotaryRevoked);
+        }
+
+        let history: Vec<MaintenanceRecord> = env
+            .storage()
+            .persistent()
+            .get(&history_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut record_hash: Option<Bytes> = None;
+        for record in history.iter() {
+            if record.timestamp == record_timestamp {
+                record_hash = Some(hash_maintenance_record(&env, &record));
+                break;
+            }
+        }
+        let message = record_hash
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::RecordNotFound));
+
+        let key = DataKey::Notarizations(asset_id);
+        let mut notarizations: Vec<NotarizationRecord> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        for existing in notarizations.iter() {
+            if existing.record_timestamp == record_timestamp {
+                panic_with_error!(&env, ContractError::RecordAlreadyNotarized);
+            }
+        }
+
+        // Traps the invocation if the signature is not valid for this notary's key.
+        env.crypto()
+            .ed25519_verify(&notary_info.public_key, &message, &signature);
+
+        notarizations.push_back(NotarizationRecord {
+            asset_id,
+            record_timestamp,
+            notary: notary.clone(),
+            record_hash: message,
+            signature,
+            certificate_hash,
+            notarized_at: env.ledger().timestamp(),
+        });
+        env.storage().persistent().set(&key, &notarizations);
+        extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (symbol_short!("NOTARIZE"), asset_id),
+            (record_timestamp, notary),
+        );
+    }
+
+    /// Returns the notarization for a record, or `None` if it has not been notarized.
+    pub fn get_notarization(
+        env: Env,
+        asset_id: u64,
+        record_timestamp: u64,
+    ) -> Option<NotarizationRecord> {
+        let notarizations: Vec<NotarizationRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Notarizations(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        notarizations
+            .iter()
+            .find(|n| n.record_timestamp == record_timestamp)
+    }
+
+    /// Returns whether a maintenance record has a stored notarization.
+    pub fn is_record_notarized(env: Env, asset_id: u64, record_timestamp: u64) -> bool {
+        Self::get_notarization(env, asset_id, record_timestamp).is_some()
+    }
+
+    /// All notarizations recorded for an asset, in the order they were made.
+    pub fn get_notarized_records(env: Env, asset_id: u64) -> Vec<NotarizationRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Notarizations(asset_id))
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Revoke an engineer's owner-approved authorization for a specific asset.

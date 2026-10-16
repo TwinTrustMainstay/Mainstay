@@ -73,6 +73,14 @@ pub enum ContractError {
     RecordNotFound = 43,
     CompressionFailed = 44,
     CompressionRequiresDecommissioned = 45,
+    /// The address is not a registered notary.
+    NotaryNotRegistered = 46,
+    /// The notary's accreditation has been revoked and it can no longer notarize.
+    NotaryRevoked = 47,
+    /// The maintenance record already has a notarization.
+    RecordAlreadyNotarized = 48,
+    /// The notary credential reference is empty.
+    InvalidNotaryCredential = 49,
 }
 
 impl From<SharedContractError> for ContractError {
