@@ -2,6 +2,7 @@
 
 mod errors;
 mod scoring;
+mod timestamping;
 mod types;
 pub(crate) mod storage;
 pub(crate) mod events;
@@ -1333,6 +1334,80 @@ impl Lifecycle {
             env.storage().persistent().set(&list_key, &list);
             extend_persistent_ttl(&env, &list_key);
         }
+    }
+
+    /// Register a trusted timestamp authority (admin only). Returns its `authority_id` (#1750).
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if `admin` is not the contract admin
+    pub fn register_timestamp_authority(env: Env, admin: Address, public_key: BytesN<32>) -> u32 {
+        timestamping::register_authority(&env, admin, public_key)
+    }
+
+    /// Revoke a trusted timestamp authority (admin only). Tokens issued before revocation stay valid (#1750).
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if `admin` is not the contract admin
+    /// - [`ContractError::TimestampAuthorityNotFound`] if no authority has `authority_id`
+    /// - [`ContractError::TimestampAuthorityInactive`] if the authority is already revoked
+    pub fn revoke_timestamp_authority(env: Env, admin: Address, authority_id: u32) {
+        timestamping::revoke_authority(&env, admin, authority_id);
+    }
+
+    /// List every registered timestamp authority, including revoked ones (#1750).
+    pub fn get_timestamp_authorities(env: Env) -> Vec<crate::types::TimestampAuthority> {
+        timestamping::get_timestamp_authorities(&env)
+    }
+
+    /// Store a trusted timestamp token for a maintenance record (#1750).
+    ///
+    /// Anyone may relay the token. The authority's Ed25519 signature over
+    /// `sha256(record) || issued_at || expires_at` is what authenticates it. A later token
+    /// with a larger `issued_at` renews the stored one.
+    ///
+    /// # Panics
+    /// - [`ContractError::InvalidTimestampWindow`] if `expires_at <= issued_at` or `issued_at` is in the future
+    /// - [`ContractError::TimestampAuthorityNotFound`] / [`ContractError::TimestampAuthorityInactive`]
+    ///   if the authority is unknown or not active at `issued_at`
+    /// - [`ContractError::RecordNotFound`] if no record has `record_timestamp`
+    /// - [`ContractError::TimestampNotNewer`] if a stored token already has an equal or later `issued_at`
+    /// - Traps if the signature does not verify
+    pub fn submit_timestamp(
+        env: Env,
+        asset_id: u64,
+        record_timestamp: u64,
+        authority_id: u32,
+        issued_at: u64,
+        expires_at: u64,
+        signature: BytesN<64>,
+    ) {
+        timestamping::submit_timestamp(
+            &env,
+            asset_id,
+            record_timestamp,
+            authority_id,
+            issued_at,
+            expires_at,
+            signature,
+        );
+    }
+
+    /// Return the stored timestamp token for a maintenance record, if any (#1750).
+    pub fn get_timestamped_record(
+        env: Env,
+        asset_id: u64,
+        record_timestamp: u64,
+    ) -> Option<crate::types::TrustedTimestamp> {
+        timestamping::get_timestamped_record(&env, asset_id, record_timestamp)
+    }
+
+    /// Check a maintenance record's timestamp token (#1750).
+    ///
+    /// Returns `true` when a token exists, has not expired, and its signature still verifies
+    /// against the issuing authority. Returns `false` when there is no token, it has expired,
+    /// or the record is gone from history. Traps if a stored signature fails to verify.
+    pub fn verify_timestamp(env: Env, asset_id: u64, record_timestamp: u64) -> bool {
+        timestamping::verify_timestamp(&env, asset_id, record_timestamp)
     }
 
     /// Revoke an engineer's owner-approved authorization for a specific asset.
