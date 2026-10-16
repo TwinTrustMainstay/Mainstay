@@ -33,16 +33,60 @@ source .env 2>/dev/null || true
 # Temp file for the latest metrics page
 METRICS_FILE="/tmp/mainstay-metrics.prom"
 
+# Per-call RPC telemetry. Each invoke_read appends one line "<exit_code> <seconds>".
+# A file is used instead of shell variables because invoke_read runs inside
+# $(...) subshells, where counter updates would be lost.
+RPC_LOG="${METRICS_FILE}.rpc"
+
 # ---------------------------------------------------------------------------
 # Query helpers
 # ---------------------------------------------------------------------------
 
 invoke_read() {
-    stellar contract invoke \
-        --id "$1" \
+    local contract_id="$1" start_ns end_ns rc=0 out
+    shift
+    start_ns="$(date +%s%N)"
+    out="$(stellar contract invoke \
+        --id "$contract_id" \
         --network "$STELLAR_NETWORK" \
         --source any \
-        -- "$2" "$3" "$4" "$5" 2>/dev/null || echo "0"
+        -- "$@" 2>/dev/null)" || rc=$?
+    end_ns="$(date +%s%N)"
+    echo "$rc $(( (end_ns - start_ns) / 1000 ))" >> "$RPC_LOG"
+    if [[ "$rc" -ne 0 ]]; then
+        echo "0"
+    else
+        echo "$out"
+    fi
+}
+
+# Emits RPC latency and error metrics for the current collection window.
+# Counts are per-scrape (reset each collection) so error rate is a ratio
+# over the most recent scrape rather than an ever-growing counter.
+rpc_metrics() {
+    local requests=0 errors=0 total_us=0 rc us
+    if [[ -f "$RPC_LOG" ]]; then
+        while read -r rc us; do
+            requests=$((requests + 1))
+            total_us=$((total_us + us))
+            [[ "$rc" -ne 0 ]] && errors=$((errors + 1))
+        done < "$RPC_LOG"
+    fi
+    rm -f "$RPC_LOG"
+
+    cat <<EOF
+# HELP mainstay_rpc_requests_last_scrape Read-only RPC calls made during the last collection.
+# TYPE mainstay_rpc_requests_last_scrape gauge
+mainstay_rpc_requests_last_scrape $requests
+
+# HELP mainstay_rpc_errors_last_scrape Failed RPC calls during the last collection.
+# TYPE mainstay_rpc_errors_last_scrape gauge
+mainstay_rpc_errors_last_scrape $errors
+
+# HELP mainstay_rpc_request_duration_seconds_sum Total RPC call time during the last collection.
+# TYPE mainstay_rpc_request_duration_seconds_sum gauge
+mainstay_rpc_request_duration_seconds_sum $(awk -v t="$total_us" 'BEGIN { printf "%.6f", t / 1000000 }')
+EOF
 }
 
 # ---------------------------------------------------------------------------
@@ -54,6 +98,7 @@ collect_metrics() {
     ts="$(date +%s)"
 
     > "$METRICS_FILE.tmp"
+    rm -f "$RPC_LOG"
 
     # --- Asset Registry metrics ---
     local total_assets
@@ -149,6 +194,7 @@ mainstay_metrics_collection_seconds $ts
 mainstay_exporter_up 1
 EOF
 
+    rpc_metrics >> "$METRICS_FILE.tmp"
     mv "$METRICS_FILE.tmp" "$METRICS_FILE"
 }
 
@@ -181,8 +227,10 @@ serve_http() {
 
     if command -v socat &> /dev/null; then
         echo "[$(date -u +%H:%M:%S)] Using socat for HTTP server"
-        socat TCP-LISTEN:"$port",reuseaddr,fork \
-            EXEC:"printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n'; cat $METRICS_FILE"
+        # EXEC: splits arguments on spaces, and inline shell quoting is
+        # fragile across socat versions, so the response is written by a helper.
+        METRICS_FILE="$METRICS_FILE" socat TCP-LISTEN:"$port",reuseaddr,fork \
+            EXEC:"$ROOT/scripts/monitoring/serve-metrics-once.sh"
     elif command -v python3 &> /dev/null; then
         echo "[$(date -u +%H:%M:%S)] Using Python for HTTP server"
         python3 -c "
