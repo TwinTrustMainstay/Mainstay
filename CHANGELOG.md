@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and hash-based maintenance evidence attachments to the lifecycle contract.
 
 ### Added
+- New `marketplace` contract (`contracts/marketplace`) with dynamic maintenance pricing: the admin records supply (available engineers) and demand (pending tasks), and the price moves toward the implied multiplier with a surge cap, a per-update step limit, and a minimum update interval. Price history (bounded to 100 observations) and a demand-elasticity estimate are exposed (closes [#1738](https://github.com/TwinTrustMainstay/Mainstay/issues/1738))
+- `marketplace` maintenance auctions: open auctions and sealed-bid (commit/reveal) auctions for maintenance tasks, with lowest-price or highest-reputation winner selection, bid history, and bidder disputes resolved by the admin within a 3-day window. Bids require a valid or grace-period engineer credential (closes [#1739](https://github.com/TwinTrustMainstay/Mainstay/issues/1739))
+- New `governance` contract (`contracts/governance`): transferable voting shares, proposals for platform parameter changes or treasury funding grants, quorum- and approval-threshold voting, execution of passed proposals, and per-proposal vote history. A voter's shares are locked until the proposal's voting period ends (closes [#1740](https://github.com/TwinTrustMainstay/Mainstay/issues/1740))
+- `award_quality_bonus` in `engineer-registry`: admin-only reward of 1–50 reputation points for high-quality work, capped at the 1000 maximum (closes [#1741](https://github.com/TwinTrustMainstay/Mainstay/issues/1741))
+- `ContractError` (`marketplace`) variants 1–22 (`NotInitialized` through `BidLimitReached`); `ContractError` (`governance`) variants 1–17 (`NotInitialized` through `TooManyVotes`)
+- `ContractError` (`engineer-registry`) variant `InvalidReputationBonus` (37)
+- Storage keys added: `marketplace` `PriceHistory`, `Auction`, `Bids`, `Commit`, `Pricing`, `Registry`, `NextAuctionId`; `governance` `Shares`, `TotalShares`, `LockedUntil`, `Treasury`, `Proposal`, `Votes`, `Voted`, `Param`, `Config`, `NextProposalId`
 - `scripts/export-assets.py` exports backed-up asset records to CSV and
   dependency-free Excel `.xlsx` workbooks.
 - `mainstay-sdk`: an official typed Rust facade for registration, asset lookup,
@@ -33,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Storage keys (`lifecycle/src/storage.rs`) added since 1.0.0: `SCHIST` (score history), `LUPD` (last score update timestamp), `FROZEN` / `FRZ_SCR` (decommission freeze flag and frozen score), `HLTH_SNP` (health snapshots), `XFER_HIST` (ownership transfer history), `ENG_HIST` / `ENG_AUTH` (per-engineer history and per-asset authorization), `SUB_WIN` (rolling-hour submission rate window), `RVK_TL` / `TL_PROP` (timelocked engineer-revocation and generic admin proposals), `MSTD` / `SCR_WGT` (per-asset-type maintenance standards and scoring weights)
 
 ### Fixed
+- `update_reputation` in `engineer-registry`: decay is now applied to the stored score before the delta is added. Previously an inactive engineer's decayed reputation was overwritten by the undecayed stored value on the next update (closes [#1741](https://github.com/TwinTrustMainstay/Mainstay/issues/1741))
 - `apply_decay` in `lifecycle/src/scoring.rs`: enforce `MIN_SCORE_WITH_HISTORY = 1` in both the main decay path and the early-return path so the stored score is never written as 0 for an asset that has at least one maintenance record (closes [#784](https://github.com/TwinTrustMainstay/Mainstay/issues/784))
 - `get_maintenance_history_page` in `lifecycle`: cap the caller-supplied `limit` at `MAX_PAGE_SIZE` (100) so a large `limit` can no longer reintroduce an unbounded, potentially oversized response (closes [#1075](https://github.com/TwinTrustMainstay/Mainstay/issues/1075))
 - `HealthSnapshot` in `lifecycle`: renamed the `timestamp` field to `snapshot_timestamp` to make explicit that it records when the snapshot was captured (closes [#1076](https://github.com/TwinTrustMainstay/Mainstay/issues/1076))

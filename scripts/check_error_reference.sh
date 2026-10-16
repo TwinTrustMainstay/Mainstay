@@ -19,6 +19,8 @@ ERROR_SOURCE_FILES=(
   "contracts/lifecycle/src/errors.rs"
   "contracts/lending/src/lib.rs"
   "contracts/lending/src/errors.rs"
+  "contracts/marketplace/src/lib.rs"
+  "contracts/governance/src/lib.rs"
 )
 
 missing=0
