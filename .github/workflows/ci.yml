@@ -54,6 +54,9 @@ jobs:
       - name: Validate all ContractError discriminants are unique per contract
         run: bash scripts/check_error_discriminants.sh
 
+      - name: Test backup verification and retention tooling
+        run: bash scripts/test_backup_tooling.sh
+
       - name: Run clippy lints
         run: cargo clippy --workspace --all-targets -- -D warnings
 

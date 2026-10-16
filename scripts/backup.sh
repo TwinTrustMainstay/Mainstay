@@ -8,6 +8,10 @@
 # Usage:
 #   ./scripts/backup.sh [--dry-run] [--output-dir <path>]
 #
+# Optional secondary replicas (verified after copy):
+#   BACKUP_SECONDARY_DIR        - second local/mounted location
+#   BACKUP_SECONDARY_S3_BUCKET  - bucket in another region or account
+#
 # Environment variables (required for S3 upload):
 #   AWS_ACCESS_KEY_ID       - AWS access key for S3
 #   AWS_SECRET_ACCESS_KEY   - AWS secret key for S3
@@ -245,11 +249,56 @@ upload_to_s3() {
     log "Backup uploaded to $s3_path"
 }
 
+# ---------------------------------------------------------------------------
+# Secondary replication
+# ---------------------------------------------------------------------------
+# A backup is only useful if it survives the loss of its primary location.
+# Replicas are optional and configured separately from the primary S3 upload:
+#   BACKUP_SECONDARY_DIR        - local or mounted path on another disk
+#   BACKUP_SECONDARY_S3_BUCKET  - bucket in a different region or account
+# Each replica is verified against the checksums before the backup counts as
+# stored in that location.
+
+replicate_backup() {
+    local verify="$ROOT/scripts/verify-backup.sh"
+
+    if [[ -n "${BACKUP_SECONDARY_DIR:-}" ]]; then
+        local dest="${BACKUP_SECONDARY_DIR}/${TIMESTAMP}"
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log "[DRY RUN] Would replicate $BACKUP_DIR to $dest"
+        else
+            log "Replicating backup to secondary directory..."
+            mkdir -p "$dest"
+            cp -a "$BACKUP_DIR"/. "$dest"/
+            if ! "$verify" "$dest" >/dev/null; then
+                err "Secondary replica failed verification: $dest"
+                return 1
+            fi
+            log "Secondary replica verified: $dest"
+        fi
+    fi
+
+    if [[ -n "${BACKUP_SECONDARY_S3_BUCKET:-}" && "${S3_ENABLED:-false}" == "true" ]]; then
+        local s3_path="s3://${BACKUP_SECONDARY_S3_BUCKET}/backups/${TIMESTAMP}/"
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log "[DRY RUN] Would replicate backup to $s3_path"
+        else
+            log "Replicating backup to secondary S3 bucket..."
+            aws s3 cp "$BACKUP_DIR" "$s3_path" --recursive --sse AES256 \
+                --storage-class STANDARD_IA
+            log "Secondary S3 replica written: $s3_path"
+        fi
+    fi
+}
+
 generate_manifest() {
     log "Generating backup manifest..."
     local manifest="${BACKUP_DIR}/manifest.json"
     local file_list
-    file_list="$(find "$BACKUP_DIR" -type f -exec sha256sum {} \; | sort -k2)"
+    # Paths are relative to the backup directory so that checksums still verify
+    # after the backup is copied to another machine or replica location.
+    # checksums.sha256 is excluded because it is written after this list.
+    file_list="$(cd "$BACKUP_DIR" && find . -type f ! -name checksums.sha256 -exec sha256sum {} \; | sort -k2)"
 
     jq -n \
         --arg backup_id "$TIMESTAMP" \
@@ -314,6 +363,9 @@ main() {
 
     # 8. Upload to S3 (if configured)
     upload_to_s3
+
+    # 9. Replicate to secondary locations and verify each copy
+    replicate_backup
 
     log "=== Backup complete ==="
     log "Local backup: ${BACKUP_DIR}"

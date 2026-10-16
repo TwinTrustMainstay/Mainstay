@@ -190,6 +190,68 @@ cd backups/20260728T000000Z
 sha256sum -c checksums.sha256
 ```
 
+### Secondary Replicas
+
+A backup is only as safe as its last copy. Set one or both of these to write a
+verified replica after the primary upload:
+
+| Variable                     | Effect |
+|------------------------------|--------|
+| `BACKUP_SECONDARY_DIR`       | Copies the backup to a second local or mounted path, then verifies the copy |
+| `BACKUP_SECONDARY_S3_BUCKET` | Writes a second copy to a bucket in another region or account (requires S3 to be enabled) |
+
+A replica that fails verification makes the backup run exit non-zero, so a bad
+copy is never silently treated as stored.
+
+### Verifying Any Backup or Replica
+
+```bash
+# Checks manifest, every file's SHA-256, and that no files were added or removed
+./scripts/verify-backup.sh /backups/20261016T000001Z
+
+# Confirms a replica's checksums match the reference backup exactly
+./scripts/verify-backup.sh /mnt/replica/20261016T000001Z --compare /backups/20261016T000001Z
+```
+
+Checksums are stored with paths relative to the backup directory, so a backup
+still verifies after it is copied to another machine.
+
+### Retention
+
+`scripts/backup-retention.sh` applies the schedule in the table above:
+
+| Age              | Kept                                  |
+|------------------|---------------------------------------|
+| 0-30 days        | Every backup (daily tier)             |
+| 31-84 days       | Newest backup per ISO week (weekly)   |
+| 85-365 days      | Newest backup per month (monthly)     |
+| Over 365 days    | Deleted                               |
+| Any age, with `.keep` file | Never deleted (permanent) |
+
+```bash
+# Preview what would be removed
+./scripts/backup-retention.sh /backups --dry-run
+
+# Prune
+./scripts/backup-retention.sh /backups
+```
+
+To keep an on-demand backup permanently (for example, one taken before a
+contract upgrade), create an empty `.keep` file in its directory:
+
+```bash
+touch /backups/20261016T000001Z/.keep
+```
+
+Retention only deletes directories whose names match the backup timestamp
+format, so unrelated files under the backup root are never touched. Run it
+against each replica root too, since each location keeps its own copies.
+
+### Testing the Tooling
+
+`scripts/test_backup_tooling.sh` runs tests for verification and retention on
+temporary directories. It needs no network access and runs in CI.
+
 ## Restoring from Backup
 
 > **⚠️ WARNING:** Restoration writes to the live Stellar network.  Always test
