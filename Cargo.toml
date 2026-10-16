@@ -8,6 +8,7 @@ members = [
     "contracts/incident-management",
     "contracts/engineer-bond",
     "contracts/asset-nft",
+    "contracts/insurance-pool",
     "tests",
     "sdk/rust",
 ]
