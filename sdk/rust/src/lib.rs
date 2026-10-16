@@ -1,5 +1,7 @@
 //! Typed client helpers for the Mainstay Asset Registry contract.
 
+pub mod resilience;
+
 pub use asset_registry::{
     Asset, AssetRegistryClient, FacetCount, SearchFilter, SearchPage, SortOrder,
 };
