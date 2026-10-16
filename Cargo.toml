@@ -8,6 +8,7 @@ members = [
     "tests",
     "sdk/rust",
     "analytics",
+    "verification",
 ]
 resolver = "2"
 
