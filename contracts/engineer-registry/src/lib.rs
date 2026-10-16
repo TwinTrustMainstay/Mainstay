@@ -51,6 +51,8 @@ pub enum ContractError {
     InvalidWorkWindow = 34,
     EngineerUnavailable = 35,
     WorkAssignmentNotFound = 36,
+    /// Quality bonus must be between 1 and `MAX_QUALITY_BONUS` points inclusive.
+    InvalidReputationBonus = 37,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -253,6 +255,11 @@ const NEXT_ASSIGNMENT_ID_KEY: Symbol = symbol_short!("NXT_ASG");
 const DEFAULT_DECAY_INTERVAL_SECS: u64 = 90 * 86_400;
 /// Default decay rate: 5% per interval (#1315)
 const DEFAULT_DECAY_RATE_BPS: u32 = 500; // 5% in basis points
+
+/// Upper bound on any engineer's reputation score.
+const MAX_REPUTATION: u32 = 1000;
+/// Largest single quality bonus an admin may award in one call.
+const MAX_QUALITY_BONUS: u32 = 50;
 
 fn is_paused(env: &Env) -> bool {
     env.storage().persistent().get(&PAUSED_KEY).unwrap_or(false)
@@ -1642,17 +1649,69 @@ impl EngineerRegistry {
             .persistent()
             .get(&engineer_key(&engineer))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
-        let new_rep = (record.reputation_score as i64)
+        // Decay must be applied to the stored score before the delta, otherwise an
+        // inactive engineer's lost reputation would reappear on the next update.
+        let now = env.ledger().timestamp();
+        let decayed = apply_reputation_decay(&record, now) as i64;
+        let new_rep = decayed
             .saturating_add(delta as i64)
-            .clamp(0, 1000) as u32;
+            .clamp(0, MAX_REPUTATION as i64) as u32;
         record.reputation_score = new_rep;
-        record.last_active_at = env.ledger().timestamp();
+        record.last_active_at = now;
         env.storage()
             .persistent()
             .set(&engineer_key(&engineer), &record);
         env.storage()
             .persistent()
             .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
+    }
+
+    /// Admin-only: reward an engineer for high-quality work with a bounded bonus.
+    ///
+    /// The bonus is added to the engineer's decayed reputation and the result is
+    /// capped at 1000. Quality bonuses are awarded on top of the per-submission
+    /// increments applied by the lifecycle contract, so they are the mechanism for
+    /// recognising outstanding work (e.g. a client sign-off) without unbounded growth.
+    ///
+    /// # Arguments
+    /// * `admin` - Must match the stored admin
+    /// * `engineer` - The engineer receiving the bonus
+    /// * `bonus` - Points to award, between 1 and 50 inclusive
+    ///
+    /// # Panics
+    /// - [`ContractError::Paused`] if the contract is paused
+    /// - [`ContractError::UnauthorizedAdmin`] if `admin` is not the stored admin
+    /// - [`ContractError::InvalidReputationBonus`] if `bonus` is 0 or above 50
+    /// - [`ContractError::EngineerNotFound`] if no record exists for `engineer`
+    pub fn award_quality_bonus(env: Env, admin: Address, engineer: Address, bonus: u32) {
+        ensure_not_paused(&env);
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if require_admin(&admin, &stored_admin).is_err() {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if bonus == 0 || bonus > MAX_QUALITY_BONUS {
+            panic_with_error!(&env, ContractError::InvalidReputationBonus);
+        }
+        let mut record: Engineer = env
+            .storage()
+            .persistent()
+            .get(&engineer_key(&engineer))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+
+        let now = env.ledger().timestamp();
+        let current = apply_reputation_decay(&record, now);
+        let new_rep = current.saturating_add(bonus).min(MAX_REPUTATION);
+        record.reputation_score = new_rep;
+        record.last_active_at = now;
+        env.storage()
+            .persistent()
+            .set(&engineer_key(&engineer), &record);
+        extend_persistent_ttl(&env, engineer_key(&engineer));
+
+        env.events().publish(
+            (symbol_short!("QUAL_BON"), engineer.clone()),
+            (admin, bonus, new_rep, now),
+        );
     }
 
     /// Get an engineer's current reputation score (range: 0–1000).
@@ -2394,6 +2453,9 @@ impl EngineerRegistry {
             .unwrap_or(Vec::new(&env))
     }
 }
+
+#[cfg(test)]
+mod reputation_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5845,12 +5907,10 @@ mod tests {
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::InvalidSuspensionPeriod as u32
             ))),
-            )))
         );
     }
 
     #[test]
-    fn test_batch_revoke_credentials_non_admin_fails() {
     fn test_suspend_with_current_timestamp_fails() {
         let env = Env::default();
         env.mock_all_auths();
