@@ -6,6 +6,7 @@ members = [
     "contracts/lifecycle",
     "contracts/lending",
     "contracts/mobile-api",
+    "contracts/zk-privacy",
     "tests",
     "sdk/rust",
 ]

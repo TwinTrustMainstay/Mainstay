@@ -20,6 +20,7 @@ ERROR_SOURCE_FILES=(
   "contracts/lending/src/lib.rs"
   "contracts/lending/src/errors.rs"
   "contracts/mobile-api/src/lib.rs"
+  "contracts/zk-privacy/src/lib.rs"
 )
 
 missing=0
