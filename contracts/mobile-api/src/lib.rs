@@ -153,22 +153,33 @@ enum DataKey {
 }
 
 fn bump_instance(env: &Env) {
-    env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
+    env.storage()
+        .instance()
+        .extend_ttl(TTL_THRESHOLD, TTL_TARGET);
 }
 
 fn latest_seq(env: &Env) -> u64 {
-    env.storage().instance().get(&DataKey::LatestSeq).unwrap_or(0)
+    env.storage()
+        .instance()
+        .get(&DataKey::LatestSeq)
+        .unwrap_or(0)
 }
 
 fn first_seq(env: &Env) -> u64 {
-    env.storage().instance().get(&DataKey::FirstSeq).unwrap_or(1)
+    env.storage()
+        .instance()
+        .get(&DataKey::FirstSeq)
+        .unwrap_or(1)
 }
 
 fn rate_limit_config(env: &Env) -> RateLimitConfig {
-    env.storage().instance().get(&DataKey::RateLimit).unwrap_or(RateLimitConfig {
-        max_requests: DEFAULT_RATE_LIMIT_REQUESTS,
-        window_secs: DEFAULT_RATE_LIMIT_WINDOW_SECS,
-    })
+    env.storage()
+        .instance()
+        .get(&DataKey::RateLimit)
+        .unwrap_or(RateLimitConfig {
+            max_requests: DEFAULT_RATE_LIMIT_REQUESTS,
+            window_secs: DEFAULT_RATE_LIMIT_WINDOW_SECS,
+        })
 }
 
 fn require_admin(env: &Env, admin: &Address) -> Result<(), ContractError> {
@@ -197,14 +208,16 @@ fn consume_rate_limit(env: &Env, client: &Address) -> Result<(), ContractError> 
     let cfg = rate_limit_config(env);
     let now = env.ledger().timestamp();
     let key = DataKey::Window(client.clone());
-    let mut window: RateWindow = env
-        .storage()
-        .persistent()
-        .get(&key)
-        .unwrap_or(RateWindow { window_start: now, count: 0 });
+    let mut window: RateWindow = env.storage().persistent().get(&key).unwrap_or(RateWindow {
+        window_start: now,
+        count: 0,
+    });
 
     if now.saturating_sub(window.window_start) >= cfg.window_secs {
-        window = RateWindow { window_start: now, count: 0 };
+        window = RateWindow {
+            window_start: now,
+            count: 0,
+        };
     }
     if window.count >= cfg.max_requests {
         return Err(ContractError::RateLimitExceeded);
@@ -319,7 +332,11 @@ impl MobileApi {
     ///
     /// Re-registering with a new version updates the stored version. Clients
     /// must register before calling `sync`, `pull_notifications` or `subscribe`.
-    pub fn register_client(env: Env, client: Address, api_version: u32) -> Result<u32, ContractError> {
+    pub fn register_client(
+        env: Env,
+        client: Address,
+        api_version: u32,
+    ) -> Result<u32, ContractError> {
         client.require_auth();
         if api_version < MIN_API_VERSION {
             return Err(ContractError::UnsupportedApiVersion);
@@ -357,7 +374,10 @@ impl MobileApi {
         }
         env.storage().instance().set(
             &DataKey::RateLimit,
-            &RateLimitConfig { max_requests, window_secs },
+            &RateLimitConfig {
+                max_requests,
+                window_secs,
+            },
         );
         Ok(())
     }
@@ -424,7 +444,12 @@ impl MobileApi {
 
     /// Catch-up sync for offline-first clients. Returns every change after
     /// `since_seq`, up to `limit`.
-    pub fn sync(env: Env, client: Address, since_seq: u64, limit: u32) -> Result<SyncPage, ContractError> {
+    pub fn sync(
+        env: Env,
+        client: Address,
+        since_seq: u64,
+        limit: u32,
+    ) -> Result<SyncPage, ContractError> {
         client.require_auth();
         require_registered(&env, &client)?;
         consume_rate_limit(&env, &client)?;
@@ -456,7 +481,9 @@ impl MobileApi {
     }
 
     pub fn get_subscription(env: Env, client: Address) -> Option<Vec<Symbol>> {
-        env.storage().persistent().get(&DataKey::Subscription(client))
+        env.storage()
+            .persistent()
+            .get(&DataKey::Subscription(client))
     }
 
     /// Pulls only the changes matching the client's subscription, after `since_seq`.

@@ -27,14 +27,20 @@ fn negotiates_api_version_to_the_lower_of_client_and_server() {
     assert_eq!(info.minimum, MIN_API_VERSION);
 
     let old_app = Address::generate(&env);
-    assert_eq!(client.register_client(&old_app, &MIN_API_VERSION), MIN_API_VERSION);
+    assert_eq!(
+        client.register_client(&old_app, &MIN_API_VERSION),
+        MIN_API_VERSION
+    );
 
     let future_app = Address::generate(&env);
     assert_eq!(
         client.register_client(&future_app, &(CURRENT_API_VERSION + 10)),
         CURRENT_API_VERSION
     );
-    assert_eq!(client.get_client(&future_app).unwrap().api_version, CURRENT_API_VERSION);
+    assert_eq!(
+        client.get_client(&future_app).unwrap().api_version,
+        CURRENT_API_VERSION
+    );
 }
 
 #[test]
@@ -72,7 +78,12 @@ fn sync_pages_through_changes_with_cursor() {
     client.register_client(&app, &CURRENT_API_VERSION);
 
     for i in 0..5u64 {
-        let seq = client.publish_change(&admin, &Symbol::new(&env, "maint"), &i, &hash(&env, i as u8));
+        let seq = client.publish_change(
+            &admin,
+            &Symbol::new(&env, "maint"),
+            &i,
+            &hash(&env, i as u8),
+        );
         assert_eq!(seq, i + 1);
     }
 
@@ -100,7 +111,10 @@ fn sync_rejects_out_of_range_limits() {
     let client = MobileApiClient::new(&env, &id);
     let app = Address::generate(&env);
     client.register_client(&app, &CURRENT_API_VERSION);
-    assert_eq!(client.try_sync(&app, &0, &0), Err(Ok(ContractError::InvalidLimit)));
+    assert_eq!(
+        client.try_sync(&app, &0, &0),
+        Err(Ok(ContractError::InvalidLimit))
+    );
     assert_eq!(
         client.try_sync(&app, &0, &(MAX_PAGE_SIZE + 1)),
         Err(Ok(ContractError::InvalidLimit))
