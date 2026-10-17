@@ -77,6 +77,8 @@ pub enum ContractError {
     InsuranceVerificationFailed = 30,
     /// Maximum LTV must not exceed 10,000 basis points.
     InvalidLtvBps = 31,
+    /// A lien cannot be released while its loan is active or unknown.
+    LienLoanNotFinalized = 32,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -272,6 +274,7 @@ const LOAN_DURATION_KEY: soroban_sdk::Symbol = symbol_short!("LOAN_DUR");
 const MIN_STAKE_KEY: soroban_sdk::Symbol = symbol_short!("MIN_STK");
 const YIELD_BPS_KEY: soroban_sdk::Symbol = symbol_short!("YIELD_BPS");
 const YIELD_NUMERATOR: u64 = DEFAULT_YIELD_NUMERATOR;
+const LOAN_STATUS_KEY: soroban_sdk::Symbol = symbol_short!("LN_STS");
 
 #[allow(dead_code)]
 const LOAN_REQUESTED: Symbol = symbol_short!("loan_req");
@@ -291,6 +294,30 @@ const INSURANCE_CLAIMED: Symbol = symbol_short!("ins_clm");
 
 fn loan_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
     (symbol_short!("LOAN"), borrower.clone())
+}
+
+fn loan_borrower_key(loan_id: u64) -> (soroban_sdk::Symbol, u64) {
+    (symbol_short!("L_MAP"), loan_id)
+}
+
+fn loan_status_key(loan_id: u64) -> (soroban_sdk::Symbol, u64) {
+    (LOAN_STATUS_KEY, loan_id)
+}
+
+fn set_loan_status(env: &Env, loan_id: u64, status: LoanStatus) {
+    let key = loan_status_key(loan_id);
+    env.storage().persistent().set(&key, &status);
+    extend_persistent_ttl(env, &key);
+}
+
+fn get_loan_status(env: &Env, loan_id: u64) -> Option<LoanStatus> {
+    if let Some(status) = env.storage().persistent().get(&loan_status_key(loan_id)) {
+        return Some(status);
+    }
+
+    let borrower: Address = env.storage().persistent().get(&loan_borrower_key(loan_id))?;
+    let loan: Loan = env.storage().persistent().get(&loan_key(&borrower))?;
+    (loan.id == loan_id).then_some(loan.status)
 }
 
 fn borrower_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
@@ -642,7 +669,9 @@ impl LendingContract {
         let loan_id_counter: u64 = env.storage().persistent().get(&symbol_short!("L_COUNT")).unwrap_or(0);
         let new_loan_id = loan_id_counter + 1;
         env.storage().persistent().set(&symbol_short!("L_COUNT"), &new_loan_id);
-        env.storage().persistent().set(&(symbol_short!("L_MAP"), new_loan_id), &borrower);
+        env.storage()
+            .persistent()
+            .set(&loan_borrower_key(new_loan_id), &borrower);
 
         let loan = Loan {
             borrower: borrower.clone(),
@@ -653,6 +682,7 @@ impl LendingContract {
         };
         env.storage().persistent().set(&key, &loan);
         extend_persistent_ttl(&env, &key);
+        set_loan_status(&env, new_loan_id, LoanStatus::Active);
 
         // Transfer the loan amount to the borrower
         tok.transfer(
@@ -733,6 +763,7 @@ impl LendingContract {
         loan.status = LoanStatus::Repaid;
         env.storage().persistent().set(&key, &loan);
         extend_persistent_ttl(&env, &key);
+        set_loan_status(&env, loan.id, LoanStatus::Repaid);
 
         // Track successful repayments in the borrower record for credit scoring.
         let borrower_key_val = borrower_key(&borrower);
@@ -879,6 +910,7 @@ impl LendingContract {
         loan.status = LoanStatus::Defaulted;
         env.storage().persistent().set(&key, &loan);
         extend_persistent_ttl(&env, &key);
+        set_loan_status(&env, loan.id, LoanStatus::Defaulted);
 
         let default_time = env.ledger().timestamp();
         env.storage().persistent().set(&(symbol_short!("DEF_TIME"), borrower.clone()), &default_time);
@@ -1215,7 +1247,7 @@ impl LendingContract {
             .extend_ttl(&la_key, TTL_THRESHOLD, TTL_TARGET);
     }
 
-    /// Release (remove) a previously recorded lien. Only the contract admin may call this.
+    /// Release a lien only after its loan has been repaid or defaulted.
     ///
     /// Panics with [`ContractError::LienNotFound`] if no matching lien exists
     /// for the given asset, lender, and loan_id.
@@ -1245,12 +1277,27 @@ impl LendingContract {
 
         match found_index {
             Some(idx) => {
+                if !matches!(
+                    get_loan_status(&env, loan_id),
+                    Some(LoanStatus::Repaid | LoanStatus::Defaulted)
+                ) {
+                    panic_with_error!(&env, ContractError::LienLoanNotFinalized);
+                }
+
                 liens.remove(idx);
                 if liens.is_empty() {
                     env.storage().persistent().remove(&key);
                 } else {
                     env.storage().persistent().set(&key, &liens);
                     extend_persistent_ttl(&env, &key);
+                }
+                if env
+                    .storage()
+                    .persistent()
+                    .get::<_, u64>(&loan_asset_key(loan_id))
+                    == Some(asset_id)
+                {
+                    env.storage().persistent().remove(&loan_asset_key(loan_id));
                 }
             }
             None => panic_with_error!(&env, ContractError::LienNotFound),
@@ -2160,6 +2207,19 @@ mod tests {
         client.record_lien(&admin, &1, &lender, &42, &1000);
         assert_eq!(client.get_liens(&1).len(), 1);
 
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&loan_status_key(42), &LoanStatus::Active);
+        });
+        assert!(client.try_release_lien(&admin, &1, &lender, &42).is_err());
+        assert_eq!(client.get_liens(&1).len(), 1);
+
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&loan_status_key(42), &LoanStatus::Repaid);
+        });
         client.release_lien(&admin, &1, &lender, &42);
         assert_eq!(client.get_liens(&1).len(), 0);
     }
