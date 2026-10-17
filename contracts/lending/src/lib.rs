@@ -79,6 +79,10 @@ pub enum ContractError {
     InvalidLtvBps = 31,
     /// A lien cannot be released while its loan is active or unknown.
     LienLoanNotFinalized = 32,
+    /// Insurance is already registered for this asset.
+    InsuranceAlreadyRegistered = 33,
+    /// Insurance coverage must be greater than zero.
+    ZeroInsuranceCoverage = 34,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -338,6 +342,7 @@ const LTV_HISTORY_KEY: soroban_sdk::Symbol = symbol_short!("LTV_HST");
 const RESTRUCTURE_KEY: soroban_sdk::Symbol = symbol_short!("REST");
 const SYNDICATE_KEY: soroban_sdk::Symbol = symbol_short!("SYND");
 const INSURANCE_KEY: soroban_sdk::Symbol = symbol_short!("INS");
+const INSURANCE_LENDER_KEY: soroban_sdk::Symbol = symbol_short!("INS_LNDR");
 const INSURANCE_PAYOUT_KEY: soroban_sdk::Symbol = symbol_short!("INS_PAY");
 const RESTRUCTURE_COUNT_KEY: soroban_sdk::Symbol = symbol_short!("REST_CNT");
 
@@ -359,6 +364,10 @@ fn syndicate_key(loan_id: u64) -> (soroban_sdk::Symbol, u64) {
 
 fn insurance_key(asset_id: u64) -> (soroban_sdk::Symbol, u64) {
     (INSURANCE_KEY, asset_id)
+}
+
+fn insurance_lender_key(asset_id: u64) -> (soroban_sdk::Symbol, u64) {
+    (INSURANCE_LENDER_KEY, asset_id)
 }
 
 fn insurance_payout_key(asset_id: u64, index: u64) -> (soroban_sdk::Symbol, u64, u64) {
@@ -1552,6 +1561,23 @@ impl LendingContract {
     ) {
         require_not_paused(&env);
         lender.require_auth();
+        if coverage_amount == 0 {
+            panic_with_error!(&env, ContractError::ZeroInsuranceCoverage);
+        }
+
+        let key = insurance_key(asset_id);
+        if env.storage().persistent().has(&key) {
+            panic_with_error!(&env, ContractError::InsuranceAlreadyRegistered);
+        }
+
+        let liens: Vec<LienRecord> = env
+            .storage()
+            .persistent()
+            .get(&liens_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        if !liens.iter().any(|lien| lien.lender == lender) {
+            panic_with_error!(&env, ContractError::UnauthorizedLender);
+        }
 
         let insurance = InsuranceRecord {
             asset_id,
@@ -1560,8 +1586,11 @@ impl LendingContract {
             registered_at: env.ledger().timestamp(),
         };
 
-        env.storage().persistent().set(&insurance_key(asset_id), &insurance);
-        extend_persistent_ttl(&env, &insurance_key(asset_id));
+        env.storage().persistent().set(&key, &insurance);
+        extend_persistent_ttl(&env, &key);
+        let lender_key = insurance_lender_key(asset_id);
+        env.storage().persistent().set(&lender_key, &lender);
+        extend_persistent_ttl(&env, &lender_key);
 
         env.events().publish((INSURANCE_REGISTERED,), (asset_id, policy_id, coverage_amount));
     }
@@ -1576,6 +1605,15 @@ impl LendingContract {
             .persistent()
             .get(&insurance_key(asset_id))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::InsuranceNotFound));
+
+        let insurance_lender: Address = env
+            .storage()
+            .persistent()
+            .get(&insurance_lender_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::UnauthorizedLender));
+        if insurance_lender != lender {
+            panic_with_error!(&env, ContractError::UnauthorizedLender);
+        }
 
         // Payout is capped at coverage amount
         let payout = loss_amount.min(insurance.coverage_amount);
@@ -2532,5 +2570,46 @@ mod tests {
             client.get_collateral_value(&1_000_000_000_000_000, &100, &10_000),
             1_000_000_000_000_000
         );
+    }
+
+    #[test]
+    fn test_collateral_insurance_requires_matching_lien_and_is_not_overwritable() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.initialize(&deployer, &admin, &token, &0);
+
+        let lender = Address::generate(&env);
+        let other_lender = Address::generate(&env);
+        client.record_lien(&admin, &7, &lender, &41, &1000);
+        client.register_collateral_insurance(&lender, &7, &123, &500);
+
+        let insurance = client.get_insurance(&7).unwrap();
+        assert_eq!(insurance.policy_id, 123);
+        assert_eq!(insurance.coverage_amount, 500);
+
+        assert!(client
+            .try_register_collateral_insurance(&other_lender, &7, &456, &0)
+            .is_err());
+        assert!(client
+            .try_register_collateral_insurance(&lender, &7, &456, &0)
+            .is_err());
+        assert!(client
+            .try_register_collateral_insurance(&other_lender, &8, &456, &500)
+            .is_err());
+        client.record_lien(&admin, &8, &lender, &42, &1000);
+        assert!(client
+            .try_register_collateral_insurance(&lender, &8, &456, &0)
+            .is_err());
+        assert!(client
+            .try_claim_insurance(&other_lender, &7, &100)
+            .is_err());
+        assert_eq!(client.get_insurance(&7), Some(insurance));
+        assert_eq!(client.claim_insurance(&lender, &7, &100), 100);
     }
 }
