@@ -1305,9 +1305,18 @@ impl LendingContract {
             volatility,
         };
 
-        let loan_counter: u64 = env.storage().persistent().get(&symbol_short!("L_COUNT")).unwrap_or(0);
-        env.storage().persistent().set(&ltv_history_key(loan_counter), &history);
-        extend_persistent_ttl(&env, &ltv_history_key(loan_counter));
+        let history_index: u64 = env
+            .storage()
+            .persistent()
+            .get(&symbol_short!("LTV_CNT"))
+            .unwrap_or(0);
+        let history_key = ltv_history_key(history_index);
+        env.storage().persistent().set(&history_key, &history);
+        extend_persistent_ttl(&env, &history_key);
+        env.storage()
+            .persistent()
+            .set(&symbol_short!("LTV_CNT"), &(history_index + 1));
+        extend_persistent_ttl(&env, &symbol_short!("LTV_CNT"));
 
         // Emit event
         env.events().publish((LTV_ADJUSTED,), (original_ltv, config.max_ltv_bps, volatility));
