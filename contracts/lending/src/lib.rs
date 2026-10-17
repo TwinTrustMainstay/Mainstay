@@ -1521,14 +1521,60 @@ impl LendingContract {
         require_not_paused(&env);
         lender.require_auth();
 
-        let insurance: InsuranceRecord = env
+        let mut insurance: InsuranceRecord = env
             .storage()
             .persistent()
             .get(&insurance_key(asset_id))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::InsuranceNotFound));
 
+        let liens: Vec<LienRecord> = env
+            .storage()
+            .persistent()
+            .get(&liens_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut has_active_lien = false;
+        for lien in liens.iter() {
+            if lien.lender != lender {
+                continue;
+            }
+            let borrower: Option<Address> = env
+                .storage()
+                .persistent()
+                .get(&(symbol_short!("L_MAP"), lien.loan_id));
+            if let Some(borrower) = borrower {
+                let loan: Option<Loan> = env.storage().persistent().get(&loan_key(&borrower));
+                if let Some(loan) = loan {
+                    if loan.id == lien.loan_id && loan.status == LoanStatus::Active {
+                        has_active_lien = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !has_active_lien {
+            panic_with_error!(&env, ContractError::InsuranceVerificationFailed);
+        }
+
         // Payout is capped at coverage amount
         let payout = loss_amount.min(insurance.coverage_amount);
+        insurance.coverage_amount -= payout;
+        env.storage()
+            .persistent()
+            .set(&insurance_key(asset_id), &insurance);
+        extend_persistent_ttl(&env, &insurance_key(asset_id));
+
+        if payout > 0 {
+            let token_addr = get_token(&env);
+            let tok = token::Client::new(&env, &token_addr);
+            if tok.balance(&env.current_contract_address()) < payout as i128 {
+                panic_with_error!(&env, ContractError::InsufficientFunds);
+            }
+            tok.transfer(
+                &env.current_contract_address(),
+                &lender,
+                &(payout as i128),
+            );
+        }
 
         let payout_record = InsurancePayout {
             asset_id,
