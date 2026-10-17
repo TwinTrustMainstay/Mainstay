@@ -318,11 +318,11 @@ Potential improvements for future releases:
 
 ## Related Documentation
 
-- [Maintenance Guide](./docs/MAINTENANCE.md)
-- [Monitoring Guide](./docs/monitoring/PROMETHEUS_METRICS.md)
-- [Backup and Recovery](./docs/BACKUP_RECOVERY.md)
-- [Smart Contract Architecture](./docs/ARCHITECTURE.md)
-- [DeFi Integration](./docs/DEFI_INTEGRATION.md)
+- [Engineer Operations](../../engineer-operations.md)
+- [Prometheus Metrics](../../monitoring/PROMETHEUS_METRICS.md)
+- [Backup Procedures](../../backup-procedures.md)
+- [Smart Contract Architecture](../../architecture.md)
+- [Lender Integration](../../lender-integration-guide.md)
 
 ---
 
