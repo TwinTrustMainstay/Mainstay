@@ -75,6 +75,8 @@ pub enum ContractError {
     InsuranceNotFound = 29,
     /// Insurance verification failed.
     InsuranceVerificationFailed = 30,
+    /// Maximum LTV must not exceed 10,000 basis points.
+    InvalidLtvBps = 31,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -1122,6 +1124,10 @@ impl LendingContract {
     /// A value of 0 disables LTV enforcement. A value of 7000 means 70% LTV.
     pub fn set_max_ltv_bps(env: Env, admin: Address, max_ltv_bps: u32) {
         require_admin(&env, &admin);
+        if max_ltv_bps > 10_000 {
+            panic_with_error!(&env, ContractError::InvalidLtvBps);
+        }
+
         let mut config = get_config(&env);
         config.max_ltv_bps = max_ltv_bps;
         env.storage().persistent().set(&CONFIG_KEY, &config);
@@ -2434,6 +2440,26 @@ mod tests {
 
         let loan = client.get_loan(&borrower).unwrap();
         assert_eq!(loan.status, LoanStatus::Active);
+    }
+
+    #[test]
+    fn test_set_max_ltv_bps_rejects_values_above_100_percent() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.initialize(&deployer, &admin, &token, &0);
+
+        client.set_max_ltv_bps(&admin, &10_000);
+        assert_eq!(get_config(&env).max_ltv_bps, 10_000);
+
+        let result = client.try_set_max_ltv_bps(&admin, &10_001);
+        assert!(result.is_err());
+        assert_eq!(get_config(&env).max_ltv_bps, 10_000);
     }
 
     #[test]
