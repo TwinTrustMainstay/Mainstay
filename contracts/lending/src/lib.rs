@@ -424,6 +424,7 @@ fn get_config(env: &Env) -> Config {
         .unwrap_or(Config {
             yield_bps: 200,
             slash_bps: 5000,
+            max_ltv_bps: 0,
         })
 }
 
@@ -1287,11 +1288,12 @@ impl LendingContract {
         let mut config = get_config(&env);
         let original_ltv = config.max_ltv_bps;
 
-        // Reduce LTV when volatility exceeds 30 bps
+        // Reduce LTV when volatility exceeds 3000 bps
         if volatility > 3000 {
             // Reduce by 10% for every 1000 bps of volatility above 3000
-            let reduction_factor = ((volatility - 3000) / 1000).min(5000);
-            config.max_ltv_bps = original_ltv.saturating_sub(((original_ltv as u64 * reduction_factor) / 10000) as u32);
+            let reduction_bps = (((volatility - 3000) / 1000) * 1000).min(5000);
+            config.max_ltv_bps =
+                original_ltv.saturating_sub(((original_ltv as u64 * reduction_bps as u64) / 10000) as u32);
         }
 
         env.storage().persistent().set(&CONFIG_KEY, &config);
