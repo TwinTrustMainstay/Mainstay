@@ -320,7 +320,7 @@ Engineer Registry
 - **Architecture:** See [docs/architecture.md](./architecture.md) for system design
 - **ADRs:** See [docs/adr/README.md](./adr/README.md) for design decisions
 - **Deployment:** See [docs/deployment-runbook.md](./deployment-runbook.md) for testnet/mainnet procedures
-- **API Reference:** See [docs/api-reference.md](./api-reference.md) for contract functions
+- **Lifecycle Contract API:** See the [lifecycle contract source](../contracts/lifecycle/src/lib.rs) for contract functions
 
 ## Getting Help
 

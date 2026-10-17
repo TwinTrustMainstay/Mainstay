@@ -388,7 +388,7 @@ LOCKED key removed
 
 ## Further Reading
 
-- [Life-Cycle Contract Design](lifecycle-contract.md)
+- [Asset Lifecycle](asset-lifecycle.md)
 - [Engineer Credentialing](credentialing.md)
 - [Collateral Scoring Model](collateral-scoring.md)
 - [TTL Strategy](ttl-strategy.md)
