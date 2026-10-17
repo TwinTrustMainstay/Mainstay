@@ -6,6 +6,11 @@ network_passphrase = "Test SDF Network ; September 2015"
 rpc_url = "https://mainnet.sorobanrpc.com"
 network_passphrase = "Public Global Stellar Network ; September 2015"
 
+[mainnet.rpc_urls]
+"us-east-1" = "https://soroban-mainnet-us-east.stellar.org"
+"eu-west-1" = "https://soroban-mainnet-eu-west.stellar.org"
+"ap-southeast-1" = "https://soroban-mainnet-ap-se.stellar.org"
+
 [futurenet]
 rpc_url = "https://rpc-futurenet.stellar.org"
 network_passphrase = "Test SDF Future Network ; October 2022"
@@ -13,3 +18,8 @@ network_passphrase = "Test SDF Future Network ; October 2022"
 [standalone]
 rpc_url = "http://localhost:8000/soroban/rpc"
 network_passphrase = "Standalone Network ; February 2017"
+
+[aws.vpc_cidrs]
+"us-east-1" = "10.0.0.0/16"
+"eu-west-1" = "10.1.0.0/16"
+"ap-southeast-1" = "10.2.0.0/16"

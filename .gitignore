@@ -47,6 +47,7 @@ Cargo.lock
 .soroban/
 stellar-cli-output/
 .stellar/
+terraform/network.auto.tfvars.json
 
 # Temporary files
 *.tmp

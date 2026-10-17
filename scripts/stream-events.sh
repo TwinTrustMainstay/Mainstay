@@ -6,6 +6,11 @@
 
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+source .env 2>/dev/null || true
+source "$ROOT/scripts/load-network-config.sh"
+
 : "${CONTRACT_LIFECYCLE:?Set CONTRACT_LIFECYCLE}"
 : "${STELLAR_RPC_URL:?Set STELLAR_RPC_URL}"
 : "${POLL_SECONDS:=5}"

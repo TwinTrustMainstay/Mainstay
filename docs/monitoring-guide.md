@@ -40,7 +40,7 @@ Set the required environment variables in `.env`:
 ```bash
 # Stellar connection
 STELLAR_NETWORK=mainnet
-STELLAR_RPC_URL=https://mainnet.sorobanrpc.com
+source scripts/load-network-config.sh
 
 # Contract addresses (from deployment)
 CONTRACT_ASSET_REGISTRY=<your-asset-registry-contract-id>

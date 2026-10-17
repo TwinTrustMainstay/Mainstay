@@ -35,8 +35,7 @@ cd "$ROOT"
 
 source ~/.cargo/env 2>/dev/null || true
 source .env 2>/dev/null || true
-
-: "${STELLAR_NETWORK:=testnet}"
+source "$ROOT/scripts/load-network-config.sh"
 
 # ---------------------------------------------------------------------------
 # Configuration

@@ -46,23 +46,14 @@ PEER_PORT=11625
 
 ### 1.2 RPC Endpoint Configuration
 
-Update `environments.toml` with multi-region entries:
+Regional RPC endpoints are stored in `environments.toml` under
+`[mainnet.rpc_urls]`. Generate the Terraform network variables from that
+configuration before planning:
 
-```toml
-[mainnet.us-east-1]
-rpc_url = "https://soroban-mainnet-us-east.stellar.org"
-network_passphrase = "Public Global Stellar Network ; September 2015"
-priority = 1
-
-[mainnet.eu-west-1]
-rpc_url = "https://soroban-mainnet-eu-west.stellar.org"
-network_passphrase = "Public Global Stellar Network ; September 2015"
-priority = 2
-
-[mainnet.ap-southeast-1]
-rpc_url = "https://soroban-mainnet-ap-se.stellar.org"
-network_passphrase = "Public Global Stellar Network ; September 2015"
-priority = 3
+```bash
+python3 scripts/export-network-config.py --format terraform mainnet \
+  > terraform/network.auto.tfvars.json
+terraform -chdir=terraform plan
 ```
 
 ## 2. Terraform Templates for Multi-Region AWS Deployment

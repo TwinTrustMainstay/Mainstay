@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
 source ~/.cargo/env 2>/dev/null || true
 source .env 2>/dev/null || true
-
-: "${STELLAR_NETWORK:=testnet}"
+source "$ROOT/scripts/load-network-config.sh"
 if [[ "${STELLAR_NETWORK}" != "testnet" ]]; then
   echo "Refusing to deploy: STELLAR_NETWORK must be 'testnet' (got '${STELLAR_NETWORK}')." >&2
   exit 1
