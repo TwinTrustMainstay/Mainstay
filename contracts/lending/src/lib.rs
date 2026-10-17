@@ -1587,7 +1587,7 @@ impl LendingContract {
             panic_with_error!(&env, ContractError::InsuranceVerificationFailed);
         }
 
-        // Payout is capped at coverage amount
+        // Payout is capped by the policy's remaining coverage.
         let payout = loss_amount.min(insurance.coverage_amount);
         insurance.coverage_amount -= payout;
         env.storage()
@@ -2515,5 +2515,141 @@ mod tests {
 
         let loan = client.get_loan(&borrower).unwrap();
         assert_eq!(loan.status, LoanStatus::Active);
+    }
+
+    #[test]
+    fn test_insurance_claims_transfer_tokens_and_consume_coverage() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract(token_admin.clone());
+        let token = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        client.initialize(&deployer, &admin, &token_id, &0);
+
+        let borrower = Address::generate(&env);
+        let lender = Address::generate(&env);
+        token.mint(&contract_id, &1_000);
+        client.request_loan(&borrower, &100, &7);
+        client.record_lien(&admin, &7, &lender, &1, &100);
+        client.register_collateral_insurance(&lender, &7, &99, &100);
+
+        let first_payout = client.claim_insurance(&lender, &7, &80);
+        let second_payout = client.claim_insurance(&lender, &7, &80);
+
+        assert_eq!(first_payout, 80);
+        assert_eq!(second_payout, 20);
+        assert_eq!(client.get_insurance(&7).unwrap().coverage_amount, 0);
+        assert_eq!(soroban_sdk::token::Client::new(&env, &token_id).balance(&lender), 100);
+        let payouts = client.get_insurance_payouts(&7);
+        assert_eq!(payouts.len(), 2);
+        assert_eq!(payouts.get(0).unwrap().payout_amount, 80);
+        assert_eq!(payouts.get(1).unwrap().payout_amount, 20);
+    }
+
+    #[test]
+    fn test_insurance_claim_requires_active_lien_for_lender() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract(token_admin);
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let lender = Address::generate(&env);
+        client.initialize(&deployer, &admin, &token_id, &0);
+        client.register_collateral_insurance(&lender, &7, &99, &100);
+
+        assert!(client.try_claim_insurance(&lender, &7, &50).is_err());
+    }
+
+    #[test]
+    fn test_insurance_claim_rejects_lien_for_inactive_loan() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract(token_admin);
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let lender = Address::generate(&env);
+        client.initialize(&deployer, &admin, &token_id, &0);
+        client.register_collateral_insurance(&lender, &7, &99, &100);
+        client.record_lien(&admin, &7, &lender, &42, &100);
+
+        assert!(client.try_claim_insurance(&lender, &7, &50).is_err());
+    }
+
+    #[test]
+    fn test_ltv_adjustments_use_independent_history_indices() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (contract_id, admin, _) = setup_contract(&env);
+        let client = LendingContractClient::new(&env, &contract_id);
+        client.set_max_ltv_bps(&admin, &8_000);
+        client.update_market_conditions(&admin, &4_000, &0);
+
+        assert_eq!(client.adjust_ltv_for_conditions(&admin), 7_200);
+        assert_eq!(client.adjust_ltv_for_conditions(&admin), 7_200);
+
+        let (first, second) = env.as_contract(&contract_id, || {
+            (
+                env.storage()
+                    .persistent()
+                    .get::<_, LtvHistory>(&ltv_history_key(0))
+                    .unwrap(),
+                env.storage()
+                    .persistent()
+                    .get::<_, LtvHistory>(&ltv_history_key(1))
+                    .unwrap(),
+            )
+        });
+        assert_eq!(first.old_ltv_bps, 8_000);
+        assert_eq!(first.new_ltv_bps, 7_200);
+        assert_eq!(second.old_ltv_bps, 7_200);
+        assert_eq!(second.new_ltv_bps, 7_200);
+    }
+
+    #[test]
+    fn test_ltv_volatility_reduction_is_ten_percent_per_step_and_non_cumulative() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (contract_id, admin, _) = setup_contract(&env);
+        let client = LendingContractClient::new(&env, &contract_id);
+        client.set_max_ltv_bps(&admin, &8_000);
+        client.update_market_conditions(&admin, &4_000, &0);
+
+        assert_eq!(client.adjust_ltv_for_conditions(&admin), 7_200);
+        assert_eq!(client.adjust_ltv_for_conditions(&admin), 7_200);
+
+        client.update_market_conditions(&admin, &5_000, &0);
+        assert_eq!(client.adjust_ltv_for_conditions(&admin), 6_400);
+
+        client.update_market_conditions(&admin, &3_000, &0);
+        assert_eq!(client.adjust_ltv_for_conditions(&admin), 8_000);
+    }
+
+    #[test]
+    fn test_ltv_adjustment_requires_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (contract_id, admin, _) = setup_contract(&env);
+        let client = LendingContractClient::new(&env, &contract_id);
+        client.update_market_conditions(&admin, &4_000, &0);
+
+        let non_admin = Address::generate(&env);
+        assert!(client.try_adjust_ltv_for_conditions(&non_admin).is_err());
     }
 }
