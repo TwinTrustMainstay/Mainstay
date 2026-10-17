@@ -8966,6 +8966,11 @@ mod tests {
         Bytes, BytesN, Env, String, Symbol, TryIntoVal,
     };
 
+    mod collateral_tests;
+    mod lifecycle_score_tests;
+    mod maintenance_fuzz_tests;
+    mod maintenance_ttl_tests;
+
     fn setup<'a>(
         env: &'a Env,
         max_history: u32,
