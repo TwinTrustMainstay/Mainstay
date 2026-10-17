@@ -594,7 +594,7 @@ def invalidate_asset_cache(asset_id):
 
 ## Related Documentation
 
-- [Monitoring Guide](./docs/monitoring/PROMETHEUS_METRICS.md) - Real-time metrics
-- [Backup and Recovery](./docs/BACKUP_RECOVERY.md) - Data preservation
+- [Prometheus Metrics](./monitoring/PROMETHEUS_METRICS.md) - Real-time metrics
+- [Backup Procedures](./backup-procedures.md) - Data preservation
 - [Smart Contract Events](https://developers.stellar.org/docs/smart-contracts/events) - Soroban event spec
 - [Horizon API Events](https://developers.stellar.org/api/resources/events/) - Horizon API reference
