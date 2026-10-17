@@ -1051,11 +1051,8 @@ impl LendingContract {
     ) -> u64 {
         let score = u64::from(score.min(100));
         let ltv_bps = u64::from(ltv_bps.min(10_000));
-        asset_base_value
-            .saturating_mul(score)
-            .saturating_mul(ltv_bps)
-            / 100
-            / 10_000
+        ((u128::from(asset_base_value) * u128::from(score) * u128::from(ltv_bps)) / 1_000_000)
+            as u64
     }
 
     /// Returns whether the contract has been initialized.
@@ -2437,5 +2434,17 @@ mod tests {
 
         let loan = client.get_loan(&borrower).unwrap();
         assert_eq!(loan.status, LoanStatus::Active);
+    }
+
+    #[test]
+    fn test_get_collateral_value_large_base_value() {
+        let env = Env::default();
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        assert_eq!(
+            client.get_collateral_value(&1_000_000_000_000_000, &100, &10_000),
+            1_000_000_000_000_000
+        );
     }
 }
