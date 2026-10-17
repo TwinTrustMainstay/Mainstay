@@ -39,6 +39,9 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace
 
+      - name: Compile benchmark targets
+        run: cargo check --workspace --benches
+
   docs:
     name: Validate error reference docs
     runs-on: ubuntu-latest
