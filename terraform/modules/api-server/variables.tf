@@ -57,6 +57,11 @@ variable "request_retention_seconds" {
   default     = 604800
 }
 
+variable "image_tag" {
+  description = "Immutable container image tag or digest (e.g. sha256:... or v1.2.3) for the API server image"
+  type        = string
+}
+
 # Data source for AZs in the region
 data "aws_availability_zones" "available" {
   state = "available"

@@ -186,12 +186,31 @@ resource "aws_cloudwatch_log_group" "nginx_error" {
   }
 }
 
+# Dead-letter queue: isolates DSAR messages that repeatedly fail processing
+# so they can be inspected and replayed instead of stalling the main queue.
+resource "aws_sqs_queue" "data_subject_requests_dlq" {
+  name                       = "mainstay-data-subject-requests-dlq-${var.region}"
+  message_retention_seconds  = var.request_retention_seconds
+  visibility_timeout_seconds = 300
+  sqs_managed_sse_enabled    = true
+
+  tags = {
+    Project = "Mainstay"
+    Region  = var.region
+  }
+}
+
 resource "aws_sqs_queue" "data_subject_requests" {
   name                       = "mainstay-data-subject-requests-${var.region}"
   message_retention_seconds = var.request_retention_seconds
   receive_wait_time_seconds = 20
   visibility_timeout_seconds = 300
   sqs_managed_sse_enabled   = true
+
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.data_subject_requests_dlq.arn
+    maxReceiveCount     = 5
+  })
 
   tags = {
     Project = "Mainstay"
@@ -228,6 +247,11 @@ resource "aws_iam_role_policy" "api_privacy" {
         Effect   = "Allow"
         Action   = ["sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
         Resource = aws_sqs_queue.data_subject_requests.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
+        Resource = aws_sqs_queue.data_subject_requests_dlq.arn
       }
     ]
   })
@@ -332,6 +356,7 @@ resource "aws_launch_template" "api" {
     allowed_origins = var.allowed_origins
     dsar_table_name = aws_dynamodb_table.data_subject_requests.name
     dsar_queue_url  = aws_sqs_queue.data_subject_requests.url
+    image_tag       = var.image_tag
   }))
 
   iam_instance_profile {
@@ -429,5 +454,29 @@ resource "aws_cloudwatch_metric_alarm" "api_latency" {
 
   dimensions = {
     LoadBalancer = aws_lb.api.arn_suffix
+  }
+}
+
+# Any message in the DSAR DLQ means a data-subject request failed repeatedly
+# and needs manual attention. See docs/runbooks/dsar-dlq.md for replay steps.
+resource "aws_cloudwatch_metric_alarm" "dsar_dlq_depth" {
+  alarm_name          = "mainstay-dsar-dlq-depth-${var.region}"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  namespace           = "AWS/SQS"
+  period              = 300
+  statistic           = "Maximum"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+  alarm_description   = "DSAR dead-letter queue is non-empty; failed data-subject requests require replay or manual processing"
+
+  dimensions = {
+    QueueName = aws_sqs_queue.data_subject_requests_dlq.name
+  }
+
+  tags = {
+    Project = "Mainstay"
+    Region  = var.region
   }
 }

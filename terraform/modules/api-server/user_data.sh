@@ -87,8 +87,41 @@ THIRD_PARTY_API_KEY={{ .Data.data.third_party_api_key }}
 VAULT_TEMPLATE
 vault agent -config=/etc/vault.d/mainstay-agent.hcl >/var/log/vault-agent.log 2>&1 &
 
+# ── Wait for Vault to render secrets ───────────────────────
+# The container must not start until the Vault agent has authenticated and
+# rendered the env file, otherwise it would run without its secrets.
+ENV_FILE=/run/mainstay/mainstay.env
+ENV_FILE_TIMEOUT=120
+elapsed=0
+until [ -s "$ENV_FILE" ]; do
+  if [ "$elapsed" -ge "$ENV_FILE_TIMEOUT" ]; then
+    echo "ERROR: timed out after $${ENV_FILE_TIMEOUT}s waiting for Vault to render $ENV_FILE" >&2
+    echo "Check /var/log/vault-agent.log for authentication or template errors." >&2
+    exit 1
+  fi
+  sleep 2
+  elapsed=$((elapsed + 2))
+done
+echo "Vault rendered $ENV_FILE after $${elapsed}s"
+
 # ── Pull API server container ──────────────────────────────
-docker pull ghcr.io/mainstay/api-server:latest
+# The image reference is pinned to an immutable tag/digest supplied by
+# Terraform so every instance runs the same reviewed build.
+IMAGE="ghcr.io/mainstay/api-server:${image_tag}"
+docker pull "$IMAGE"
+
+# Verify the image signature before running it.
+if command -v cosign >/dev/null 2>&1; then
+  cosign verify "$IMAGE" \
+    --certificate-identity-regexp '^https://github.com/mainstay/.*$' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    >/var/log/cosign-verify.log 2>&1 || {
+      echo "ERROR: cosign signature verification failed for $IMAGE" >&2
+      exit 1
+    }
+else
+  echo "WARNING: cosign not installed; skipping image signature verification" >&2
+fi
 
 docker run -d \
   --name mainstay-api \
@@ -100,10 +133,10 @@ docker run -d \
   -e DSAR_TABLE_NAME="${dsar_table_name}" \
   -e DSAR_QUEUE_URL="${dsar_queue_url}" \
   -e RUST_LOG=info \
-  --env-file /run/mainstay/mainstay.env \
+  --env-file "$ENV_FILE" \
   --memory="512m" \
   --cpus="1" \
-  ghcr.io/mainstay/api-server:latest
+  "$IMAGE"
 
 # ── Nginx reverse proxy with rate limiting ─────────────────
 
