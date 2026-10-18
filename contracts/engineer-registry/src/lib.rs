@@ -210,8 +210,38 @@ pub struct TimelockProposal {
     pub executed: bool,
 }
 
+/// Read-only summary of an engineer's credential state and issuer relationship.
+/// Used by off-chain tooling (e.g. `backup.sh`'s `export_engineers`) to export
+/// the full engineer registry without needing to know each engineer's address.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EngineerSummary {
+    pub address: Address,
+    pub issuer: Address,
+    pub credential_hash: BytesN<32>,
+    pub active: bool,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub suspension_end_time: Option<u64>,
+    pub status: CredentialStatus,
+}
+
 fn engineer_key(addr: &Address) -> (Symbol, Address) {
     (symbol_short!("ENG"), addr.clone())
+}
+
+/// Build a read-only summary from a stored engineer record and its current status.
+fn engineer_summary(record: &Engineer, status: CredentialStatus) -> EngineerSummary {
+    EngineerSummary {
+        address: record.address.clone(),
+        issuer: record.issuer.clone(),
+        credential_hash: record.credential_hash.clone(),
+        active: record.active,
+        issued_at: record.issued_at,
+        expires_at: record.expires_at,
+        suspension_end_time: record.suspension_end_time,
+        status,
+    }
 }
 
 fn revoke_timelock_key(engineer: &Address) -> (Symbol, Address) {
@@ -381,6 +411,26 @@ pub struct EngineerRegistry;
 
 #[contractimpl]
 impl EngineerRegistry {
+    /// Returns a summary of every registered engineer, including credential state
+    /// and issuer relationship. Intended for off-chain backup/export tooling.
+    pub fn get_engineers(env: Env) -> Vec<EngineerSummary> {
+        let addresses: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&ENGINEER_LIST)
+            .unwrap_or_else(|| Vec::new(&env));
+        let now = env.ledger().timestamp();
+        let mut out: Vec<EngineerSummary> = Vec::new(&env);
+        for addr in addresses.iter() {
+            let key = engineer_key(&addr);
+            if let Some(record) = env.storage().persistent().get::<_, Engineer>(&key) {
+                let status = Self::verify_engineer(env.clone(), addr.clone(), None);
+                out.push_back(engineer_summary(&record, status));
+            }
+        }
+        out
+    }
+
     /// Store the deployer address at deploy time.
     pub fn __constructor(env: Env, deployer: Address) {
         env.storage().instance().set(&DEPLOYER_KEY, &deployer);
@@ -4133,6 +4183,51 @@ mod tests {
             count, 1,
             "Engineer address must not be duplicated after re-registration"
         );
+    }
+
+    #[test]
+    fn test_get_engineers_returns_summaries_with_credential_state() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let issuer = Address::generate(&env);
+        let eng1 = Address::generate(&env);
+        let eng2 = Address::generate(&env);
+        let hash1 = BytesN::from_array(&env, &[1u8; 32]);
+        let hash2 = BytesN::from_array(&env, &[2u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&eng1, &hash1, &issuer, &31_536_000, &None);
+        client.register_engineer(&eng2, &hash2, &issuer, &31_536_000, &None);
+        client.revoke_credential(&eng2);
+
+        let summaries = client.get_engineers();
+        assert_eq!(summaries.len(), 2);
+
+        let s1 = summaries.get(0).unwrap();
+        assert_eq!(s1.address, eng1);
+        assert_eq!(s1.issuer, issuer);
+        assert_eq!(s1.credential_hash, hash1);
+        assert!(s1.active);
+        assert_eq!(s1.status, CredentialStatus::Valid);
+        assert!(s1.suspension_end_time.is_none());
+
+        let s2 = summaries.get(1).unwrap();
+        assert_eq!(s2.address, eng2);
+        assert_eq!(s2.issuer, issuer);
+        assert_eq!(s2.credential_hash, hash2);
+        assert!(!s2.active);
+        assert_eq!(s2.status, CredentialStatus::Revoked);
+    }
+
+    #[test]
+    fn test_get_engineers_empty_when_no_engineers() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+
+        assert_eq!(client.get_engineers().len(), 0);
     }
 
     #[test]
