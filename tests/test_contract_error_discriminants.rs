@@ -171,6 +171,73 @@ fn test_lending_discriminants_are_unique() {
     assert_unique_discriminants(&discriminants, "Lending");
 }
 
+// ── Negative fixture: duplicate discriminant must fail the checker ────────
+
+/// Regression guard for the discriminant checker script. Writes a temporary
+/// contract tree containing a `ContractError` enum with a duplicate
+/// discriminant and asserts that `scripts/check_error_discriminants.sh`
+/// exits non-zero. This ensures the checker actually inspects files beyond
+/// `src/lib.rs` (e.g. `src/errors.rs`).
+#[test]
+fn test_duplicate_discriminant_fixture_fails_checker() {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let script = manifest_dir.join("scripts").join("check_error_discriminants.sh");
+    if !script.exists() {
+        // Checker script not present in this checkout; nothing to guard.
+        return;
+    }
+
+    let fixture_root = std::env::temp_dir().join(format!(
+        "discriminant_fixture_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0),
+    ));
+    let src_dir = fixture_root.join("contracts").join("fixture").join("src");
+    fs::create_dir_all(&src_dir).expect("create fixture src dir");
+
+    // `lib.rs` is clean; the duplicate lives in `errors.rs` so the checker
+    // must scan every file under `src/`, not just `lib.rs`.
+    fs::write(
+        src_dir.join("lib.rs"),
+        "pub mod errors;\n",
+    )
+    .expect("write fixture lib.rs");
+    fs::write(
+        src_dir.join("errors.rs"),
+        r#"#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ContractError {
+    First = 1,
+    Second = 2,
+    Duplicate = 1,
+}
+"#,
+    )
+    .expect("write fixture errors.rs");
+
+    let output = Command::new("bash")
+        .arg(&script)
+        .arg(&fixture_root)
+        .output()
+        .expect("run check_error_discriminants.sh");
+
+    let _ = fs::remove_dir_all(&fixture_root);
+
+    assert!(
+        !output.status.success(),
+        "checker should fail on duplicate discriminant in errors.rs; stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 // ── Integration test: valuation_history_push is callable ─────────────────
 
 /// Exercises the full lifecycle path to verify that `valuation_history_push`
