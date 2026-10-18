@@ -32,15 +32,29 @@ def read_assets(directory):
             asset = json.load(source)
         if not isinstance(asset, dict):
             raise ValueError(f"{path} must contain a JSON object")
-        assets.append({field: asset.get(field, "") for field in FIELDS})
+        missing = [field for field in FIELDS if field not in asset]
+        if missing:
+            raise ValueError(f"{path} is missing required field(s): {', '.join(missing)}")
+        assets.append({field: asset[field] for field in FIELDS})
     return assets
+
+
+FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def sanitize_csv_cell(value):
+    text = str(value)
+    if text.startswith(FORMULA_PREFIXES):
+        return "'" + text
+    return text
 
 
 def write_csv(assets, destination):
     with destination.open("w", encoding="utf-8", newline="") as output:
         writer = csv.DictWriter(output, fieldnames=FIELDS)
         writer.writeheader()
-        writer.writerows(assets)
+        for asset in assets:
+            writer.writerow({field: sanitize_csv_cell(asset[field]) for field in FIELDS})
 
 
 def cell(value, row, column):
@@ -104,9 +118,16 @@ def main():
     parser.add_argument("backup_dir", type=Path)
     parser.add_argument("--format", choices=("csv", "xlsx", "both"), default="both")
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="Succeed even when no asset files are found",
+    )
     args = parser.parse_args()
 
     assets = read_assets(args.backup_dir)
+    if not assets and not args.allow_empty:
+        parser.error(f"no asset files found in {args.backup_dir / 'assets'}")
     output_dir = args.output_dir or args.backup_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     if args.format in ("csv", "both"):
