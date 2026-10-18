@@ -39,6 +39,28 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace
 
+  shellcheck:
+    name: Shellcheck scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Run shellcheck on scripts/
+        run: |
+          mapfile -t files < <(find scripts -type f -name '*.sh' | sort)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No shell scripts found under scripts/"
+            exit 0
+          fi
+          printf 'Checking %d file(s):\n' "${#files[@]}"
+          printf '  %s\n' "${files[@]}"
+          shellcheck "${files[@]}"
+
   docs:
     name: Validate error reference docs
     runs-on: ubuntu-latest

@@ -2,7 +2,27 @@
 set -euo pipefail
 
 source ~/.cargo/env 2>/dev/null || true
-source .env 2>/dev/null || true
+
+# Strict .env loader: only accepts KEY=value lines matching a strict regex.
+# Never executes .env contents as shell code.
+load_env() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  local line k v
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Skip blank lines and comments
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]]; then
+      k="${line%%=*}"
+      v="${line#*=}"
+      export "$k=$v"
+    else
+      echo "Warning: ignoring malformed line in $file: $line" >&2
+    fi
+  done < "$file"
+}
+
+load_env .env
 
 : "${STELLAR_NETWORK:=testnet}"
 if [[ "${STELLAR_NETWORK}" != "testnet" ]]; then

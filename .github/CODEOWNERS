@@ -1,5 +1,9 @@
 # CODEOWNERS — required reviewers for sensitive paths.
 # See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# NOTE: This file only takes effect when branch protection (or a ruleset) on
+# the default branch enables "Require review from Code Owners". Without that
+# setting, these entries are advisory only. Repository admins must enable it.
 
 # Smart contract source: every PR touching contracts/ must be approved by a
 # contract maintainer before it can be merged.
@@ -11,3 +15,16 @@
 # Security policy and threat model are owner-gated.
 /SECURITY.md @marvs8
 /docs/threat-model.md @marvs8
+
+# Infrastructure as code: ALB, IAM and secret wiring changes require a
+# maintainer review.
+/terraform/ @marvs8
+
+# Operational scripts, including those that sign with admin keys.
+/scripts/ @marvs8
+
+# SDK source consumed by integrators.
+/sdk/ @marvs8
+
+# Fuzz targets and harnesses.
+/fuzz/ @marvs8

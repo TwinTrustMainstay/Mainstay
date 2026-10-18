@@ -34,7 +34,29 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 source ~/.cargo/env 2>/dev/null || true
-source .env 2>/dev/null || true
+
+# Load .env safely: only accept KEY=value lines matching a strict regex.
+# Never `source` the file, as that would execute arbitrary shell code.
+load_env_file() {
+    local env_file="$1"
+    [[ -f "$env_file" ]] || return 0
+    local line k v
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Strip trailing CR (Windows line endings)
+        line="${line%$'\r'}"
+        # Skip blank lines and comments
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            k="${BASH_REMATCH[1]}"
+            v="${BASH_REMATCH[2]}"
+            export "$k=$v"
+        else
+            echo "WARNING: ignoring malformed line in $env_file: $line" >&2
+        fi
+    done < "$env_file"
+}
+
+load_env_file .env
 
 : "${STELLAR_NETWORK:=testnet}"
 

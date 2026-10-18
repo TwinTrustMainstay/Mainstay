@@ -24,7 +24,36 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 
 source ~/.cargo/env 2>/dev/null || true
-source .env 2>/dev/null || true
+
+# Load .env safely: only accept strict KEY=value lines and never execute
+# the file as shell code (no `source`/`.` on untrusted content).
+load_env_file() {
+    local file="$1"
+    [[ -f "$file" ]] || return 0
+    local line k v
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip blank lines and comments
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        # Strip a trailing CR (CRLF files) and surrounding whitespace
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            k="${BASH_REMATCH[1]}"
+            v="${BASH_REMATCH[2]}"
+            # Strip matching single or double quotes around the value
+            if [[ "$v" =~ ^\"(.*)\"$ ]] || [[ "$v" =~ ^\'(.*)\'$ ]]; then
+                v="${BASH_REMATCH[1]}"
+            fi
+            export "$k=$v"
+        else
+            echo "WARNING: ignoring malformed line in $file: $line" >&2
+        fi
+    done < "$file"
+}
+
+load_env_file "$ROOT/.env"
 
 : "${STELLAR_NETWORK:=testnet}"
 : "${EXPORTER_PORT:=9600}"
