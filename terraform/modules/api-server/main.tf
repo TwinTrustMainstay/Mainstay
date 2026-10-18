@@ -136,6 +136,16 @@ resource "aws_security_group_rule" "api_from_alb" {
   description              = "HTTP only from the ALB"
 }
 
+resource "aws_security_group_rule" "api_metrics_from_prometheus" {
+  type                     = "ingress"
+  security_group_id        = aws_security_group.api.id
+  source_security_group_id = var.prometheus_security_group_id
+  from_port                = var.metrics_port
+  to_port                  = var.metrics_port
+  protocol                 = "tcp"
+  description              = "Metrics scraping only from the Prometheus host"
+}
+
 # ── Data-subject request processing ─────────────────────────
 resource "aws_dynamodb_table" "data_subject_requests" {
   name         = "mainstay-data-subject-requests-${var.region}"
@@ -285,6 +295,30 @@ resource "aws_lb_listener" "https" {
   }
 }
 
+# Deny /metrics at the ALB layer: never forwarded to the target group.
+resource "aws_lb_listener_rule" "deny_metrics" {
+  listener_arn = aws_lb_listener.https.arn
+  priority     = 1
+
+  action {
+    type = "fixed-response"
+
+    fixed_response {
+      content_type = "text/plain"
+      message_body = "Not Found"
+      status_code  = "404"
+    }
+  }
+
+  condition {
+    path_pattern {
+      values = ["/metrics", "/metrics/*"]
+    }
+  }
+
+  tags = { Name = "mainstay-deny-metrics-${var.region}" }
+}
+
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.api.arn
   port              = 80
@@ -332,6 +366,7 @@ resource "aws_launch_template" "api" {
     allowed_origins = var.allowed_origins
     dsar_table_name = aws_dynamodb_table.data_subject_requests.name
     dsar_queue_url  = aws_sqs_queue.data_subject_requests.url
+    metrics_port    = var.metrics_port
   }))
 
   iam_instance_profile {
@@ -430,4 +465,15 @@ resource "aws_cloudwatch_metric_alarm" "api_latency" {
   dimensions = {
     LoadBalancer = aws_lb.api.arn_suffix
   }
+}
+
+# ── Outputs ────────────────────────────────────────────────
+output "metrics_port" {
+  description = "Private port serving Prometheus metrics (not exposed via the ALB)"
+  value       = var.metrics_port
+}
+
+output "metrics_target" {
+  description = "Private metrics scrape target for the Prometheus host"
+  value       = "mainstay-api-${var.region}:${var.metrics_port}"
 }

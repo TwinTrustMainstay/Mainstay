@@ -1,2 +1,16 @@
 [advisories]
+# Agreed cargo-audit policy (shared by CI `dependency-scan` job and local runs).
+#
+# The gate relies on cargo-audit's non-zero exit code, NOT on string matching
+# of the JSON output. Any advisory at or above `severity_threshold` causes
+# cargo-audit to exit non-zero, which fails the CI job.
 severity_threshold = "high"
+
+# Advisories to ignore (with justification). Keep this list empty unless an
+# advisory has been reviewed and accepted.
+ignore = []
+
+# Treat unmaintained crates as warnings only (do not fail the gate).
+yanked = "deny"
+unmaintained = "warn"
+unsound = "deny"

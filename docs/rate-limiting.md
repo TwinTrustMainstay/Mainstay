@@ -12,7 +12,15 @@ Rate limiting protects Mainstay API servers from abuse and ensures fair resource
 |-------|-------|---------|
 | Rate | 100 requests/minute | Prevent single IP from overwhelming the API |
 | Burst | 20 requests | Allow short spikes above the base rate |
-| Scope | Per IP address (`$binary_remote_addr`) | Independent limits per client IP |
+| Scope | Per client IP (`$remote_addr`, rewritten by `realip`) | Independent limits per client IP |
+
+> **Note:** The API runs behind an AWS ALB, so the TCP peer address nginx sees
+> is always an ALB node, not the client. The `realip` module rewrites
+> `$remote_addr` from `X-Forwarded-For` for peers inside the trusted ALB
+> subnets only (see [Real Client IP Resolution](#real-client-ip-resolution)).
+> Rate limiting keys on `$remote_addr` *after* this rewrite, so each client
+> gets its own bucket. Keying on `$binary_remote_addr` without `realip` would
+> collapse every client into a single global 100 req/min limit.
 
 ### Per-API-Key Quota
 
@@ -49,12 +57,40 @@ contract-wide `max_submissions_per_hour` default.
 
 ## Nginx Configuration
 
+### Real Client IP Resolution
+
+The `realip` module must be configured so that `$remote_addr` reflects the
+actual client, not the ALB. Only the ALB subnets are trusted; any
+`X-Forwarded-For` value from an untrusted peer is ignored, so clients cannot
+spoof their address to dodge rate limits.
+
+```nginx
+http {
+    # Trust X-Forwarded-For only from the ALB subnets (replace with the
+    # actual subnets of your ALB, e.g. from `aws ec2 describe-subnets`).
+    set_real_ip_from 10.0.0.0/19;
+    set_real_ip_from 10.0.32.0/19;
+    set_real_ip_from 10.0.64.0/19;
+
+    # Take the client address from the ALB's X-Forwarded-For header and walk
+    # the chain right-to-left, skipping trusted proxies, to find the real
+    # client address.
+    real_ip_header X-Forwarded-For;
+    real_ip_recursive on;
+}
+```
+
+After this rewrite, `$remote_addr` holds the client address and is used for
+both the rate-limit key and the access log.
+
 ### Main Configuration (`/etc/nginx/nginx.conf` additions)
 
 ```nginx
 http {
-    # Per-IP rate limiting zone: 10 MB shared memory, 100 req/min
-    limit_req_zone $binary_remote_addr zone=ip_limit:10m rate=100r/m;
+    # Per-IP rate limiting zone: 10 MB shared memory, 100 req/min.
+    # Keyed on $remote_addr, which realip has rewritten to the real client
+    # address (see "Real Client IP Resolution" above).
+    limit_req_zone $remote_addr zone=ip_limit:10m rate=100r/m;
 
     # Per-API-key rate limiting zone: 10 MB shared memory, ~0.7 req/min (1000/day)
     # Note: nginx rate is per-second; 1000/day = ~0.0116 req/s
@@ -62,7 +98,7 @@ http {
     limit_req_zone $http_x_api_key zone=key_limit:10m rate=17r/m;
 
     # Rate limit tracking for metrics (no rejection, just logging)
-    limit_req_zone $binary_remote_addr zone=ip_track:10m rate=100r/m;
+    limit_req_zone $remote_addr zone=ip_track:10m rate=100r/m;
 }
 ```
 
@@ -228,6 +264,45 @@ wrk -t 2 -c 2 -d 60s --rate 2 https://api.mainstay.io/api/v1/assets
 # Over-limit test at 3 req/s
 wrk -t 2 -c 2 -d 30s --rate 3 https://api.mainstay.io/api/v1/assets
 ```
+
+### Verifying Separate Buckets per Client (Behind the ALB)
+
+This test proves the `realip` configuration works: two clients behind the same
+ALB must get independent rate-limit buckets. If `realip` were missing or
+misconfigured, both clients would share one bucket and the second client would
+see 429s while the first is still under its limit.
+
+1. Confirm nginx sees the real client address (not the ALB node):
+
+   ```bash
+   # From each client host, hit the API and check the access log
+   curl -s https://api.mainstay.io/api/v1/health >/dev/null
+   tail -n 1 /var/log/nginx/mainstay-api-access.log
+   # The leading address must be the client's public IP, not the ALB node.
+   ```
+
+2. Run the load test from **two different client hosts** (or two distinct
+   egress IPs) at the same time:
+
+   ```bash
+   # On client A
+   ab -n 110 -c 1 https://api.mainstay.io/api/v1/health
+
+   # On client B, concurrently
+   ab -n 110 -c 1 https://api.mainstay.io/api/v1/health
+   ```
+
+3. Expected result: **each** client sees ~100 successes and ~10 429s. If the
+   buckets were shared, the combined 220 requests would produce ~120 429s
+   split across both clients. A quick check of the 429 counts per client IP:
+
+   ```bash
+   awk '$9 == 429 {print $1}' /var/log/nginx/mainstay-api-access.log \
+     | sort | uniq -c | sort -rn
+   ```
+
+   You should see roughly equal counts for both client IPs, each near 10,
+   rather than one IP absorbing all rejections.
 
 ## Adjusting Limits
 
