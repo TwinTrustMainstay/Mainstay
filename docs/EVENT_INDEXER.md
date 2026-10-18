@@ -111,6 +111,17 @@ Emitted when maintenance standard registered for asset type.
 
 ## Integration Patterns
 
+### Pattern 0: Shell Event Stream (`stream-events.sh`)
+
+The repository ships a lightweight shell-based streamer, `stream-events.sh`, that tails the Soroban RPC event stream for the Mainstay contract. It is intended for simple dashboards and smoke tests, and it is designed to be restart-safe:
+
+- **Persisted state file** — the last processed ledger and the pagination cursor are written to a state file (e.g. `.stream-events.state`) after each successful batch. On startup the script reads this file and resumes from the stored cursor/ledger instead of hardcoding `startLedger: 0`, so a restart does not replay the entire event history.
+- **Resume without replay** — if the state file is missing (first run), the streamer starts from a configured ledger or `now`; on subsequent runs it continues exactly where it left off, so the dashboard does not receive duplicate events after a restart.
+- **Exponential-backoff retries** — RPC errors (non-2xx responses, timeouts, malformed payloads) no longer terminate the loop. The script retries with exponential backoff (with a capped maximum delay) and only advances the persisted cursor after a batch is fully processed.
+- **Event de-duplication** — events are tracked by their unique event ID (the paging token / event ID returned by the RPC). IDs already seen are skipped, so overlapping pages, retried batches, or a resumed run never emit the same event twice.
+
+When building your own indexer, follow the same rules: persist the cursor and last ledger, retry transient RPC failures with backoff, and key your storage on the event ID so replays are idempotent.
+
 ### Pattern 1: Horizon REST API Polling
 
 Use Stellar Horizon API to fetch contract events after the fact.
@@ -204,8 +215,11 @@ def index_events(contract_id, storage=None):
     if storage is None:
         storage = {}
     
-    cursor = None
+    # Resume from persisted cursor instead of replaying from the beginning.
+    cursor = load_cursor()
+    seen_ids = load_seen_ids()
     batch = 0
+    backoff = 1
     
     while True:
         try:
@@ -220,6 +234,11 @@ def index_events(contract_id, storage=None):
                 continue
             
             for event in events:
+                event_id = event.get("id") or event.get("paging_token")
+                if event_id in seen_ids:
+                    # De-duplicate: skip events already processed.
+                    continue
+                
                 parsed = parse_event(event)
                 if parsed:
                     # Store event
@@ -229,18 +248,25 @@ def index_events(contract_id, storage=None):
                     storage[key].append(parsed)
                     
                     print(f"Indexed: {parsed['type']} for asset_id={parsed.get('asset_id')}")
+                
+                if event_id:
+                    seen_ids.add(event_id)
             
-            # Get next cursor
+            # Get next cursor and persist it so a restart resumes here.
             cursor = response.get("_links", {}).get("next", {}).get("href")
+            save_cursor(cursor)
             if not cursor:
                 print("Reached end of event stream")
                 time.sleep(60)
             
             batch += 1
+            backoff = 1  # reset backoff after a successful batch
             
         except Exception as e:
-            print(f"Error fetching events: {e}")
-            time.sleep(5)
+            # Retry with exponential backoff instead of exiting.
+            print(f"Error fetching events: {e}; retrying in {backoff}s")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
 
 if __name__ == "__main__":
     index_events(CONTRACT_ID)
@@ -572,8 +598,15 @@ def batch_process_events(events, batch_size=100):
 
 ### Indexing Strategy
 - Index on `asset_id`, `event_type`, `created_at`
+- Add a unique constraint on the event ID (paging token) so replayed or retried batches are idempotent
 - Partition events table by date or asset type
 - Archive old events (>1 year) to cold storage
+
+### Cursor Persistence and Retries
+- Persist the last processed ledger and paging cursor (e.g. in a `stream_state` table or a state file) after each committed batch
+- On startup, resume from the persisted cursor rather than from ledger 0
+- Retry transient RPC failures with exponential backoff (capped) instead of exiting the loop
+- Skip events whose ID has already been processed to avoid duplicates after a restart
 
 ### Caching
 ```python
