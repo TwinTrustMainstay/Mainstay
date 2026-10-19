@@ -64,3 +64,32 @@ The expected absolute noise is `E|noise| = 2q / (1 - q^2)` with `q = e^(-epsilon
 At epsilon 1 this is about 0.85 counts, so counts above roughly 100 stay within
 about 1% of the true value. Small counts are dominated by noise, which is the
 intended privacy trade-off.
+
+## Threat model and composition (#1761)
+
+This section covers the privacy-guarantee documentation task from #1761, which
+duplicates #1759.
+
+**What an attacker learns from one query.** The released count reveals at most
+`epsilon` in log-likelihood ratio about whether one asset of the queried type
+exists. This holds for any observer, including one who knows every other asset.
+
+**Repeated queries.** Each call is a separate mechanism. Under basic sequential
+composition, `k` queries with epsilons `e1..ek` together give
+`sum(ei)`-differential privacy. The per-type budget caps this sum. The default
+of 10 units therefore bounds the total leakage for a type across all queries,
+however they are issued.
+
+**What the budget does not protect.**
+- Non-DP reads, such as `get_assets_by_type`, are exact and leak the count
+  completely. The DP endpoint protects only callers who use it. Sensitive
+  queries must not be answered through the exact read functions.
+- Attributes other than the count are not covered. A query about asset
+  attributes needs its own mechanism and budget.
+- Budget reset is an admin action (`set_dp_budget`). An admin who resets the
+  budget resets the privacy accounting. Treat budget changes as sensitive.
+- The guarantee applies to the count as a function of asset membership. It does
+  not hide that the registry has a given asset type's category at all.
+
+**Utility.** At epsilon 1 the expected noise is about 0.85 counts. Small counts
+are dominated by noise, and that is intended.
