@@ -88,6 +88,12 @@ pub enum ContractError {
     ModelNotFound = 50,
     /// #1758: Model input is malformed (dimension, batch size, value range, or learning rate).
     InvalidModelInput = 51,
+    /// #1760: No sidecar record exists at the given index.
+    SidecarNotFound = 45,
+    /// #1760: The sidecar record has been deleted or expired.
+    SidecarDeleted = 46,
+    /// #1760: The sidecar's retention period has not yet ended.
+    RetentionNotElapsed = 49,
     /// #1759: The privacy budget for this query type is exhausted.
     DpBudgetExhausted = 47,
     /// #1759: Epsilon must be in (0, 5000] milli-units.
@@ -290,6 +296,10 @@ pub enum DataKey {
     MlModel(Symbol),
     /// #1758: Accuracy and drift metrics per model name.
     MlMetrics(Symbol),
+    /// #1760: Sidecar content-hash records for an asset.
+    AssetSidecars(u64),
+    /// #1760: Total off-chain bytes tracked for an asset's sidecars (storage cost tracking).
+    SidecarBytes(u64),
     /// #1759: Remaining privacy budget (milli-epsilon) for a query type.
     DpBudget(Symbol),
 }
@@ -984,6 +994,25 @@ const DP_SCALE: u128 = 1_000_000_000_000_000_000;
 /// #1759: Upper bound on Bernoulli trials per geometric draw (keeps gas bounded).
 const DP_MAX_GEOM_STEPS: u64 = 10_000;
 
+/// #1760: Metadata for an off-chain sidecar blob. Only the content hash and
+/// metadata live on-chain; the bytes live in content-addressed storage (IPFS / Arweave).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SidecarRecord {
+    /// SHA-256 digest of the sidecar bytes.
+    pub content_hash: BytesN<32>,
+    /// Content address (e.g. `ipfs://...` or `ar://...`).
+    pub uri: String,
+    /// Size of the off-chain blob, used for storage cost tracking.
+    pub size_bytes: u64,
+    /// Ledger timestamp when the record was added.
+    pub added_at: u64,
+    /// Ledger timestamp after which anyone may expire the record. 0 = no expiry.
+    pub retain_until: u64,
+    /// True once the record has been removed or expired.
+    pub deleted: bool,
+}
+
 /// #1759: A differential-privacy query over aggregate asset counts.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1035,6 +1064,30 @@ fn dp_geometric(env: &Env, q: u128) -> u64 {
         }
     }
     count
+}
+
+/// Marks sidecar `index` for `asset_id` as deleted and releases its tracked bytes.
+fn mark_sidecar_deleted(env: &Env, asset_id: u64, index: u32) {
+    let key = DataKey::AssetSidecars(asset_id);
+    let mut list: Vec<SidecarRecord> = env.storage().persistent().get(&key).unwrap_or(Vec::new(env));
+    let mut rec = list
+        .get(index)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::SidecarNotFound));
+    if rec.deleted {
+        panic_with_error!(env, ContractError::SidecarDeleted);
+    }
+    rec.deleted = true;
+    let size = rec.size_bytes;
+    list.set(index, rec);
+    env.storage().persistent().set(&key, &list);
+    extend_persistent_ttl(env, key);
+
+    let bytes_key = DataKey::SidecarBytes(asset_id);
+    let total: u64 = env.storage().persistent().get(&bytes_key).unwrap_or(0);
+    env.storage()
+        .persistent()
+        .set(&bytes_key, &total.saturating_sub(size));
+    extend_persistent_ttl(env, bytes_key);
 }
 
 #[contract]
@@ -2203,6 +2256,140 @@ impl AssetRegistry {
     /// #1758: The trained model, or `None` if it has not been trained.
     pub fn get_model(env: Env, model: Symbol) -> Option<MlModel> {
         env.storage().persistent().get(&DataKey::MlModel(model))
+    }
+
+    /// #1760: Record an off-chain sidecar blob for an asset. Owner-only.
+    ///
+    /// Only the SHA-256 digest and metadata are stored on-chain; the bytes must
+    /// be uploaded to content-addressed storage (IPFS / Arweave) separately.
+    ///
+    /// # Returns
+    /// The index of the new sidecar record for this asset.
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist
+    /// - [`ContractError::UnauthorizedOwner`] if caller is not the asset owner
+    pub fn add_sidecar(
+        env: Env,
+        caller: Address,
+        asset_id: u64,
+        content_hash: BytesN<32>,
+        uri: String,
+        size_bytes: u64,
+        retain_until: u64,
+    ) -> u32 {
+        caller.require_auth();
+        let asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+        if asset.owner != caller {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        let key = DataKey::AssetSidecars(asset_id);
+        let mut list: Vec<SidecarRecord> =
+            env.storage().persistent().get(&key).unwrap_or(Vec::new(&env));
+        let index = list.len();
+        list.push_back(SidecarRecord {
+            content_hash: content_hash.clone(),
+            uri,
+            size_bytes,
+            added_at: env.ledger().timestamp(),
+            retain_until,
+            deleted: false,
+        });
+        env.storage().persistent().set(&key, &list);
+        extend_persistent_ttl(&env, key);
+
+        let bytes_key = DataKey::SidecarBytes(asset_id);
+        let total: u64 = env.storage().persistent().get(&bytes_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&bytes_key, &total.saturating_add(size_bytes));
+        extend_persistent_ttl(&env, bytes_key);
+
+        env.events()
+            .publish((symbol_short!("sc_add"), asset_id), (index, content_hash));
+        index
+    }
+
+    /// #1760: Verify downloaded sidecar bytes against the on-chain digest.
+    ///
+    /// # Returns
+    /// `true` if `SHA-256(content)` equals the stored digest, `false` otherwise.
+    ///
+    /// # Panics
+    /// - [`ContractError::SidecarNotFound`] if no record exists at `index`
+    /// - [`ContractError::SidecarDeleted`] if the record was removed or expired
+    pub fn verify_sidecar(env: Env, asset_id: u64, index: u32, content: Bytes) -> bool {
+        let list: Vec<SidecarRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AssetSidecars(asset_id))
+            .unwrap_or(Vec::new(&env));
+        let rec = list
+            .get(index)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::SidecarNotFound));
+        if rec.deleted {
+            panic_with_error!(&env, ContractError::SidecarDeleted);
+        }
+        let digest: BytesN<32> = env.crypto().sha256(&content).to_bytes();
+        digest == rec.content_hash
+    }
+
+    /// #1760: Remove a sidecar record. Owner-only. The off-chain bytes must be
+    /// unpinned by the owner; this marks the on-chain record deleted and releases tracked bytes.
+    pub fn remove_sidecar(env: Env, caller: Address, asset_id: u64, index: u32) {
+        caller.require_auth();
+        let asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+        if asset.owner != caller {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+        mark_sidecar_deleted(&env, asset_id, index);
+    }
+
+    /// #1760: Expire a sidecar whose `retain_until` has passed. Callable by anyone,
+    /// so retention is enforced without the owner's cooperation.
+    ///
+    /// # Panics
+    /// - [`ContractError::SidecarNotFound`] / [`ContractError::SidecarDeleted`] as above
+    /// - [`ContractError::RetentionNotElapsed`] if the retention period has not yet ended
+    pub fn expire_sidecar(env: Env, asset_id: u64, index: u32) {
+        let list: Vec<SidecarRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AssetSidecars(asset_id))
+            .unwrap_or(Vec::new(&env));
+        let rec = list
+            .get(index)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::SidecarNotFound));
+        let expired = rec.retain_until != 0 && env.ledger().timestamp() >= rec.retain_until;
+        if !expired {
+            panic_with_error!(&env, ContractError::RetentionNotElapsed);
+        }
+        mark_sidecar_deleted(&env, asset_id, index);
+    }
+
+    /// #1760: All sidecar records for an asset, including deleted ones.
+    pub fn get_sidecars(env: Env, asset_id: u64) -> Vec<SidecarRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AssetSidecars(asset_id))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    /// #1760: Total off-chain bytes currently tracked for an asset's live sidecars.
+    pub fn get_sidecar_bytes(env: Env, asset_id: u64) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::SidecarBytes(asset_id))
+            .unwrap_or(0)
     }
 
     /// #1759: Remaining privacy budget (milli-epsilon) for an asset type.
