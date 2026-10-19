@@ -88,6 +88,10 @@ pub enum ContractError {
     ModelNotFound = 50,
     /// #1758: Model input is malformed (dimension, batch size, value range, or learning rate).
     InvalidModelInput = 51,
+    /// #1759: The privacy budget for this query type is exhausted.
+    DpBudgetExhausted = 47,
+    /// #1759: Epsilon must be in (0, 5000] milli-units.
+    DpInvalidEpsilon = 48,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -286,6 +290,8 @@ pub enum DataKey {
     MlModel(Symbol),
     /// #1758: Accuracy and drift metrics per model name.
     MlMetrics(Symbol),
+    /// #1759: Remaining privacy budget (milli-epsilon) for a query type.
+    DpBudget(Symbol),
 }
 
 /// Filter criteria for [`AssetRegistry::search_assets`].
@@ -967,6 +973,68 @@ fn ml_check_dim(env: &Env, model: &MlModel, features: &Vec<i64>) {
     if features.len() != model.weights.len() {
         panic_with_error!(env, ContractError::InvalidModelInput);
     }
+}
+
+/// #1759: Default privacy budget per asset type, in milli-epsilon (epsilon = 10).
+pub const DEFAULT_DP_BUDGET_MILLI: u64 = 10_000;
+
+/// #1759: Fixed-point scale used by the discrete Laplace sampler (1e18).
+const DP_SCALE: u128 = 1_000_000_000_000_000_000;
+
+/// #1759: Upper bound on Bernoulli trials per geometric draw (keeps gas bounded).
+const DP_MAX_GEOM_STEPS: u64 = 10_000;
+
+/// #1759: A differential-privacy query over aggregate asset counts.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DpQuery {
+    /// Asset type to count.
+    pub asset_type: Symbol,
+    /// Epsilon for this query, in milli-units (1000 = epsilon 1.0).
+    pub epsilon_milli: u32,
+}
+
+/// #1759: Noisy aggregate result from [`AssetRegistry::get_dp_stats`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NoisyStats {
+    pub asset_type: Symbol,
+    /// Count plus two-sided geometric noise, clamped to zero.
+    pub noisy_count: u64,
+    /// Epsilon that was charged to the budget for this query.
+    pub epsilon_milli: u32,
+}
+
+/// #1759: Exact discrete Laplace (two-sided geometric) mechanism helpers.
+/// `e^{-x}` in fixed point. Requires `x <= 5 * DP_SCALE` to avoid overflow.
+fn dp_exp_neg(x: u128) -> u128 {
+    let mut term: u128 = DP_SCALE;
+    let mut pos: u128 = DP_SCALE;
+    let mut neg: u128 = 0;
+    for k in 1u128..60 {
+        term = term * x / (DP_SCALE * k);
+        if k % 2 == 1 {
+            neg += term;
+        } else {
+            pos += term;
+        }
+    }
+    pos.saturating_sub(neg)
+}
+
+/// Samples the number of failures before the first success, where each trial
+/// continues with probability `q` (a geometric draw with parameter `q`).
+fn dp_geometric(env: &Env, q: u128) -> u64 {
+    let mut count = 0u64;
+    while count < DP_MAX_GEOM_STEPS {
+        let u = env.prng().gen_range::<u64>(0..(DP_SCALE as u64)) as u128;
+        if u < q {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    count
 }
 
 #[contract]
@@ -2135,6 +2203,64 @@ impl AssetRegistry {
     /// #1758: The trained model, or `None` if it has not been trained.
     pub fn get_model(env: Env, model: Symbol) -> Option<MlModel> {
         env.storage().persistent().get(&DataKey::MlModel(model))
+    }
+
+    /// #1759: Remaining privacy budget (milli-epsilon) for an asset type.
+    pub fn get_dp_budget(env: Env, asset_type: Symbol) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DpBudget(asset_type))
+            .unwrap_or(DEFAULT_DP_BUDGET_MILLI)
+    }
+
+    /// #1759: Set the privacy budget for an asset type. Admin-only.
+    pub fn set_dp_budget(env: Env, admin: Address, asset_type: Symbol, budget_milli: u64) {
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if require_admin(&admin, &stored_admin).is_err() {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        let key = DataKey::DpBudget(asset_type);
+        env.storage().persistent().set(&key, &budget_milli);
+        extend_persistent_ttl(&env, key);
+    }
+
+    /// #1759: Differentially private count of assets of a given type.
+    ///
+    /// Adds two-sided geometric noise (the discrete Laplace mechanism), which
+    /// gives epsilon-differential privacy for a count with sensitivity 1
+    /// (adding or removing one asset changes the count by at most 1).
+    /// Each call consumes `epsilon_milli` from the asset type's budget.
+    ///
+    /// # Panics
+    /// - [`ContractError::DpInvalidEpsilon`] if epsilon is 0 or above 5000 milli-units
+    /// - [`ContractError::DpBudgetExhausted`] if the remaining budget is below epsilon
+    pub fn get_dp_stats(env: Env, query: DpQuery) -> NoisyStats {
+        if query.epsilon_milli == 0 || query.epsilon_milli > 5000 {
+            panic_with_error!(&env, ContractError::DpInvalidEpsilon);
+        }
+        let remaining = Self::get_dp_budget(env.clone(), query.asset_type.clone());
+        let cost = query.epsilon_milli as u64;
+        if remaining < cost {
+            panic_with_error!(&env, ContractError::DpBudgetExhausted);
+        }
+        let budget_key = DataKey::DpBudget(query.asset_type.clone());
+        env.storage()
+            .persistent()
+            .set(&budget_key, &(remaining - cost));
+        extend_persistent_ttl(&env, budget_key);
+
+        let true_count = Self::get_assets_by_type(env.clone(), query.asset_type.clone()).len() as i128;
+        let eps = (query.epsilon_milli as u128) * DP_SCALE / 1000;
+        let q = dp_exp_neg(eps);
+        let g1 = dp_geometric(&env, q) as i128;
+        let g2 = dp_geometric(&env, q) as i128;
+        let noisy = (true_count + g1 - g2).max(0) as u64;
+
+        NoisyStats {
+            asset_type: query.asset_type,
+            noisy_count: noisy,
+            epsilon_milli: query.epsilon_milli,
+        }
     }
 
     /// Get the current admin address of the contract.
