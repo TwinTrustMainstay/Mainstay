@@ -73,6 +73,11 @@ pub enum ContractError {
     RecordNotFound = 43,
     CompressionFailed = 44,
     CompressionRequiresDecommissioned = 45,
+    /// Issue #1767/#1768: the targeted autonomous agent is not enabled.
+    AgentDisabled = 46,
+    /// Issue #1767/#1768: an agent action was attempted before
+    /// `min_interval_secs` elapsed since its last recorded action.
+    AgentRateLimited = 47,
 }
 
 impl From<SharedContractError> for ContractError {
