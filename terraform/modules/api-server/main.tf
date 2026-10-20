@@ -402,7 +402,7 @@ resource "aws_cloudwatch_metric_alarm" "api_latency" {
   metric_name         = "TargetResponseTime"
   namespace           = "AWS/ApplicationELB"
   period              = 60
-  statistic           = "p95"
+  extended_statistic  = "p95"
   threshold           = 2
   alarm_description   = "API p95 latency exceeding 2 seconds"
 
