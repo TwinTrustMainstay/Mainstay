@@ -326,12 +326,15 @@ resource "aws_launch_template" "api" {
   key_name      = var.key_name
 
   user_data = base64encode(templatefile("${path.module}/user_data.sh", {
-    region          = var.region
-    rpc_url         = var.rpc_url
-    network         = var.network_passphrase
-    allowed_origins = var.allowed_origins
-    dsar_table_name = aws_dynamodb_table.data_subject_requests.name
-    dsar_queue_url  = aws_sqs_queue.data_subject_requests.url
+    region            = var.region
+    rpc_url           = var.rpc_url
+    network           = var.network_passphrase
+    allowed_origins   = var.allowed_origins
+    dsar_table_name   = aws_dynamodb_table.data_subject_requests.name
+    dsar_queue_url    = aws_sqs_queue.data_subject_requests.url
+    vault_address     = var.vault_address
+    vault_aws_role    = var.vault_aws_role
+    vault_secret_path = var.vault_secret_path
   }))
 
   iam_instance_profile {

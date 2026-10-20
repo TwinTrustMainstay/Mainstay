@@ -39,6 +39,24 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace
 
+  terraform:
+    name: Validate Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive terraform/
+
+      - name: terraform validate
+        run: |
+          for dir in terraform terraform/modules/api-server; do
+            echo "=== terraform validate: $dir ==="
+            (cd "$dir" && terraform init -backend=false -input=false && terraform validate)
+          done
+
   docs:
     name: Validate error reference docs
     runs-on: ubuntu-latest

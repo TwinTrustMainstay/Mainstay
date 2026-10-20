@@ -57,6 +57,21 @@ variable "request_retention_seconds" {
   default     = 604800
 }
 
+variable "vault_address" {
+  description = "Address of the Vault server used by the AWS auth method on API instances"
+  type        = string
+}
+
+variable "vault_aws_role" {
+  description = "Vault AWS auth role the API instance assumes via its IAM role"
+  type        = string
+}
+
+variable "vault_secret_path" {
+  description = "Vault KV path holding the API server's secrets (stellar_rpc_url, third_party_api_key)"
+  type        = string
+}
+
 # Data source for AZs in the region
 data "aws_availability_zones" "available" {
   state = "available"
