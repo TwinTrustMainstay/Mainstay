@@ -108,6 +108,18 @@ resource "aws_security_group" "alb" {
     description = "HTTP (redirect to HTTPS)"
   }
 
+  # #1813: defining a security group with explicit ingress/egress blocks
+  # makes Terraform remove AWS's default allow-all egress rule. Without
+  # this, the ALB cannot open connections to its targets and forwarding
+  # fails entirely.
+  egress {
+    from_port       = 8080
+    to_port         = 8080
+    protocol        = "tcp"
+    security_groups = [aws_security_group.api.id]
+    description     = "Forward to API targets"
+  }
+
   tags = { Name = "mainstay-alb-sg-${var.region}" }
 }
 
