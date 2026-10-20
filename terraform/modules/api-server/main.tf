@@ -379,6 +379,21 @@ resource "aws_autoscaling_group" "api" {
 }
 
 # ── CloudWatch Alarms ──────────────────────────────────────
+resource "aws_sns_topic" "alarms" {
+  name = "mainstay-api-alarms-${var.region}"
+
+  tags = {
+    Project = "Mainstay"
+    Region  = var.region
+  }
+}
+
+resource "aws_sns_topic_subscription" "alarms_on_call" {
+  topic_arn = aws_sns_topic.alarms.arn
+  protocol  = "email"
+  endpoint  = var.on_call_email
+}
+
 resource "aws_cloudwatch_metric_alarm" "api_5xx" {
   alarm_name          = "mainstay-api-5xx-${var.region}"
   comparison_operator = "GreaterThanThreshold"
@@ -389,6 +404,8 @@ resource "aws_cloudwatch_metric_alarm" "api_5xx" {
   statistic           = "Sum"
   threshold           = 5
   alarm_description   = "High 5xx error rate on API ALB"
+  alarm_actions       = [aws_sns_topic.alarms.arn]
+  ok_actions          = [aws_sns_topic.alarms.arn]
 
   dimensions = {
     LoadBalancer = aws_lb.api.arn_suffix
@@ -405,6 +422,8 @@ resource "aws_cloudwatch_metric_alarm" "api_latency" {
   extended_statistic  = "p95"
   threshold           = 2
   alarm_description   = "API p95 latency exceeding 2 seconds"
+  alarm_actions       = [aws_sns_topic.alarms.arn]
+  ok_actions          = [aws_sns_topic.alarms.arn]
 
   dimensions = {
     LoadBalancer = aws_lb.api.arn_suffix

@@ -195,6 +195,7 @@ module "api_server_us_east_1" {
   allowed_origins     = var.allowed_origins
   log_retention_days  = var.log_retention_days
   request_retention_seconds = var.request_retention_seconds
+  on_call_email              = var.on_call_email
 
   providers = {
     aws = aws.us_east_1
@@ -215,6 +216,7 @@ module "api_server_eu_west_1" {
   allowed_origins     = var.allowed_origins
   log_retention_days  = var.log_retention_days
   request_retention_seconds = var.request_retention_seconds
+  on_call_email              = var.on_call_email
 
   providers = {
     aws = aws.eu_west_1
@@ -235,6 +237,7 @@ module "api_server_ap_southeast_1" {
   allowed_origins     = var.allowed_origins
   log_retention_days  = var.log_retention_days
   request_retention_seconds = var.request_retention_seconds
+  on_call_email              = var.on_call_email
 
   providers = {
     aws = aws.ap_southeast_1

@@ -57,6 +57,11 @@ variable "request_retention_seconds" {
   default     = 604800
 }
 
+variable "on_call_email" {
+  description = "On-call email address subscribed to API alarm notifications"
+  type        = string
+}
+
 # Data source for AZs in the region
 data "aws_availability_zones" "available" {
   state = "available"
