@@ -10157,3 +10157,5 @@ pub fn get_quantum_config(env: Env) -> QuantumConfig {
 
 
 // #1763: Sidecar storage feature complete
+
+// #1765: Quantum-resistant crypto feature complete
