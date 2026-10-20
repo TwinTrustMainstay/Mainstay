@@ -365,6 +365,11 @@ resource "aws_launch_template" "api" {
   metadata_options {
     http_tokens   = "required"
     http_endpoint = "enabled"
+    # #1814: the API runs in a Docker bridge container, one network hop
+    # beyond the host. The default hop limit of 1 blocks IMDSv2 token
+    # requests made from inside the container, so the AWS SDK default
+    # credential chain (used for DynamoDB/SQS calls) would time out.
+    http_put_response_hop_limit = 2
   }
 
   tag_specifications {
