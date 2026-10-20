@@ -108,7 +108,7 @@ docker pull ghcr.io/mainstay/api-server:latest
 docker run -d \
   --name mainstay-api \
   --restart always \
-  -p 8080:8080 \
+  -p 127.0.0.1:8080:8080 \
   -e STELLAR_RPC_URL="$RPC_URL" \
   -e STELLAR_NETWORK_PASSPHRASE="$NETWORK" \
   -e DEPLOY_REGION="$REGION" \
@@ -158,18 +158,12 @@ upstream api_backend {
 }
 
 server {
+    # #1812: this is the ALB's target (port 80). The ALB terminates TLS
+    # with the real ACM certificate and forwards plaintext HTTP to nginx
+    # inside the VPC; the instance's security group only accepts traffic
+    # from the ALB, so there is no direct-internet path to this listener.
     listen 80;
-    return 301 https://$host$request_uri;
-}
-
-server {
-    listen 443 ssl http2;
     server_name _;
-
-    ssl_certificate     /etc/nginx/ssl/cert.pem;
-    ssl_certificate_key /etc/nginx/ssl/key.pem;
-    ssl_protocols       TLSv1.2 TLSv1.3;
-    ssl_ciphers         HIGH:!aNULL:!MD5;
 
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     add_header X-Content-Type-Options "nosniff" always;
@@ -247,12 +241,9 @@ server {
 }
 NGINX
 
-# Self-signed certificate placeholder (replace with real cert via ACM/Let's Encrypt)
-mkdir -p /etc/nginx/ssl
-openssl req -x509 -nodes -days 30 -newkey rsa:2048 \
-  -keyout /etc/nginx/ssl/key.pem \
-  -out /etc/nginx/ssl/cert.pem \
-  -subj "/CN=api.$${REGION}.mainstay.io"
+# #1812: nginx no longer terminates TLS itself — the ALB does, with the
+# real ACM certificate — so the self-signed placeholder cert this instance
+# used to generate for its own :443 listener is no longer needed.
 
 systemctl enable nginx
 systemctl restart nginx

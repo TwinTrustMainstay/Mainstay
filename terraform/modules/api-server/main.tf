@@ -113,11 +113,11 @@ resource "aws_security_group" "alb" {
   # this, the ALB cannot open connections to its targets and forwarding
   # fails entirely.
   egress {
-    from_port       = 8080
-    to_port         = 8080
+    from_port       = 80
+    to_port         = 80
     protocol        = "tcp"
     security_groups = [aws_security_group.api.id]
-    description     = "Forward to API targets"
+    description     = "Forward to API targets (nginx)"
   }
 
   tags = { Name = "mainstay-alb-sg-${var.region}" }
@@ -142,10 +142,13 @@ resource "aws_security_group_rule" "api_from_alb" {
   type                     = "ingress"
   security_group_id        = aws_security_group.api.id
   source_security_group_id = aws_security_group.alb.id
-  from_port                = 8080
-  to_port                  = 8080
+  from_port                = 80
+  to_port                  = 80
   protocol                 = "tcp"
-  description              = "HTTP only from the ALB"
+  # #1812: the ALB targets nginx (port 80) so rate limiting, security
+  # headers, CORS and the /metrics ACL actually apply. The API container
+  # itself is bound to loopback only and is not reachable from the ALB.
+  description = "HTTP to nginx only from the ALB"
 }
 
 # ── Data-subject request processing ─────────────────────────
@@ -271,7 +274,10 @@ resource "aws_lb" "api" {
 
 resource "aws_lb_target_group" "api" {
   name     = "mainstay-tg-${substr(replace(var.region, "-", ""), 0, 10)}"
-  port     = 8080
+  # #1812: target nginx (80), not the API container directly, so the ALB
+  # traffic actually goes through nginx's rate limiting, security headers,
+  # CORS policy and /metrics ACL.
+  port     = 80
   protocol = "HTTP"
   vpc_id   = aws_vpc.main.id
 
