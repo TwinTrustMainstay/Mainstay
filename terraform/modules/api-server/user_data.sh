@@ -52,6 +52,21 @@ CWAGENT
 systemctl enable amazon-cloudwatch-agent
 systemctl start amazon-cloudwatch-agent
 
+# #1815: fail the bootstrap if the agent isn't actually running, rather than
+# silently shipping no logs or metrics. Give it a few seconds to come up.
+for i in $(seq 1 10); do
+  if systemctl is-active --quiet amazon-cloudwatch-agent; then
+    echo "amazon-cloudwatch-agent is running"
+    break
+  fi
+  if [ "$i" -eq 10 ]; then
+    echo "FATAL: amazon-cloudwatch-agent failed to start" >&2
+    systemctl status amazon-cloudwatch-agent --no-pager >&2 || true
+    exit 1
+  fi
+  sleep 2
+done
+
 # Authenticate with Vault using the instance IAM role. Secrets are rendered
 # locally with restrictive permissions and never enter Terraform state, user
 # data, Docker arguments, or proxy logs.

@@ -250,6 +250,14 @@ resource "aws_iam_instance_profile" "api" {
   role = aws_iam_role.api.name
 }
 
+# #1815: user_data.sh starts amazon-cloudwatch-agent, which ships nginx
+# logs and host metrics, but no policy granted PutLogEvents/PutMetricData,
+# so the agent's calls were silently denied.
+resource "aws_iam_role_policy_attachment" "api_cloudwatch_agent" {
+  role       = aws_iam_role.api.name
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+}
+
 # ── Application Load Balancer ──────────────────────────────
 resource "aws_lb" "api" {
   name               = "mainstay-api-${replace(var.region, "-", "")}"
