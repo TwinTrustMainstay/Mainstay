@@ -346,9 +346,6 @@ resource "aws_launch_template" "api" {
       encrypted = true
     }
   }
-  iam_instance_profile {
-    name = aws_iam_instance_profile.api.name
-  }
 
   metadata_options {
     http_tokens   = "required"
