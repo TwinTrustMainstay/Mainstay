@@ -387,4 +387,4 @@ When integrating collateral scoring into lending workflows:
 
 ---
 
-*This document is maintained alongside the Mainstay smart contract system. For implementation details, refer to the source code in `lifecycle/src/lib.rs`.*
+*This document is maintained alongside the Mainstay smart contract system. For implementation details, refer to the source code in `contracts/lifecycle/src/lib.rs`.*
