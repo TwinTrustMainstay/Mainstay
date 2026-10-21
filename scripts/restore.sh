@@ -36,7 +36,34 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 source ~/.cargo/env 2>/dev/null || true
-source .env 2>/dev/null || true
+
+# Load .env safely: only accept strict KEY=value lines and export them.
+# Never `source` the file, since it may contain shell code.
+load_env_file() {
+    local env_file="$1"
+    [[ -f "$env_file" ]] || return 0
+    local line k v
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip blank lines and comments
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        # Only accept KEY=value with a strict key pattern
+        if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            k="${BASH_REMATCH[2]}"
+            v="${BASH_REMATCH[3]}"
+            # Strip a single pair of surrounding quotes, if present
+            if [[ "$v" =~ ^\"(.*)\"$ ]] || [[ "$v" =~ ^\'(.*)\'$ ]]; then
+                v="${BASH_REMATCH[1]}"
+            fi
+            export "$k=$v"
+        else
+            echo "WARNING: ignoring malformed line in $env_file" >&2
+        fi
+    done < "$env_file"
+}
+
+load_env_file "$ROOT/.env"
+=======
 
 : "${STELLAR_NETWORK:=testnet}"
 : "${AWS_DEFAULT_REGION:=us-east-1}"
@@ -281,15 +308,52 @@ invoke_write() {
     local func="$2"
     shift 2
     local source_flag=""
-    if [[ -n "$ADMIN_KEY_PATH" ]]; then
-        # Import the key temporarily if using a key file
-        stellar keys import admin --secret-key "$(cat "$ADMIN_KEY_PATH")" --network "$STELLAR_NETWORK" 2>/dev/null || true
-        source_flag="--source admin"
-    fi
+
+    # Dry-run must never touch the identity store, so check it first.
     if [[ "$DRY_RUN" == "true" ]]; then
         log "[DRY RUN] stellar contract invoke --id $contract_id --network $STELLAR_NETWORK -- $func $*"
         return 0
     fi
+
+    if [[ -n "$ADMIN_KEY_PATH" ]]; then
+        if [[ ! -f "$ADMIN_KEY_PATH" ]]; then
+            err "Admin key file not found: $ADMIN_KEY_PATH"
+            exit 1
+        fi
+
+        # Derive the expected public key from the secret key without exposing
+        # the secret in argv.  `stellar keys add` reads the secret from stdin.
+        local expected_address
+        expected_address="$(stellar keys add __mainstay_expected --secret-key < "$ADMIN_KEY_PATH" 2>/dev/null \
+            && stellar keys address __mainstay_expected 2>/dev/null)" || true
+        stellar keys rm __mainstay_expected >/dev/null 2>&1 || true
+        if [[ -z "$expected_address" ]]; then
+            err "Failed to derive expected admin address from $ADMIN_KEY_PATH"
+            exit 1
+        fi
+
+        # Import the admin key from stdin so the secret never appears in argv.
+        # A failed import must abort the script.
+        if ! stellar keys import admin --secret-key - --network "$STELLAR_NETWORK" < "$ADMIN_KEY_PATH"; then
+            err "Failed to import admin key from $ADMIN_KEY_PATH"
+            exit 1
+        fi
+
+        # Verify the imported identity matches the expected admin address
+        # before any write is performed.
+        local imported_address
+        if ! imported_address="$(stellar keys address admin 2>/dev/null)"; then
+            err "Failed to read imported admin address"
+            exit 1
+        fi
+        if [[ "$imported_address" != "$expected_address" ]]; then
+            err "Imported admin address ($imported_address) does not match expected ($expected_address)"
+            exit 1
+        fi
+
+        source_flag="--source admin"
+    fi
+
     stellar contract invoke \
         --id "$contract_id" \
         --network "$STELLAR_NETWORK" \

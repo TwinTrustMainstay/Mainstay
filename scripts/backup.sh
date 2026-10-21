@@ -37,7 +37,40 @@ cd "$ROOT"
 # ---------------------------------------------------------------------------
 
 source ~/.cargo/env 2>/dev/null || true
-source .env 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Safe .env loader
+# ---------------------------------------------------------------------------
+# Reads KEY=value pairs without executing the file as shell code. Only lines
+# matching a strict identifier regex are accepted; anything else is skipped
+# with a warning so a tampered .env cannot run commands.
+load_env_file() {
+    local env_file="$1"
+    [[ -f "$env_file" ]] || return 0
+
+    local line k v
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Strip trailing carriage return (CRLF files)
+        line="${line%$'\r'}"
+        # Skip blank lines and comments
+        [[ -z "${line//[[:space:]]/}" ]] && continue
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        # Accept only KEY=value with a strict identifier
+        if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            k="${BASH_REMATCH[1]}"
+            v="${BASH_REMATCH[2]}"
+            # Strip one pair of matching surrounding quotes
+            if [[ "$v" =~ ^\"(.*)\"$ ]] || [[ "$v" =~ ^\'(.*)\'$ ]]; then
+                v="${BASH_REMATCH[1]}"
+            fi
+            export "$k=$v"
+        else
+            echo "WARNING: ignoring invalid line in ${env_file}: ${line}" >&2
+        fi
+    done < "$env_file"
+}
+
+load_env_file "$ROOT/.env"
 
 : "${STELLAR_NETWORK:=testnet}"
 : "${AWS_DEFAULT_REGION:=us-east-1}"
