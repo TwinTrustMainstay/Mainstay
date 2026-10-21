@@ -43,13 +43,26 @@ is stored externally.  This backup system ensures that:
 
 ### 1. AWS S3 Bucket
 
-Create an S3 bucket with versioning and encryption:
+The bucket, its versioning configuration, and its encryption are managed by
+Terraform in `infra/backup-bucket/`.  Versioning is a **separate bootstrap
+resource** that must be applied before the first backup runs — `backup.sh`
+checks `get-bucket-versioning` before uploading and aborts if versioning is
+not `Enabled`.
+
+```bash
+# One-time bootstrap (creates the bucket, enables versioning, sets encryption)
+terraform -chdir=infra/backup-bucket init
+terraform -chdir=infra/backup-bucket apply
+```
+
+The equivalent manual commands are:
 
 ```bash
 aws s3api create-bucket \
     --bucket mainstay-backups \
     --region us-east-1
 
+# Must complete before the first upload; backup.sh fails otherwise.
 aws s3api put-bucket-versioning \
     --bucket mainstay-backups \
     --versioning-configuration Status=Enabled
@@ -66,6 +79,15 @@ aws s3api put-bucket-encryption \
     }'
 ```
 
+#### Optional: S3 Object Lock
+
+For tamper-evident backups, enable S3 Object Lock on the bucket (it can only
+be enabled at bucket creation time).  With Object Lock in governance or
+compliance mode, backup objects cannot be deleted or overwritten for the
+retention period, even by a compromised credential.  Set
+`object_lock_enabled = true` and a retention period in the Terraform module,
+and grant `s3:PutObjectRetention` to the backup role.
+
 ### 2. AWS IAM Policy
 
 Attach this policy to the backup service account:
@@ -80,7 +102,7 @@ Attach this policy to the backup service account:
                 "s3:PutObject",
                 "s3:GetObject",
                 "s3:ListBucket",
-                "s3:PutBucketVersioning"
+                "s3:GetBucketVersioning"
             ],
             "Resource": [
                 "arn:aws:s3:::mainstay-backups",
@@ -92,13 +114,19 @@ Attach this policy to the backup service account:
             "Action": [
                 "kms:Encrypt",
                 "kms:Decrypt",
-                "kms:GenerateDataKey"
+                "kms:GenerateDataKey",
+                "kms:Sign",
+                "kms:Verify"
             ],
             "Resource": "arn:aws:kms:us-east-1:<account-id>:key/<key-id>"
         }
     ]
 }
 ```
+
+`kms:Sign`/`kms:Verify` are required for manifest signing (see
+[Manifest Signing](#manifest-signing)).  If you use minisign instead, no KMS
+signing permissions are needed.
 
 ### 3. Environment Variables
 
@@ -120,6 +148,12 @@ export AWS_SECRET_ACCESS_KEY=<your-secret>
 export AWS_DEFAULT_REGION=us-east-1
 export BACKUP_S3_BUCKET=mainstay-backups
 export BACKUP_ENCRYPTION_KEY=arn:aws:kms:us-east-1:<account-id>:key/<key-id>
+
+# Manifest signing (choose one)
+export BACKUP_SIGNING_KEY=arn:aws:kms:us-east-1:<account-id>:key/<signing-key-id>
+# or, for minisign:
+# export BACKUP_MINISIGN_SECRET_KEY=/etc/mainstay/minisign.key
+# export BACKUP_MINISIGN_PUBLIC_KEY=/etc/mainstay/minisign.pub
 ```
 
 ## Running a Backup
@@ -158,7 +192,9 @@ Each backup directory contains:
 ```
 backups/<timestamp>/
 ├── manifest.json              # Backup metadata (network, contract IDs, timestamp)
-├── checksums.sha256           # SHA-256 hashes of all files
+├── manifest.json.sig          # Signature over manifest.json (KMS or minisign)
+├── checksums.sha256           # SHA-256 hashes of every other file, incl. manifest.json
+├── failures.json              # IDs that could not be read after retries (empty list = complete)
 ├── asset_count.json           # Total asset count at backup time
 ├── asset_export_summary.json  # Summary of exported assets
 ├── contracts_ids.md           # Human-readable contract ID reference
@@ -170,8 +206,37 @@ backups/<timestamp>/
 │   ├── 1_history.json         # Maintenance history for asset 1
 │   ├── 1_score.json           # Collateral score for asset 1
 │   └── ...
-└── engineers.json             # Engineer credential data
+└── engineers.json             # Engineer records and credential state
 ```
+
+### Read Failures and `failures.json`
+
+Every on-chain read (asset records, maintenance history, collateral scores,
+engineer records) is retried with exponential backoff.  If a read still fails
+after the retries are exhausted, the failing ID is recorded in
+`failures.json`:
+
+```json
+{
+  "assets": [42, 107],
+  "maintenance": [{ "asset_id": 42, "kind": "history" }],
+  "engineers": ["GABC..."]
+}
+```
+
+When `failures.json` is non-empty the backup is **incomplete**: the summary
+counts only successful reads, and `backup.sh` exits non-zero so the cron job
+and monitoring alert.  A partial backup is still uploaded (for forensics), but
+it must not be treated as a valid restore source.  Re-run the backup once the
+RPC endpoint is healthy.
+
+### Engineer Export
+
+`engineers.json` is exported from the engineer registry's engineer-listing
+view, which returns each engineer's address, credential state (active,
+suspended, revoked), and trusted-issuer relationships.  An empty
+`engineers.json` means no engineers were exported; `restore.sh` reports this
+as a partial recovery rather than silently skipping engineer restoration.
 
 ## Verifying a Backup
 
@@ -185,12 +250,39 @@ backups/<timestamp>/
 ./scripts/restore.sh s3://mainstay-backups/backups/20260728T000000Z/ --verify-only
 ```
 
+`--verify-only` checks the manifest signature, then verifies every file listed
+in `checksums.sha256` — including `manifest.json` itself.  Only
+`checksums.sha256` is excluded from the checksum list (it cannot hash itself);
+its integrity is covered by the signed manifest.
+
 ### Manual Checksum Verification
 
 ```bash
 cd backups/20260728T000000Z
 sha256sum -c checksums.sha256
 ```
+
+### Manifest Signing
+
+`manifest.json` is signed after it is written, and every file (including
+`manifest.json`) is hashed afterwards.  Signing uses either AWS KMS
+asymmetric keys or minisign:
+
+```bash
+# KMS
+aws kms sign \
+    --key-id "$BACKUP_SIGNING_KEY" \
+    --message fileb://manifest.json \
+    --message-type RAW \
+    --signing-algorithm RSASSA_PSS_SHA_256 \
+    --output json > manifest.json.sig
+
+# minisign
+minisign -Sm manifest.json -s "$BACKUP_MINISIGN_SECRET_KEY"
+```
+
+`restore.sh` verifies `manifest.json.sig` against the manifest before
+restoring, and aborts if the signature is missing or invalid.
 
 ## Restoring from Backup
 
@@ -248,9 +340,15 @@ These tests validate:
 Set up monitoring for the backup process:
 
 1. **Cron job success**: Monitor that the daily backup script exits with code 0.
-2. **S3 bucket size**: Track the total size of the backup bucket over time.
-3. **Backup age**: Alert if the most recent backup is older than 26 hours.
-4. **Versioning**: Periodically verify that bucket versioning is still enabled.
+   A non-zero exit may indicate read failures (see `failures.json`).
+2. **Read failures**: Alert whenever `failures.json` is non-empty; the backup
+   is incomplete and must be re-run.
+3. **S3 bucket size**: Track the total size of the backup bucket over time.
+4. **Backup age**: Alert if the most recent backup is older than 26 hours.
+5. **Versioning**: Periodically verify that bucket versioning is still enabled
+   (`aws s3api get-bucket-versioning --bucket mainstay-backups`).
+6. **Signature verification**: Alert if `restore.sh --verify-only` fails on the
+   latest backup.
 
 ## Disaster Recovery Testing Schedule
 
@@ -278,3 +376,20 @@ Set up monitoring for the backup process:
 
 - Assets with existing serial numbers will fail.  Use `--start-asset-id` to
   skip already-restored assets, or deregister them first.
+
+### Backup exits non-zero with read failures
+
+- Inspect `failures.json` in the backup directory to see which IDs failed.
+- Check RPC health and re-run the backup; do not restore from an incomplete
+  backup.
+
+### Restore reports partial recovery
+
+- `restore.sh` reports partial recovery when `engineers.json` is empty or when
+  `failures.json` lists missing records.  Re-export the missing data from a
+  complete backup before declaring the restore finished.
+
+### Upload fails with "bucket versioning is not enabled"
+
+- Apply the Terraform bootstrap (`terraform -chdir=infra/backup-bucket apply`)
+  or run `put-bucket-versioning` manually, then re-run the backup.

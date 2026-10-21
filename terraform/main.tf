@@ -152,6 +152,47 @@ resource "aws_route53_record" "api_ap_southeast_1" {
   health_check_id = aws_route53_health_check.api_ap_southeast_1.id
 }
 
+# ── Backup bucket bootstrap ─────────────────────────────────
+# Versioning (and optionally Object Lock) must be enabled before
+# the first backup upload. This replaces the runtime best-effort
+# `put-bucket-versioning ... || true` call in backup.sh.
+resource "aws_s3_bucket" "backups" {
+  provider = aws.us_east_1
+  bucket   = var.backup_bucket_name
+
+  # Object Lock can only be enabled at bucket creation time.
+  object_lock_enabled = var.backup_object_lock_enabled
+
+  tags = {
+    Project = "Mainstay"
+    Purpose = "backups"
+  }
+}
+
+resource "aws_s3_bucket_versioning" "backups" {
+  provider = aws.us_east_1
+  bucket   = aws_s3_bucket.backups.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_object_lock_configuration" "backups" {
+  provider = aws.us_east_1
+  bucket   = aws_s3_bucket.backups.id
+  count    = var.backup_object_lock_enabled ? 1 : 0
+
+  rule {
+    default_retention {
+      mode = "GOVERNANCE"
+      days = var.backup_object_lock_retention_days
+    }
+  }
+
+  depends_on = [aws_s3_bucket_versioning.backups]
+}
+
 # ── SNS topic for cross-region cache invalidation ─────────────
 resource "aws_sns_topic" "cache_invalidation" {
   provider = aws.us_east_1
