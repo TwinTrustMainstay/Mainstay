@@ -8,6 +8,13 @@ use asset_registry::{AssetRegistry, AssetRegistryClient};
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::{vec, Address, Env, String, Symbol};
 
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
+=======
+
 /// Helper: register a single asset and return its ID, type, and owner.
 fn register_test_asset(e: &Env, client: &AssetRegistryClient, owner: &Address, idx: u32) -> u64 {
     let asset_type = Symbol::new(e, "GENSET");
@@ -361,4 +368,321 @@ fn test_backup_manifest_generation() {
         assert!(serials.contains(&exp));
     }
     assert_eq!(metadatas.len(), 3);
+}
+
+// ---------------------------------------------------------------------------
+// Shell script tests (backup.sh / restore.sh)
+//
+// These exercise the operational scripts directly.  They require a POSIX
+// shell and are skipped gracefully on platforms where one is unavailable.
+// ---------------------------------------------------------------------------
+
+/// Locate the repository root (the directory containing `backup.sh`).
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("contract crate should live inside the repository")
+        .to_path_buf()
+}
+
+/// Return true when a usable `sh` is available.
+fn have_sh() -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg("exit 0")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Create a unique temporary directory for a test.
+fn unique_tmp_dir(tag: &str) -> PathBuf {
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!(
+        "stellar-backup-test-{}-{}-{}",
+        tag,
+        std::process::id(),
+        n
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("create temp dir");
+    dir
+}
+
+/// Write an executable shell script.
+fn write_script(path: &Path, contents: &str) {
+    fs::write(path, contents).expect("write script");
+    let mut perms = fs::metadata(path).expect("stat script").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).expect("chmod script");
+}
+
+/// #1839: backup.sh must fail (non-zero exit) when the asset count read fails
+/// instead of silently writing `asset_count: 0` and reporting success.
+#[test]
+fn test_backup_fails_when_asset_count_read_fails() {
+    if !have_sh() {
+        eprintln!("skipping: no POSIX shell available");
+        return;
+    }
+
+    let root = repo_root();
+    let backup = root.join("backup.sh");
+    if !backup.exists() {
+        eprintln!("skipping: backup.sh not found at {:?}", backup);
+        return;
+    }
+
+    let tmp = unique_tmp_dir("backup-fail");
+    let bin = tmp.join("bin");
+    fs::create_dir_all(&bin).expect("create bin dir");
+
+    // Stub `stellar` so that any contract invocation fails.
+    write_script(
+        &bin.join("stellar"),
+        "#!/bin/sh\necho 'simulated RPC outage' >&2\nexit 1\n",
+    );
+
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = Command::new("sh")
+        .arg(&backup)
+        .current_dir(&tmp)
+        .env("PATH", path_env)
+        .env("STELLAR_NETWORK", "testnet")
+        .env("CONTRACT_ID", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM")
+        .output()
+        .expect("run backup.sh");
+
+    assert!(
+        !output.status.success(),
+        "backup.sh must exit non-zero when the asset count read fails.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // No manifest claiming a valid empty backup should be produced.
+    let manifest = tmp.join("backup").join("manifest.json");
+    if manifest.exists() {
+        let contents = fs::read_to_string(&manifest).unwrap_or_default();
+        assert!(
+            !contents.contains("asset_count: 0") && !contents.contains("\"asset_count\": 0"),
+            "backup.sh must not write asset_count: 0 on failure, got:\n{}",
+            contents
+        );
+    }
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// #1836: in dry-run mode restore.sh must report assets as "would restore"
+/// rather than counting them as actually restored.
+#[test]
+fn test_restore_dry_run_reports_would_restore() {
+    if !have_sh() {
+        eprintln!("skipping: no POSIX shell available");
+        return;
+    }
+
+    let root = repo_root();
+    let restore = root.join("restore.sh");
+    if !restore.exists() {
+        eprintln!("skipping: restore.sh not found at {:?}", restore);
+        return;
+    }
+
+    let tmp = unique_tmp_dir("restore-dry-run");
+    let bin = tmp.join("bin");
+    fs::create_dir_all(&bin).expect("create bin dir");
+
+    // Stub `stellar` so that writes are never actually performed.
+    write_script(
+        &bin.join("stellar"),
+        "#!/bin/sh\necho 'stub: no-op' >&2\nexit 0\n",
+    );
+
+    // Fixture backup: a manifest plus two asset files.
+    let backup_dir = tmp.join("backup");
+    let assets_dir = backup_dir.join("assets");
+    fs::create_dir_all(&assets_dir).expect("create assets dir");
+    fs::write(
+        backup_dir.join("manifest.json"),
+        "asset_count: 2\nnetwork: testnet\n",
+    )
+    .expect("write manifest");
+    for id in 1..=2u32 {
+        fs::write(
+            assets_dir.join(format!("asset_{}.json", id)),
+            format!(
+                "{{\"asset_id\": {}, \"asset_type\": \"GENSET\", \"metadata\": \"gen {}\", \"serial_number\": \"SN-{}\", \"owner\": \"GOWNER\"}}",
+                id, id, id
+            ),
+        )
+        .expect("write asset fixture");
+    }
+
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = Command::new("sh")
+        .arg(&restore)
+        .arg("--dry-run")
+        .arg(&backup_dir)
+        .current_dir(&tmp)
+        .env("PATH", path_env)
+        .env("STELLAR_NETWORK", "testnet")
+        .env("CONTRACT_ID", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM")
+        .output()
+        .expect("run restore.sh --dry-run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    let combined = format!("{}\n{}", stdout, stderr);
+
+    assert!(
+        output.status.success(),
+        "restore.sh --dry-run should succeed.\nstdout: {}\nstderr: {}",
+        stdout,
+        stderr
+    );
+
+    // The summary must mention a non-zero "would restore" count.
+    assert!(
+        combined.contains("would restore"),
+        "dry-run summary should report a 'would restore' counter, got:\n{}",
+        combined
+    );
+    assert!(
+        !combined.contains("would restore: 0")
+            && !combined.contains("would restore 0")
+            && !combined.contains("would restore:  0"),
+        "dry-run summary should report a non-zero 'would restore' count, got:\n{}",
+        combined
+    );
+
+    // And it must not claim assets were actually restored.
+    assert!(
+        !combined.contains("restored: 2") && !combined.contains("restored 2"),
+        "dry-run must not count assets as actually restored, got:\n{}",
+        combined
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+/// #1838: restore.sh must write an `id_map.json` mapping original IDs to new
+/// IDs, and must fail when the map is incomplete.
+#[test]
+fn test_restore_writes_and_validates_id_map() {
+    if !have_sh() {
+        eprintln!("skipping: no POSIX shell available");
+        return;
+    }
+
+    let root = repo_root();
+    let restore = root.join("restore.sh");
+    if !restore.exists() {
+        eprintln!("skipping: restore.sh not found at {:?}", restore);
+        return;
+    }
+
+    let tmp = unique_tmp_dir("restore-id-map");
+    let bin = tmp.join("bin");
+    fs::create_dir_all(&bin).expect("create bin dir");
+
+    // Stub `stellar` so that writes are never actually performed.
+    write_script(
+        &bin.join("stellar"),
+        "#!/bin/sh\necho 'stub: no-op' >&2\nexit 0\n",
+    );
+
+    let backup_dir = tmp.join("backup");
+    let assets_dir = backup_dir.join("assets");
+    fs::create_dir_all(&assets_dir).expect("create assets dir");
+    fs::write(
+        backup_dir.join("manifest.json"),
+        "asset_count: 2\nnetwork: testnet\n",
+    )
+    .expect("write manifest");
+    for id in 1..=2u32 {
+        fs::write(
+            assets_dir.join(format!("asset_{}.json", id)),
+            format!(
+                "{{\"asset_id\": {}, \"asset_type\": \"GENSET\", \"metadata\": \"gen {}\", \"serial_number\": \"SN-{}\", \"owner\": \"GOWNER\"}}",
+                id, id, id
+            ),
+        )
+        .expect("write asset fixture");
+    }
+
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    // A dry-run restore should still produce an id_map.json covering every
+    // asset in the backup.
+    let output = Command::new("sh")
+        .arg(&restore)
+        .arg("--dry-run")
+        .arg(&backup_dir)
+        .current_dir(&tmp)
+        .env("PATH", path_env.clone())
+        .env("STELLAR_NETWORK", "testnet")
+        .env("CONTRACT_ID", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM")
+        .output()
+        .expect("run restore.sh --dry-run");
+
+    assert!(
+        output.status.success(),
+        "restore.sh --dry-run should succeed.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let id_map = tmp.join("id_map.json");
+    assert!(
+        id_map.exists(),
+        "restore.sh should write id_map.json (looked in {:?})",
+        id_map
+    );
+    let map_contents = fs::read_to_string(&id_map).expect("read id_map.json");
+    assert!(
+        map_contents.contains('1') && map_contents.contains('2'),
+        "id_map.json should map every original asset ID, got:\n{}",
+        map_contents
+    );
+
+    // Now simulate an incomplete map: remove one entry and re-run the
+    // validation path.  The restore must fail.
+    fs::write(&id_map, "{\"1\": 101}\n").expect("write incomplete id_map.json");
+
+    let output = Command::new("sh")
+        .arg(&restore)
+        .arg("--validate-id-map")
+        .arg(&backup_dir)
+        .current_dir(&tmp)
+        .env("PATH", path_env)
+        .env("STELLAR_NETWORK", "testnet")
+        .env("CONTRACT_ID", "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM")
+        .output()
+        .expect("run restore.sh --validate-id-map");
+
+    assert!(
+        !output.status.success(),
+        "restore.sh must fail when id_map.json is incomplete.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
 }

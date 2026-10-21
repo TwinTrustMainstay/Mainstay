@@ -208,9 +208,20 @@ validate_s3() {
 export_asset_count() {
     log "Exporting asset count..."
     local count
-    count="$(invoke_read "$CONTRACT_ASSET_REGISTRY" get_asset_count 2>/dev/null)" || true
+    if ! count="$(invoke_read "$CONTRACT_ASSET_REGISTRY" get_asset_count 2>/dev/null)"; then
+        err "Failed to read asset count from ${CONTRACT_ASSET_REGISTRY} (RPC/CLI error)."
+        err "Aborting backup: refusing to write an empty backup that looks valid."
+        exit 1
+    fi
     if [[ -z "$count" || "$count" == "null" ]]; then
-        count=0
+        err "Asset count read returned empty/null output."
+        err "Aborting backup: refusing to write an empty backup that looks valid."
+        exit 1
+    fi
+    if [[ ! "$count" =~ ^[0-9]+$ ]]; then
+        err "Asset count is not a non-negative integer: '$count'"
+        err "Aborting backup: refusing to write an empty backup that looks valid."
+        exit 1
     fi
     jq -n --argjson count "$count" \
        --arg timestamp "$(date -u -Iseconds)" \
