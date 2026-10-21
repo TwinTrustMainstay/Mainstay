@@ -65,6 +65,7 @@ impl From<SharedContractError> for ContractError {
             SharedContractError::TimelockNotExpired => ContractError::TimelockNotExpired,
             SharedContractError::ProposalNotFound => ContractError::ProposalNotFound,
             SharedContractError::PendingAdminAlreadyExists => ContractError::PendingAdminAlreadyExists,
+            SharedContractError::InvalidSuspensionPeriod => ContractError::InvalidSuspensionPeriod,
         }
     }
 }
@@ -285,11 +286,11 @@ const NEXT_ASSIGNMENT_ID_KEY: Symbol = symbol_short!("NXT_ASG");
 const DEFAULT_DECAY_INTERVAL_SECS: u64 = 90 * 86_400;
 /// Default decay rate: 5% per interval (#1315)
 const DEFAULT_DECAY_RATE_BPS: u32 = 500; // 5% in basis points
-
-/// Upper bound on any engineer's reputation score.
+/// Maximum reputation score an engineer can reach (#1742 cap).
 const MAX_REPUTATION: u32 = 1000;
-/// Largest single quality bonus an admin may award in one call.
+/// Largest single quality bonus an admin may award in one call (#1742).
 const MAX_QUALITY_BONUS: u32 = 50;
+const QUALITY_BONUS_EVENT: Symbol = symbol_short!("QUAL_BON");
 
 fn is_paused(env: &Env) -> bool {
     env.storage().persistent().get(&PAUSED_KEY).unwrap_or(false)
@@ -1088,7 +1089,7 @@ impl EngineerRegistry {
             (admin.clone(), env.ledger().timestamp()),
         );
         env.events().publish(
-            (symbol_short!("ADM_CANCEL"),),
+            (symbol_short!("ADM_CNCL"),),
             (admin,),
         );
     }
@@ -2251,7 +2252,7 @@ impl EngineerRegistry {
         }
         env.storage()
             .persistent()
-            .set(&(CE_REQUIREMENT_KEY, specialization), &(hours, frequency_secs));
+            .set(&(CE_REQUIREMENT_KEY, specialization.clone()), &(hours, frequency_secs));
         extend_persistent_ttl(&env, &(CE_REQUIREMENT_KEY, specialization));
     }
 
@@ -2342,7 +2343,7 @@ impl EngineerRegistry {
         record.tier = EngineerTier::Apprentice;
         env.storage().persistent().set(&engineer_key(&apprentice), &record);
         extend_persistent_ttl(&env, &engineer_key(&apprentice));
-        let key = (APP_KEY, apprentice);
+        let key = (APP_KEY, apprentice.clone());
         env.storage().persistent().set(
             &key,
             &Apprenticeship {
@@ -2354,14 +2355,14 @@ impl EngineerRegistry {
         );
         extend_persistent_ttl(&env, &key);
         env.events().publish(
-            (symbol_short!("MENTOR_START"), apprentice),
+            (symbol_short!("MNT_START"), apprentice.clone()),
             (env.ledger().timestamp(), hours_required),
         );
     }
 
     pub fn record_apprenticeship_hours(env: Env, apprentice: Address, hours: u32) {
         ensure_not_paused(&env);
-        let key = (APP_KEY, apprentice);
+        let key = (APP_KEY, apprentice.clone());
         let mut apprenticeship: Apprenticeship = env
             .storage()
             .persistent()
@@ -2375,7 +2376,7 @@ impl EngineerRegistry {
         env.storage().persistent().set(&key, &apprenticeship);
         extend_persistent_ttl(&env, &key);
         env.events().publish(
-            (symbol_short!("MENTOR_HOURS"), apprentice),
+            (symbol_short!("MNT_HOURS"), apprentice.clone()),
             (hours, apprenticeship.hours_completed),
         );
     }
@@ -2402,7 +2403,7 @@ impl EngineerRegistry {
         env.storage().persistent().remove(&key);
         extend_persistent_ttl(&env, &engineer_key(&apprentice));
         env.events().publish(
-            (symbol_short!("MENTOR_DONE"), apprentice),
+            (symbol_short!("MNT_DONE"), apprentice.clone()),
             env.ledger().timestamp(),
         );
     }
@@ -6001,6 +6002,23 @@ mod tests {
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::InvalidSuspensionPeriod as u32
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_batch_revoke_credentials_non_admin_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+
+        let outsider = Address::generate(&env);
+        let batch = Vec::new(&env);
+        let result = client.try_batch_revoke_credentials(&outsider, &batch);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
             ))),
         );
     }

@@ -11,8 +11,10 @@ members = [
     "contracts/insurance-pool",
     "contracts/marketplace",
     "contracts/governance",
+    "contracts/bridge",
     "tests",
     "sdk/rust",
+    "sdk/mobile-api",
 ]
 resolver = "2"
 

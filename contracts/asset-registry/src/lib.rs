@@ -1956,7 +1956,7 @@ impl AssetRegistry {
             (admin.clone(), env.ledger().timestamp()),
         );
         env.events().publish(
-            (symbol_short!("ADM_CANCEL"),),
+            (symbol_short!("ADM_CNCL"),),
             (admin,),
         );
     }
@@ -8021,13 +8021,6 @@ mod tests {
                 &owner,
             );
 
-            // Non-admin tries to decommission
-            let non_admin = Address::generate(&env);
-            let result = client.try_decommission_asset(&non_admin, &asset_id);
-            assert_eq!(
-                result,
-                Err(Ok(soroban_sdk::Error::from_contract_error(
-                    ContractError::UnauthorizedAdmin as u32
 
             // Non-admin tries to decommission
             let non_admin = Address::generate(&env);
@@ -8684,37 +8677,6 @@ mod tests {
         let emitted_hash: BytesN<32> = data.try_into_val(&env).unwrap();
         assert_eq!(emitted_hash, hash);
     }
-
-    #[test]
-    fn test_get_assets_by_type_paginated_total_matches_across_pages() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, owner) = setup_with_types_for_pagination(&env);
-
-        for i in 0..12u32 {
-            client.register_asset(
-                &symbol_short!("GENSET"),
-                &String::from_str(&env, &format!("Generator {i}")),
-                &unique_serial(&env),
-                &owner,
-            let events = env.events().all();
-            use soroban_sdk::TryIntoVal;
-            let upgrade_event = events.iter().find(|(_, topics, _)| {
-                if let Some(val) = topics.get(0) {
-                    if let Ok(s) = val.try_into_val::<_, Symbol>(&env) {
-                        return s == symbol_short!("UPGRADE");
-                    }
-                }
-                false
-            });
-            assert!(
-                upgrade_event.is_some(),
-                "UPGRADE event must be emitted on execute_upgrade"
-            );
-            let (_, _, data) = upgrade_event.unwrap();
-            let emitted_hash: BytesN<32> = data.try_into_val(&env).unwrap();
-            assert_eq!(emitted_hash, hash);
-        }
 
         #[test]
         fn test_get_assets_by_type_paginated_total_matches_across_pages() {

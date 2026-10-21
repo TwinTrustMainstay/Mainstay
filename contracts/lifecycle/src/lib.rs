@@ -1911,7 +1911,7 @@ impl Lifecycle {
             (admin.clone(), env.ledger().timestamp()),
         );
         env.events().publish(
-            (symbol_short!("ADM_CANCEL"),),
+            (symbol_short!("ADM_CNCL"),),
             (admin,),
         );
     }
