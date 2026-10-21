@@ -5,6 +5,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Default to the least privilege required: every job inherits read-only
+# access to repository contents. Jobs that need more must opt in with a
+# job-level `permissions:` block.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: Test Workspace
@@ -272,7 +278,47 @@ jobs:
           bash scripts/upgrade_state.sh capture "$PRE_SNAPSHOT"
           echo "PRE_UPGRADE_SNAPSHOT=$PRE_SNAPSHOT" >> $GITHUB_ENV
 
-          echo "Pre-upgrade state captured"
+          # Capture each getter's output to a file so it can be diffed
+          # against the post-upgrade state.
+          stellar contract invoke --id "$LC_ID" --network local --source deployer \
+            -- get_config > "$SNAP_DIR/lc_get_config.pre.txt"
+          stellar contract invoke --id "$AR_ID" --network local --source deployer \
+            -- get_admin > "$SNAP_DIR/ar_get_admin.pre.txt"
+          stellar contract invoke --id "$ER_ID" --network local --source deployer \
+            -- get_admin > "$SNAP_DIR/er_get_admin.pre.txt"
+          stellar contract invoke --id "$AR_ID" --network local --source deployer \
+            -- get_asset_count > "$SNAP_DIR/ar_get_asset_count.pre.txt"
+
+          # Assert specific pre-upgrade values so the baseline itself is known-good.
+          DEPLOYER_ADDR=$(stellar keys address deployer)
+          echo "DEPLOYER_ADDR=$DEPLOYER_ADDR" >> $GITHUB_ENV
+
+          if ! grep -q "$DEPLOYER_ADDR" "$SNAP_DIR/ar_get_admin.pre.txt"; then
+            echo "❌ Pre-upgrade AR admin mismatch (expected $DEPLOYER_ADDR)"
+            cat "$SNAP_DIR/ar_get_admin.pre.txt"
+            exit 1
+          fi
+          if ! grep -q "$DEPLOYER_ADDR" "$SNAP_DIR/er_get_admin.pre.txt"; then
+            echo "❌ Pre-upgrade ER admin mismatch (expected $DEPLOYER_ADDR)"
+            cat "$SNAP_DIR/er_get_admin.pre.txt"
+            exit 1
+          fi
+          if ! grep -q "200" "$SNAP_DIR/lc_get_config.pre.txt"; then
+            echo "❌ Pre-upgrade LC config missing expected max_history (200)"
+            cat "$SNAP_DIR/lc_get_config.pre.txt"
+            exit 1
+          fi
+          if ! grep -q "0" "$SNAP_DIR/ar_get_asset_count.pre.txt"; then
+            echo "❌ Pre-upgrade asset count mismatch (expected 0)"
+            cat "$SNAP_DIR/ar_get_asset_count.pre.txt"
+            exit 1
+          fi
+
+          echo "Pre-upgrade state captured and asserted"
+          for f in "$SNAP_DIR"/*.pre.txt; do
+            echo "--- $f ---"
+            cat "$f"
+          done
 
       # ── Step 4b: Simulate contract upgrade ───────────────
       - name: Simulate contract upgrade
@@ -312,8 +358,6 @@ jobs:
           echo "  LC: $NEW_LC_HASH"
 
           # Propose upgrades on all three contracts.
-          # The timelock prevents immediate execution, but we exercise the
-          # propose path to ensure storage is not corrupted.
           echo "Proposing upgrades..."
 
           stellar contract invoke --id "$AR_ID" --network local --source deployer \
@@ -327,22 +371,63 @@ jobs:
 
           echo "Upgrades proposed successfully"
 
-      # ── Step 4c: Verify state after upgrade proposal ─────
-      - name: Verify state after upgrade proposal
-        run: |
-          echo "=== Post-Proposal State Verification ==="
-
-          # Verify that proposing an upgrade did not corrupt existing data
-          stellar contract invoke --id "$LC_ID" --network local --source deployer \
-            -- get_config
+          # Execute the upgrades so the post-upgrade checks run against the
+          # newly installed WASM rather than the original code.
+          echo "Executing upgrades..."
 
           stellar contract invoke --id "$AR_ID" --network local --source deployer \
-            -- get_admin
+            -- execute_upgrade --admin "$DEPLOYER_ADDR"
 
           stellar contract invoke --id "$ER_ID" --network local --source deployer \
-            -- get_admin
+            -- execute_upgrade --admin "$DEPLOYER_ADDR"
 
-          echo "State intact after upgrade proposal"
+          stellar contract invoke --id "$LC_ID" --network local --source deployer \
+            -- execute_upgrade --admin "$DEPLOYER_ADDR"
+
+          echo "Upgrades executed successfully"
+
+      # ── Step 4c: Verify state after upgrade execution ────
+      - name: Verify state after upgrade execution
+        run: |
+          echo "=== Post-Upgrade State Verification ==="
+
+          # Re-run the same getters into post-upgrade files.
+          stellar contract invoke --id "$LC_ID" --network local --source deployer \
+            -- get_config > "$SNAP_DIR/lc_get_config.post.txt"
+          stellar contract invoke --id "$AR_ID" --network local --source deployer \
+            -- get_admin > "$SNAP_DIR/ar_get_admin.post.txt"
+          stellar contract invoke --id "$ER_ID" --network local --source deployer \
+            -- get_admin > "$SNAP_DIR/er_get_admin.post.txt"
+          stellar contract invoke --id "$AR_ID" --network local --source deployer \
+            -- get_asset_count > "$SNAP_DIR/ar_get_asset_count.post.txt"
+
+          # Diff pre vs post; any mismatch fails the job.
+          for name in lc_get_config ar_get_admin er_get_admin ar_get_asset_count; do
+            if ! diff -u "$SNAP_DIR/$name.pre.txt" "$SNAP_DIR/$name.post.txt"; then
+              echo "❌ State mismatch for $name after upgrade"
+              exit 1
+            fi
+          done
+
+          # Assert specific values survived the upgrade.
+          if ! grep -q "$DEPLOYER_ADDR" "$SNAP_DIR/ar_get_admin.post.txt"; then
+            echo "❌ Post-upgrade AR admin mismatch (expected $DEPLOYER_ADDR)"
+            exit 1
+          fi
+          if ! grep -q "$DEPLOYER_ADDR" "$SNAP_DIR/er_get_admin.post.txt"; then
+            echo "❌ Post-upgrade ER admin mismatch (expected $DEPLOYER_ADDR)"
+            exit 1
+          fi
+          if ! grep -q "200" "$SNAP_DIR/lc_get_config.post.txt"; then
+            echo "❌ Post-upgrade LC config missing expected max_history (200)"
+            exit 1
+          fi
+          if ! grep -q "0" "$SNAP_DIR/ar_get_asset_count.post.txt"; then
+            echo "❌ Post-upgrade asset count mismatch (expected 0)"
+            exit 1
+          fi
+
+          echo "State intact after upgrade execution"
 
       # ── Step 5: Run storage migration validation tests ───
       - name: Storage migration validation

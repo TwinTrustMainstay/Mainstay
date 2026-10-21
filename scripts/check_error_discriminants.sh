@@ -16,15 +16,16 @@ for contract in asset-registry engineer-registry lifecycle lending marketplace g
   contract_path="${REPO_ROOT}/contracts/${contract}"
   [ -d "$contract_path" ] || continue
 
-  # Look for ContractError enum discriminants
-  # We'll use a temporary file to extract just the ContractError enum section
-  temp_enum=$(mktemp)
-  trap "rm -f '$temp_enum'" EXIT
+  src_path="${contract_path}/src"
+  [ -d "$src_path" ] || continue
 
-  # Extract the ContractError enum section from lib.rs
-  if [ -f "$contract_path/src/lib.rs" ]; then
-    # Use sed to extract lines between "enum ContractError" and the closing brace
-    sed -n '/^pub enum ContractError/,/^}/p' "$contract_path/src/lib.rs" > "$temp_enum" 2>/dev/null || true
+  # Scan every Rust source file under src/ for a `pub enum ContractError` definition.
+  while IFS= read -r source_file; do
+    [ -f "$source_file" ] || continue
+
+    # Extract the ContractError enum section from this file
+    temp_enum=$(mktemp)
+    sed -n '/^pub enum ContractError/,/^}/p' "$source_file" > "$temp_enum" 2>/dev/null || true
 
     # Extract all discriminant assignments: VariantName = number,
     if [ -s "$temp_enum" ]; then
@@ -42,7 +43,8 @@ for contract in asset-registry engineer-registry lifecycle lending marketplace g
 
         # Check for duplicates
         if [[ -v discriminants[$discriminant] ]]; then
-          echo "DUPLICATE: ${contract} has duplicate ContractError discriminant ${discriminant}: '${variant}' and '${discriminants[$discriminant]}'"
+          rel_file="${source_file#"${REPO_ROOT}/"}"
+          echo "DUPLICATE: ${contract} has duplicate ContractError discriminant ${discriminant} in ${rel_file}: '${variant}' and '${discriminants[$discriminant]}'"
           violations=$((violations + 1))
         else
           discriminants[$discriminant]="$variant"
@@ -51,7 +53,9 @@ for contract in asset-registry engineer-registry lifecycle lending marketplace g
 
       unset discriminants
     fi
-  fi
+
+    rm -f "$temp_enum"
+  done < <(find "$src_path" -name '*.rs' -type f | sort)
 done
 
 if [ "$violations" -ne 0 ]; then
