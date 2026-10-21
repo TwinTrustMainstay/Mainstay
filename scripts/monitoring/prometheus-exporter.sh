@@ -6,7 +6,7 @@
 # HTTP endpoint suitable for Prometheus scraping.
 #
 # Usage:
-#   ./scripts/monitoring/prometheus-exporter.sh [--port <port>]
+#   ./scripts/monitoring/prometheus-exporter.sh [--port <port>] [--bind <address>]
 #
 # Environment variables:
 #   CONTRACT_ASSET_REGISTRY     - Asset Registry contract ID
@@ -121,6 +121,19 @@ init_metrics_dir() {
     METRICS_DIR="$(mktemp -d "$base/mainstay-exporter.XXXXXXXX")"
     chmod 700 "$METRICS_DIR"
     METRICS_FILE="$METRICS_DIR/mainstay-metrics.prom"
+}
+
+# Length of a get_maintenance_history view. A bare integer is used as-is.
+# Otherwise each MaintenanceRecord in the CLI output contributes one "asset_id".
+history_len_from_view() {
+    local raw="$1"
+    local trimmed="${raw//[[:space:]]/}"
+    if [[ "$trimmed" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "$trimmed"
+        return 0
+    fi
+    local without="${raw//\"asset_id\"/}"
+    printf '%s\n' "$(( (${#raw} - ${#without}) / 10 ))"
 }
 
 # ---------------------------------------------------------------------------
@@ -290,7 +303,7 @@ serve_http() {
     elif command -v python3 &> /dev/null; then
         echo "[$(date -u +%H:%M:%S)] Using Python for HTTP server"
         python3 -c "
-import http.server, os
+import http.server, os, sys
 METRICS_FILE = '$METRICS_FILE'
 BIND_ADDRESS = '$bind_addr'
 class MetricsHandler(http.server.BaseHTTPRequestHandler):
@@ -329,11 +342,42 @@ http.server.HTTPServer((BIND_ADDRESS, $port), MetricsHandler).serve_forever()
 # Main
 # ---------------------------------------------------------------------------
 
+# Sourcing this file (as the fixture test does) must not start the exporter.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 PORT="${EXPORTER_PORT}"
 BIND_ADDR="${EXPORTER_BIND_ADDRESS}"
 
-if [[ "${1:-}" == "--port" ]]; then
-    PORT="${2:-9600}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --port)
+            if [[ -z "${2:-}" ]]; then
+                echo "Option --port requires an integer from 1 to 65535." >&2
+                exit 1
+            fi
+            PORT="$2"
+            shift 2
+            ;;
+        --bind)
+            if [[ -z "${2:-}" ]]; then
+                echo "Option --bind requires an address." >&2
+                exit 1
+            fi
+            BIND="$2"
+            shift 2
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [[ ! "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+    echo "Invalid port: ${PORT} (expected an integer from 1 to 65535)." >&2
+    exit 1
 fi
 
 echo "=== Mainstay Prometheus Exporter ==="
