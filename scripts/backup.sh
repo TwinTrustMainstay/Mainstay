@@ -8,6 +8,10 @@
 # Usage:
 #   ./scripts/backup.sh [--dry-run] [--output-dir <path>]
 #
+# Optional secondary replicas (verified after copy):
+#   BACKUP_SECONDARY_DIR        - second local/mounted location
+#   BACKUP_SECONDARY_S3_BUCKET  - bucket in another region or account
+#
 # Environment variables (required for S3 upload):
 #   AWS_ACCESS_KEY_ID       - AWS access key for S3
 #   AWS_SECRET_ACCESS_KEY   - AWS secret key for S3
@@ -601,6 +605,9 @@ main() {
 
     # 9. Upload to S3 (if configured)
     upload_to_s3
+
+    # 9. Replicate to secondary locations and verify each copy
+    replicate_backup
 
     log "=== Backup complete ==="
     log "Local backup: ${BACKUP_DIR}"

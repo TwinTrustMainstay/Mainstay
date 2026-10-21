@@ -47,6 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Storage keys (`lifecycle/src/storage.rs`) added since 1.0.0: `SCHIST` (score history), `LUPD` (last score update timestamp), `FROZEN` / `FRZ_SCR` (decommission freeze flag and frozen score), `HLTH_SNP` (health snapshots), `XFER_HIST` (ownership transfer history), `ENG_HIST` / `ENG_AUTH` (per-engineer history and per-asset authorization), `SUB_WIN` (rolling-hour submission rate window), `RVK_TL` / `TL_PROP` (timelocked engineer-revocation and generic admin proposals), `MSTD` / `SCR_WGT` (per-asset-type maintenance standards and scoring weights)
 
 ### Fixed
+- Metrics exporter: the exporter no longer crashes on its first collection, and its HTTP endpoint now returns metrics (the response was never sent before).
+- Backup checksums use paths relative to the backup directory, so backups verify after being copied to another location.
 - `apply_decay` in `lifecycle/src/scoring.rs`: enforce `MIN_SCORE_WITH_HISTORY = 1` in both the main decay path and the early-return path so the stored score is never written as 0 for an asset that has at least one maintenance record (closes [#784](https://github.com/TwinTrustMainstay/Mainstay/issues/784))
 - `get_maintenance_history_page` in `lifecycle`: cap the caller-supplied `limit` at `MAX_PAGE_SIZE` (100) so a large `limit` can no longer reintroduce an unbounded, potentially oversized response (closes [#1075](https://github.com/TwinTrustMainstay/Mainstay/issues/1075))
 - `HealthSnapshot` in `lifecycle`: renamed the `timestamp` field to `snapshot_timestamp` to make explicit that it records when the snapshot was captured (closes [#1076](https://github.com/TwinTrustMainstay/Mainstay/issues/1076))

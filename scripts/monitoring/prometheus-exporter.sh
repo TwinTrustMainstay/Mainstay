@@ -43,6 +43,11 @@ METRICS_FILE=""
 # Number of chain reads that failed during the current collection cycle.
 CHAIN_READ_ERRORS=0
 
+# Per-call RPC telemetry. Each invoke_read appends one line "<exit_code> <seconds>".
+# A file is used instead of shell variables because invoke_read runs inside
+# $(...) subshells, where counter updates would be lost.
+RPC_LOG="${METRICS_FILE}.rpc"
+
 # ---------------------------------------------------------------------------
 # Query helpers
 # ---------------------------------------------------------------------------
