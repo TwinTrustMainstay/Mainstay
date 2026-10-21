@@ -1,8 +1,6 @@
 # Error Reference
 
-> **Last updated:** 2026-09-27 · **Doc version:** 0.1.0
-
-This document lists every `ContractError` variant across the three core contracts — **AssetRegistry**, **EngineerRegistry**, and **Lifecycle** — together with the **Lending** contract. For each code you'll find the numeric value, when it is raised, and how to resolve it.
+This document lists every `ContractError` variant across the three core contracts — **AssetRegistry**, **EngineerRegistry**, and **Lifecycle** — together with the **Lending**, **Marketplace**, and **Governance** contracts. For each code you'll find the numeric value, when it is raised, and how to resolve it.
 
 ---
 
@@ -12,6 +10,8 @@ This document lists every `ContractError` variant across the three core contract
 - [EngineerRegistry](#engineerregistry)
 - [Lifecycle](#lifecycle)
 - [Lending](#lending)
+- [Marketplace](#marketplace)
+- [Governance](#governance)
 
 ---
 
@@ -89,6 +89,7 @@ This document lists every `ContractError` variant across the three core contract
 | 18 | `EngineerAlreadySuspended` | The engineer is already suspended and cannot be suspended again. |
 | 19 | `InvalidSuspensionPeriod` | The supplied suspension period is invalid or out of range. |
 | 20 | `BatchRevokeTooLarge` | The batch passed to a batch-revoke call exceeds the maximum of 50 engineers per call. |
+| 37 | `InvalidReputationBonus` | An admin quality bonus was 0 or above 50 points. Bonuses must be between 1 and 50 inclusive (see `award_quality_bonus`). |
 | 21 | `CredentialExpired` | The engineer's credential has expired and cannot be used for maintenance submissions. |
 
 ### Resolution guidance
@@ -112,6 +113,7 @@ This document lists every `ContractError` variant across the three core contract
 | `TimelockNotExpired` | Call `propose_revoke_credential` first; then wait 48 hours before calling `execute_revoke_credential`. |
 | `ProposalNotFound` | Call `propose_revoke_credential` before `execute_revoke_credential`. If already executed, create a new proposal. |
 | `BatchRevokeTooLarge` | Split the batch into chunks of ≤ 50 engineers per call. |
+| `InvalidReputationBonus` | Pass a bonus between 1 and 50. Larger rewards should be split across calls; reputation is capped at 1000 regardless. |
 
 ---
 
@@ -274,6 +276,86 @@ The lending error codes are unique. In particular, `TimelockNotExpired` and `Pro
 | `NotSyndicateLender` | Join the syndicate as a lender before submitting a lender-only action. |
 | `InsuranceNotFound` | Register insurance for the asset before attempting to claim against it. |
 | `InsuranceVerificationFailed` | Verify the policy details with the insurer and retry with valid coverage information. |
+
+---
+
+## Marketplace
+
+The `marketplace` contract implements dynamic maintenance pricing and competitive maintenance auctions.
+
+| Code | Variant | Description |
+|------|---------|-------------|
+| 1 | `NotInitialized` | The contract has not been initialized. |
+| 2 | `AlreadyInitialized` | `initialize` was called a second time. |
+| 3 | `UnauthorizedAdmin` | The caller is not the stored admin. |
+| 4 | `InvalidPricingConfig` | The pricing configuration is inconsistent: base price is zero, the floor is above 1.0x, the cap is below 1.0x, the step or sensitivity is zero, or the sensitivity exceeds 10x. |
+| 5 | `PriceUpdateTooSoon` | `record_market_state` was called before `min_update_interval_secs` elapsed since the last update. |
+| 6 | `AuctionNotFound` | No auction exists with the given id. |
+| 7 | `AuctionNotOpen` | The auction is already finalized or disputed, so the requested action is no longer allowed. |
+| 8 | `BiddingClosed` | The bidding or commit window (`bid_end`) has passed. |
+| 9 | `RevealWindowClosed` | A sealed bid was revealed outside the reveal window (after `bid_end` and up to `reveal_end`). |
+| 10 | `InvalidBid` | The bid price is zero or above the auction's ceiling price. |
+| 11 | `NotCredentialed` | The engineer does not hold a `Valid` or `GracePeriod` credential in the engineer registry. |
+| 12 | `AlreadyBid` | The engineer has already placed a bid or commitment on this auction. |
+| 13 | `NoCommitment` | No sealed commitment exists for this engineer, or it was already revealed. |
+| 14 | `RevealMismatch` | The revealed price and salt do not reproduce the stored commitment. |
+| 15 | `AuctionStillOpen` | `finalize_auction` was called before the bidding (open) or reveal (sealed) window ended. |
+| 16 | `InvalidAuctionConfig` | Auction parameters are invalid: a deadline is not in the future, a sealed auction's `reveal_end` is not after `bid_end`, or the ceiling is zero. |
+| 17 | `NotAwarded` | A dispute was opened on an auction that has not been awarded. |
+| 18 | `DisputeWindowClosed` | The 3-day dispute window after finalization has passed. |
+| 19 | `NotABidder` | The caller did not bid on this auction, or the named final winner did not bid. |
+| 20 | `NotDisputed` | `resolve_dispute` was called on an auction that is not disputed. |
+| 21 | `AuctionModeMismatch` | The action does not match the auction's mode. Use `place_bid` for open auctions and `commit_bid`/`reveal_bid` for sealed ones. |
+| 22 | `BidLimitReached` | The auction already holds the maximum of 100 bids. |
+
+Status values written by the contract: `Active`, `Passed`, `Rejected`, `NoQuorum`, `Executed` are governance proposal states, and `Valid`, `GracePeriod`, `HardExpired`, `Revoked`, `NotFound`, `Suspended`, `Expired` mirror the engineer registry's credential states. Auction status values are `Open`, `Unawarded`, `Awarded`, `Disputed`, and `Resolved`.
+
+### Resolution guidance
+
+| Variant | How to resolve |
+|---------|----------------|
+| `PriceUpdateTooSoon` | Wait until `min_update_interval_secs` has elapsed since the last `record_market_state` call, then retry. |
+| `BiddingClosed` | The bidding window has ended. Bids cannot be placed or committed after `bid_end`. |
+| `RevealWindowClosed` | Reveal only between `bid_end` and `reveal_end`. Commitments not revealed in time are forfeited. |
+| `NotCredentialed` | Verify the engineer's credential with `verify_engineer` in the engineer registry and renew it if needed. |
+| `RevealMismatch` | Use the exact price and salt that were hashed with `commitment(auction_id, engineer, price, salt)`. |
+| `AuctionStillOpen` | Retry `finalize_auction` after the relevant window ends. |
+| `DisputeWindowClosed` | Disputes must be opened within 3 days of finalization. |
+
+---
+
+## Governance
+
+The `governance` contract implements voting shares, proposals, quorum-based voting, and a treasury funding ledger.
+
+| Code | Variant | Description |
+|------|---------|-------------|
+| 1 | `NotInitialized` | The contract has not been initialized. |
+| 2 | `AlreadyInitialized` | `initialize` was called a second time. |
+| 3 | `UnauthorizedAdmin` | The caller is not the stored admin. |
+| 4 | `InvalidConfig` | The governance configuration is out of range: zero voting period, or quorum or approval threshold outside 1–10,000 bps. |
+| 5 | `InvalidAmount` | An amount of zero was supplied for shares, a transfer, or a treasury credit. |
+| 6 | `InsufficientShares` | The holder has too few shares for the action: a transfer above balance, a proposal below `min_proposal_shares`, or a vote with no shares. |
+| 7 | `SharesLocked` | The sender's shares are locked by a vote on an active proposal and cannot be transferred until voting ends. |
+| 8 | `ProposalNotFound` | No proposal exists with the given id. |
+| 9 | `InvalidProposal` | The title is empty or longer than 128 bytes, or a funding grant is for zero. |
+| 10 | `VotingClosed` | The proposal is not active, or its voting period has ended. |
+| 11 | `AlreadyVoted` | The holder has already voted on this proposal. |
+| 12 | `VotingStillOpen` | `finalize_proposal` was called before the voting period ended. |
+| 13 | `AlreadyFinalized` | The proposal's outcome has already been recorded. |
+| 14 | `ProposalNotPassed` | `execute_proposal` was called on a proposal that did not pass. |
+| 15 | `AlreadyExecuted` | The proposal has already been executed. |
+| 16 | `InsufficientBudget` | The treasury balance does not cover the funding grant at execution time. |
+| 17 | `TooManyVotes` | The proposal has reached the cap of 500 votes. |
+
+### Resolution guidance
+
+| Variant | How to resolve |
+|---------|----------------|
+| `InsufficientShares` | Ask an admin to mint shares, or acquire them with `transfer_shares`. Proposals need at least `min_proposal_shares`. |
+| `SharesLocked` | Shares locked by a vote are released when that proposal's voting period ends. |
+| `VotingStillOpen` | Retry `finalize_proposal` once the voting period has ended. |
+| `InsufficientBudget` | The proposal passed but the treasury no longer covers it. Fund the treasury with `fund_treasury` or reject the grant. |
 
 ---
 

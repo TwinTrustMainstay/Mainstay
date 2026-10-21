@@ -4,6 +4,8 @@
 # Smart contract source: every PR touching contracts/ must be approved by a
 # contract maintainer before it can be merged.
 /contracts/ @marvs8
+/contracts/marketplace/ @marvs8
+/contracts/governance/ @marvs8
 
 # CI / workflow changes require the same maintainer sign-off.
 /.github/workflows/ @marvs8
