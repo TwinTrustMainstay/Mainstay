@@ -11,7 +11,7 @@
 #
 # Options:
 #   --dry-run                  Validate CSV only, no chain writes
-#   --admin-key <path>         Path to admin Stellar key
+#   --admin-key <path>         Path to admin Stellar key (required for live import)
 #   --start-row <N>            Start importing at CSV row N (header=1)
 #   --end-row <N>              Stop importing at CSV row N
 #   --skip-asset-registration  Skip asset registration (assets already on-chain)
@@ -21,11 +21,22 @@
 #   asset_serial_number,asset_type,metadata,engineer_name,engineer_address,
 #   task_type,timestamp,notes
 #
+# Historical timestamps:
+#   The Lifecycle contract records the ledger timestamp when
+#   submit_maintenance is invoked; it has no parameter for a historical
+#   time.  The CSV `timestamp` column is therefore validated (not in the
+#   future) but the on-chain record will carry the import time.  Keep the
+#   original CSV as the authoritative historical record.
+#
 # Environment variables:
 #   CONTRACT_ASSET_REGISTRY     - Asset Registry contract ID
 #   CONTRACT_LIFECYCLE          - Lifecycle contract ID
 #   STELLAR_NETWORK             - Stellar network
 #   STELLAR_RPC_URL             - Stellar RPC endpoint
+#   EXPECTED_ADMIN_ADDRESS      - Expected admin address (optional; when set,
+#                                 the derived --admin-key address must match)
+#   ADMIN_IDENTITY              - Stellar CLI identity name for the admin key
+#                                 (default: mainstay-admin)
 # =============================================================================
 
 set -euo pipefail
@@ -49,6 +60,10 @@ START_ROW=2    # Row 1 is header
 END_ROW=""
 BATCH_SIZE=50
 CSV_FILE=""
+ADMIN_IDENTITY="${ADMIN_IDENTITY:-mainstay-admin}"
+ADMIN_ADDRESS=""
+# Serial number -> asset_id map, populated during registration / lookup.
+declare -A ASSET_IDS=()
 
 usage() {
     cat <<EOF
@@ -56,7 +71,7 @@ Usage: $0 <csv_file> [options]
 
 Options:
   --dry-run                  Validate CSV only (no chain writes)
-  --admin-key <path>         Path to admin Stellar key file
+  --admin-key <path>         Path to admin Stellar key file (required for live import)
   --start-row <N>            Import starting at row N (default: 2, skips header)
   --end-row <N>              Import ending at row N (default: all rows)
   --skip-asset-registration  Skip registering assets (if already on-chain)
@@ -66,6 +81,8 @@ Environment:
   CONTRACT_ASSET_REGISTRY     Asset Registry contract ID
   CONTRACT_LIFECYCLE          Lifecycle contract ID
   STELLAR_NETWORK             Stellar network (testnet/mainnet)
+  EXPECTED_ADMIN_ADDRESS      Expected admin address (optional check)
+  ADMIN_IDENTITY              Stellar CLI identity name (default: mainstay-admin)
 
 EOF
     exit 1
@@ -107,6 +124,11 @@ if [[ "$DRY_RUN" != "true" && -z "$ADMIN_KEY_PATH" ]]; then
     exit 1
 fi
 
+if [[ "$DRY_RUN" != "true" && ! -f "$ADMIN_KEY_PATH" ]]; then
+    echo "ERROR: admin key file not found: $ADMIN_KEY_PATH" >&2
+    exit 1
+fi
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -114,6 +136,52 @@ fi
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 warn() { echo "[$(date -u +%H:%M:%S)] WARNING: $*" >&2; }
 err() { echo "[$(date -u +%H:%M:%S)] ERROR: $*" >&2; }
+
+# Map a CSV task_type to a contract Priority variant.
+task_type_to_priority() {
+    case "$1" in
+        OIL_CHG|LUBE|FILTER) echo "Low" ;;
+        INSPECT|TUNE_UP) echo "Medium" ;;
+        BRAKE|ENGINE) echo "High" ;;
+        OVERHAUL|REBUILD) echo "Critical" ;;
+        *) echo "Low" ;;
+    esac
+}
+
+# Import the admin key as an explicit Stellar CLI identity and verify it.
+setup_admin_identity() {
+    if [[ "$DRY_RUN" == "true" ]]; then
+        return 0
+    fi
+
+    log "Importing admin key as identity '$ADMIN_IDENTITY'..."
+    local secret
+    secret="$(tr -d '[:space:]' < "$ADMIN_KEY_PATH")"
+    if [[ -z "$secret" ]]; then
+        err "Admin key file is empty: $ADMIN_KEY_PATH"
+        exit 1
+    fi
+
+    # Remove any stale identity with the same name, then import the key.
+    stellar keys remove "$ADMIN_IDENTITY" >/dev/null 2>&1 || true
+    if ! stellar keys add "$ADMIN_IDENTITY" --secret-key "$secret" >/dev/null 2>&1; then
+        err "Failed to import admin key as identity '$ADMIN_IDENTITY'."
+        exit 1
+    fi
+
+    ADMIN_ADDRESS="$(stellar keys address "$ADMIN_IDENTITY" 2>/dev/null || true)"
+    if [[ -z "$ADMIN_ADDRESS" ]]; then
+        err "Could not derive address for identity '$ADMIN_IDENTITY'."
+        exit 1
+    fi
+
+    if [[ -n "${EXPECTED_ADMIN_ADDRESS:-}" && "$ADMIN_ADDRESS" != "$EXPECTED_ADMIN_ADDRESS" ]]; then
+        err "Admin address mismatch: derived $ADMIN_ADDRESS, expected $EXPECTED_ADMIN_ADDRESS."
+        exit 1
+    fi
+
+    log "Admin identity ready: $ADMIN_ADDRESS"
+}
 
 read_csv_field() {
     local row="$1"
@@ -254,15 +322,26 @@ register_assets_from_csv() {
         # Check if already registered
         # (In a full implementation, we'd query the chain first)
         if [[ "$DRY_RUN" != "true" ]]; then
-            stellar contract invoke \
+            local out
+            if out="$(stellar contract invoke \
                 --id "$CONTRACT_ASSET_REGISTRY" \
                 --network "$STELLAR_NETWORK" \
+                --source "$ADMIN_IDENTITY" \
                 -- register_asset \
                 --asset_type "$asset_type" \
                 --metadata "$metadata" \
                 --serial_number "$sn" \
-                --owner "$(stellar keys address admin 2>/dev/null || echo '')" \
-                2>/dev/null && registered=$((registered + 1)) || skipped=$((skipped + 1))
+                --owner "$ADMIN_ADDRESS" 2>&1)"; then
+                registered=$((registered + 1))
+                local asset_id
+                asset_id="$(printf '%s\n' "$out" | tr -d '"[:space:]')"
+                if [[ -n "$asset_id" ]]; then
+                    ASSET_IDS["$sn"]="$asset_id"
+                fi
+            else
+                warn "Row $row: asset registration failed: $(printf '%s\n' "$out" | head -1)"
+                skipped=$((skipped + 1))
+            fi
         else
             log "[DRY RUN] Would register asset: type=$asset_type, sn=$sn"
             registered=$((registered + 1))
@@ -272,6 +351,28 @@ register_assets_from_csv() {
     log "Asset registration: $registered registered, $skipped skipped"
 }
 
+# Resolve a serial number to an on-chain asset_id.
+resolve_asset_id() {
+    local sn="$1"
+    if [[ -n "${ASSET_IDS[$sn]:-}" ]]; then
+        echo "${ASSET_IDS[$sn]}"
+        return 0
+    fi
+    local asset_id
+    asset_id="$(stellar contract invoke \
+        --id "$CONTRACT_ASSET_REGISTRY" \
+        --network "$STELLAR_NETWORK" \
+        --source "$ADMIN_IDENTITY" \
+        -- get_asset_by_serial \
+        --serial_number "$sn" 2>/dev/null | tr -d '"[:space:]')" || true
+    if [[ -n "$asset_id" ]]; then
+        ASSET_IDS["$sn"]="$asset_id"
+        echo "$asset_id"
+        return 0
+    fi
+    return 1
+}
+
 # ---------------------------------------------------------------------------
 # Maintenance Import
 # ---------------------------------------------------------------------------
@@ -279,46 +380,91 @@ register_assets_from_csv() {
 import_maintenance_records() {
     local end
     end="${END_ROW:-$(total_rows)}"
-    log "Importing maintenance records..."
+    log "Importing maintenance records (batch size: $BATCH_SIZE)..."
 
     local imported=0
     local skipped=0
     local failed=0
+    local batch_count=0
 
+    local -a batch_rows=()
+
+    submit_batch() {
+        local -a rows=("$@")
+        if [[ "${#rows[@]}" -eq 0 ]]; then
+            return 0
+        fi
+        batch_count=$((batch_count + 1))
+        log "Submitting batch $batch_count (${#rows[@]} record(s))..."
+
+        local row
+        for row in "${rows[@]}"; do
+            local sn eng_addr task_type ts notes
+            sn="$(read_csv_field "$row" 1)"
+            eng_addr="$(read_csv_field "$row" 5)"
+            task_type="$(read_csv_field "$row" 6)"
+            ts="$(read_csv_field "$row" 7)"
+            notes="$(read_csv_field "$row" 8)"
+
+            if [[ -z "$sn" || -z "$eng_addr" || -z "$task_type" || -z "$ts" ]]; then
+                skipped=$((skipped + 1))
+                continue
+            fi
+
+            local priority fee
+            priority="$(task_type_to_priority "$task_type")"
+            fee="${MAINTENANCE_FEE:-0}"
+
+            if [[ "$DRY_RUN" != "true" ]]; then
+                local asset_id
+                if ! asset_id="$(resolve_asset_id "$sn")"; then
+                    warn "Row $row: could not resolve asset_id for serial '$sn'"
+                    failed=$((failed + 1))
+                    continue
+                fi
+
+                local out
+                if out="$(stellar contract invoke \
+                    --id "$CONTRACT_LIFECYCLE" \
+                    --network "$STELLAR_NETWORK" \
+                    --source "$ADMIN_IDENTITY" \
+                    -- submit_maintenance \
+                    --asset_id "$asset_id" \
+                    --engineer "$eng_addr" \
+                    --task_type "$task_type" \
+                    --priority "$priority" \
+                    --fee "$fee" \
+                    --notes "${notes:-Imported from paper records}" 2>&1)"; then
+                    imported=$((imported + 1))
+                else
+                    failed=$((failed + 1))
+                    err "Row $row: submit_maintenance failed: $(printf '%s\n' "$out" | head -1)"
+                fi
+            else
+                log "[DRY RUN] Would submit: sn=$sn, engineer=$eng_addr, task=$task_type, priority=$priority, fee=$fee, ts=$ts"
+                imported=$((imported + 1))
+            fi
+        done
+    }
+
+    local row
     for (( row=START_ROW; row<=end; row++ )); do
-        local eng_addr task_type ts notes
-        eng_addr="$(read_csv_field "$row" 5)"
-        task_type="$(read_csv_field "$row" 6)"
-        ts="$(read_csv_field "$row" 7)"
-        notes="$(read_csv_field "$row" 8)"
-
-        if [[ -z "$eng_addr" || -z "$task_type" || -z "$ts" ]]; then
-            skipped=$((skipped + 1))
+        local line
+        line="$(sed -n "${row}p" "$CSV_FILE")"
+        if [[ -z "${line:-}" || "$line" =~ ^[[:space:]]*$ ]]; then
             continue
         fi
-
-        if [[ "$DRY_RUN" != "true" ]]; then
-            # Note: Full implementation requires asset_id lookup and per-engineer
-            # authorization.  This is a scaffold that operators extend.
-            if stellar contract invoke \
-                --id "$CONTRACT_LIFECYCLE" \
-                --network "$STELLAR_NETWORK" \
-                -- submit_maintenance \
-                --engineer "$eng_addr" \
-                --task_type "$task_type" \
-                --notes "${notes:-Imported from paper records}" \
-                2>/dev/null; then
-                imported=$((imported + 1))
-            else
-                failed=$((failed + 1))
-            fi
-        else
-            log "[DRY RUN] Would submit: engineer=$eng_addr, task=$task_type, ts=$ts"
-            imported=$((imported + 1))
+        batch_rows+=("$row")
+        if [[ "${#batch_rows[@]}" -ge "$BATCH_SIZE" ]]; then
+            submit_batch "${batch_rows[@]}"
+            batch_rows=()
         fi
     done
+    if [[ "${#batch_rows[@]}" -gt 0 ]]; then
+        submit_batch "${batch_rows[@]}"
+    fi
 
-    log "Maintenance import: $imported imported, $skipped skipped, $failed failed"
+    log "Maintenance import: $imported imported, $skipped skipped, $failed failed ($batch_count batch(es))"
 }
 
 # ---------------------------------------------------------------------------
@@ -362,17 +508,20 @@ main() {
     # 2. Validate all rows
     run_validation
 
-    # 3. Register assets
+    # 3. Set up the admin signing identity (live imports only)
+    setup_admin_identity
+
+    # 4. Register assets
     if [[ "$SKIP_ASSET_REG" != "true" ]]; then
         register_assets_from_csv
     else
         log "Skipping asset registration (--skip-asset-registration)"
     fi
 
-    # 4. Import maintenance records
+    # 5. Import maintenance records
     import_maintenance_records
 
-    # 5. Print summary
+    # 6. Print summary
     generate_report
 }
 

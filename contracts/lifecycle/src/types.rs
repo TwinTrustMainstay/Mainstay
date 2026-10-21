@@ -37,7 +37,15 @@ pub struct MaintenanceRecord {
     pub priority: Priority,
     pub notes: String,
     pub engineer: Address,
+    /// Ledger timestamp at which this record was written on-chain.
     pub timestamp: u64,
+    /// Historical timestamp of when the maintenance work actually took place,
+    /// as supplied by the submitter (e.g. imported from an off-chain log).
+    ///
+    /// This may differ from `timestamp` (the ledger time of submission) for
+    /// back-filled or batch-imported records. `None` means the work is assumed
+    /// to have occurred at `timestamp`.
+    pub recorded_at: Option<u64>,
     /// Maintenance cost in stroops (1 stroop = 10^-7 XLM).
     /// `None` indicates no cost was recorded for this maintenance event.
     pub cost: Option<u64>,
