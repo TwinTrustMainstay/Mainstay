@@ -217,6 +217,33 @@ resource "aws_sns_topic_subscription" "cache_invalidation_ap" {
   endpoint  = aws_sqs_queue.cache_invalidation["ap-southeast-1"].arn
 }
 
+# Allow the us-east-1 SNS topic to deliver messages to each regional queue.
+# Without these policies SNS cannot enqueue cross-region messages.
+resource "aws_sqs_queue_policy" "cache_invalidation" {
+  for_each = var.regions
+
+  provider  = aws.eu_west_1
+  queue_url = aws_sqs_queue.cache_invalidation[each.key].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "AllowSnsSendMessage"
+        Effect    = "Allow"
+        Principal = { Service = "sns.amazonaws.com" }
+        Action    = "sqs:SendMessage"
+        Resource  = aws_sqs_queue.cache_invalidation[each.key].arn
+        Condition = {
+          StringEquals = {
+            "aws:SourceArn" = aws_sns_topic.cache_invalidation.arn
+          }
+        }
+      }
+    ]
+  })
+}
+
 # ── Per-region API server modules ───────────────────────────
 # Each region uses a separate module block because Terraform
 # requires explicit provider aliases (for_each can't dynamically

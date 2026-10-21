@@ -85,6 +85,16 @@ variable "request_retention_seconds" {
   default     = 604800
 }
 
+variable "image_tag" {
+  description = "Immutable container image tag or digest for the API server (e.g. sha256:<digest> or v1.2.3). Mutable tags such as 'latest' are rejected."
+  type        = string
+
+  validation {
+    condition     = var.image_tag != "latest" && !endswith(var.image_tag, ":latest")
+    error_message = "image_tag must be an immutable tag or digest; 'latest' is not allowed."
+  }
+}
+
 # ── SQS queues for cross-region cache invalidation ──────────
 resource "aws_sqs_queue" "cache_invalidation" {
   for_each = var.regions

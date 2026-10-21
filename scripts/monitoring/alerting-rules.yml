@@ -131,6 +131,22 @@ groups:
             The number of registered engineers has decreased over the past day.
             This may indicate mass credential revocations or data issues.
 
+      # --- DSAR Queue Health ---
+
+      - alert: MainstayDsarDlqNotEmpty
+        expr: mainstay_dsar_dlq_depth > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DSAR dead-letter queue is not empty"
+          description: >
+            One or more data-subject requests have been moved to the DSAR
+            dead-letter queue after exceeding maxReceiveCount. These requests
+            are no longer being retried and require manual investigation.
+            Inspect the DLQ messages, fix the underlying processing failure,
+            then replay them to the main queue (see docs/runbooks/dsar-dlq.md).
+
       # --- Data Freshness ---
 
       - alert: StaleMetrics
