@@ -63,9 +63,6 @@ load_env_file() {
 }
 
 load_env_file "$ROOT/.env"
-=======
-
-: "${STELLAR_NETWORK:=testnet}"
 : "${AWS_DEFAULT_REGION:=us-east-1}"
 
 DRY_RUN=false

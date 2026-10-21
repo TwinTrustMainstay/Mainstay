@@ -135,7 +135,7 @@ Set in `.env` or export before running:
 ```bash
 # Stellar
 export STELLAR_NETWORK=mainnet
-export STELLAR_RPC_URL=https://mainnet.sorobanrpc.com
+source scripts/load-network-config.sh
 
 # Contracts
 export CONTRACT_ASSET_REGISTRY=<asset-registry-contract-id>

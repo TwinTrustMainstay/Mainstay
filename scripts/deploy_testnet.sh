@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
 source ~/.cargo/env 2>/dev/null || true
 # Strict .env loader: only accepts KEY=value lines matching a strict regex.
 # Never executes .env contents as shell code.

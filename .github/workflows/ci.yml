@@ -90,6 +90,9 @@ jobs:
           printf '  %s\n' "${files[@]}"
           shellcheck "${files[@]}"
 
+      - name: Compile benchmark targets
+        run: cargo check --workspace --benches
+
   docs:
     name: Validate error reference docs
     runs-on: ubuntu-latest

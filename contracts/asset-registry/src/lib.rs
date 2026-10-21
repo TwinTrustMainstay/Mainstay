@@ -3970,6 +3970,8 @@ mod tests {
     use engineer_registry;
     use lifecycle;
 
+    mod ttl_tests;
+
     fn unique_serial(env: &Env) -> String {
         use core::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(1);

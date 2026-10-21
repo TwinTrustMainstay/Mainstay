@@ -110,21 +110,23 @@ cp .env.example .env
 Configure your environment variables in `.env`:
 
 ```bash
-# Network configuration
+# Select a network; RPC settings are loaded from environments.toml.
 STELLAR_NETWORK=testnet
-STELLAR_RPC_URL=https://soroban-testnet.stellar.org
 
 # Contract addresses (after deployment)
 CONTRACT_ASSET_REGISTRY=<your-contract-id>
 CONTRACT_ENGINEER_REGISTRY=<your-contract-id>
 CONTRACT_LIFECYCLE=<your-contract-id>
 
-# Frontend configuration
+# Optional frontend network selection
 VITE_STELLAR_NETWORK=testnet
-VITE_STELLAR_RPC_URL=https://soroban-testnet.stellar.org
 ```
 
-Network configurations are defined in `environments.toml`:
+Scripts load the selected network's RPC URL and passphrase from
+`environments.toml`. Choose a different network by changing `STELLAR_NETWORK`;
+set `STELLAR_RPC_URL` explicitly only to override the configured endpoint.
+The example environment file also lists the backup and monitoring variables
+used by the scripts.
 
 - `testnet` — Stellar testnet
 - `staging` — Pre-production validation (testnet RPC, canary-gated rollouts)
@@ -136,6 +138,14 @@ Network configurations are defined in `environments.toml`:
 Each environment carries limits, timeouts, rate, logging, and canary settings.
 See [Operations Infrastructure](docs/operations-infrastructure.md) for validation,
 promotion diffs, and the audit trail.
+
+Terraform network inputs are generated from the same file before planning:
+
+```bash
+python3 scripts/export-network-config.py --format terraform mainnet \
+  > terraform/network.auto.tfvars.json
+terraform -chdir=terraform plan
+```
 
 ### Deploy to Testnet
 

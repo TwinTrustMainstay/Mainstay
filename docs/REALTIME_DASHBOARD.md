@@ -10,7 +10,7 @@ can update asset health, maintenance, transfer, and critical-maintenance views
 without repeatedly rebuilding a report.
 
 ```bash
-export STELLAR_RPC_URL=https://soroban-testnet.stellar.org
+source scripts/load-network-config.sh
 export CONTRACT_LIFECYCLE=<lifecycle-contract-id>
 POLL_SECONDS=3 ./scripts/stream-events.sh | jq --unbuffered \
   'select(.topics[0].sym == "MAINT" or .topics[0].sym == "CRIT_MNT")'

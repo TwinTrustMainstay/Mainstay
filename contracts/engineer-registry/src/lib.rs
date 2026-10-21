@@ -2519,6 +2519,8 @@ mod tests {
         BytesN, Env, IntoVal, Symbol,
     };
 
+    mod ttl_tests;
+
     fn setup<'a>(env: &'a Env) -> (EngineerRegistryClient<'a>, Address) {
         let contract_id = env.register(EngineerRegistry, ());
         let client = EngineerRegistryClient::new(env, &contract_id);
