@@ -108,6 +108,18 @@ resource "aws_security_group" "alb" {
     description = "HTTP (redirect to HTTPS)"
   }
 
+  # #1813: defining a security group with explicit ingress/egress blocks
+  # makes Terraform remove AWS's default allow-all egress rule. Without
+  # this, the ALB cannot open connections to its targets and forwarding
+  # fails entirely.
+  egress {
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [aws_security_group.api.id]
+    description     = "Forward to API targets (nginx)"
+  }
+
   tags = { Name = "mainstay-alb-sg-${var.region}" }
 }
 
@@ -130,10 +142,13 @@ resource "aws_security_group_rule" "api_from_alb" {
   type                     = "ingress"
   security_group_id        = aws_security_group.api.id
   source_security_group_id = aws_security_group.alb.id
-  from_port                = 8080
-  to_port                  = 8080
+  from_port                = 80
+  to_port                  = 80
   protocol                 = "tcp"
-  description              = "HTTP only from the ALB"
+  # #1812: the ALB targets nginx (port 80) so rate limiting, security
+  # headers, CORS and the /metrics ACL actually apply. The API container
+  # itself is bound to loopback only and is not reachable from the ALB.
+  description = "HTTP to nginx only from the ALB"
 }
 
 resource "aws_security_group_rule" "api_metrics_from_prometheus" {
@@ -248,6 +263,14 @@ resource "aws_iam_instance_profile" "api" {
   role = aws_iam_role.api.name
 }
 
+# #1815: user_data.sh starts amazon-cloudwatch-agent, which ships nginx
+# logs and host metrics, but no policy granted PutLogEvents/PutMetricData,
+# so the agent's calls were silently denied.
+resource "aws_iam_role_policy_attachment" "api_cloudwatch_agent" {
+  role       = aws_iam_role.api.name
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+}
+
 # ── Application Load Balancer ──────────────────────────────
 resource "aws_lb" "api" {
   name               = "mainstay-api-${replace(var.region, "-", "")}"
@@ -261,7 +284,10 @@ resource "aws_lb" "api" {
 
 resource "aws_lb_target_group" "api" {
   name     = "mainstay-tg-${substr(replace(var.region, "-", ""), 0, 10)}"
-  port     = 8080
+  # #1812: target nginx (80), not the API container directly, so the ALB
+  # traffic actually goes through nginx's rate limiting, security headers,
+  # CORS policy and /metrics ACL.
+  port     = 80
   protocol = "HTTP"
   vpc_id   = aws_vpc.main.id
 
@@ -388,6 +414,11 @@ resource "aws_launch_template" "api" {
   metadata_options {
     http_tokens   = "required"
     http_endpoint = "enabled"
+    # #1814: the API runs in a Docker bridge container, one network hop
+    # beyond the host. The default hop limit of 1 blocks IMDSv2 token
+    # requests made from inside the container, so the AWS SDK default
+    # credential chain (used for DynamoDB/SQS calls) would time out.
+    http_put_response_hop_limit = 2
   }
 
   tag_specifications {
