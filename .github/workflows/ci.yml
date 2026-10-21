@@ -39,6 +39,26 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace
 
+  # ── Operations tooling (#1726-#1729) ─────────────────────────
+  #
+  # Stdlib-only Python tooling under scripts/ops: environment config
+  # validation, state snapshots, canary rollout, and structured logging.
+  ops-tooling:
+    name: Ops tooling tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s scripts/ops/tests -t . -v
+
+      - name: Validate every environment in environments.toml
+        run: python3 -m scripts.ops.config validate --env all
+
   docs:
     name: Validate error reference docs
     runs-on: ubuntu-latest

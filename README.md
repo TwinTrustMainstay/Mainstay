@@ -127,9 +127,15 @@ VITE_STELLAR_RPC_URL=https://soroban-testnet.stellar.org
 Network configurations are defined in `environments.toml`:
 
 - `testnet` — Stellar testnet
+- `staging` — Pre-production validation (testnet RPC, canary-gated rollouts)
 - `mainnet` — Stellar mainnet
 - `futurenet` — Stellar futurenet
-- `standalone` — Local development
+- `dev` — Local development (localhost RPC)
+- `standalone` — Local standalone network
+
+Each environment carries limits, timeouts, rate, logging, and canary settings.
+See [Operations Infrastructure](docs/operations-infrastructure.md) for validation,
+promotion diffs, and the audit trail.
 
 ### Deploy to Testnet
 

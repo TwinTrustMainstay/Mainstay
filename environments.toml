@@ -1,15 +1,179 @@
+# Environment-specific configuration for Mainstay operations tooling.
+#
+# Every environment MUST define the full schema below. The loader in
+# scripts/ops/config.py validates it, and CI (job `ops-tooling`) validates
+# every environment on each push.
+#
+#   rpc_url, network_passphrase
+#   [<env>.limits]    max_fee_stroops, max_batch_size
+#   [<env>.timeouts]  rpc_timeout_secs, tx_timeout_secs
+#   [<env>.rates]     max_requests_per_minute, max_submissions_per_hour
+#   [<env>.logging]   level, retention_days
+#   [<env>.canary]    stages, max_error_rate, max_p95_latency_ms,
+#                     min_samples, observe_secs
+#
+# Promotion: `python3 -m scripts.ops.config diff --from staging --to mainnet`
+# shows exactly which values differ before a change is promoted.
+
+[dev]
+rpc_url = "http://localhost:8000/soroban/rpc"
+network_passphrase = "Standalone Network ; February 2017"
+
+[dev.limits]
+max_fee_stroops = 1000000
+max_batch_size = 10
+
+[dev.timeouts]
+rpc_timeout_secs = 30
+tx_timeout_secs = 60
+
+[dev.rates]
+# 0 disables submission rate limiting. Allowed for dev only.
+max_requests_per_minute = 600
+max_submissions_per_hour = 0
+
+[dev.logging]
+level = "DEBUG"
+retention_days = 7
+
+[dev.canary]
+stages = [100]
+max_error_rate = 0.5
+max_p95_latency_ms = 5000
+min_samples = 1
+observe_secs = 0
+
+[staging]
+rpc_url = "https://soroban-testnet.stellar.org"
+network_passphrase = "Test SDF Network ; September 2015"
+
+[staging.limits]
+max_fee_stroops = 10000000
+max_batch_size = 25
+
+[staging.timeouts]
+rpc_timeout_secs = 30
+tx_timeout_secs = 120
+
+[staging.rates]
+max_requests_per_minute = 120
+max_submissions_per_hour = 20
+
+[staging.logging]
+level = "INFO"
+retention_days = 14
+
+[staging.canary]
+stages = [5, 25, 50, 100]
+max_error_rate = 0.02
+max_p95_latency_ms = 3000
+min_samples = 20
+observe_secs = 300
+
 [testnet]
 rpc_url = "https://soroban-testnet.stellar.org"
 network_passphrase = "Test SDF Network ; September 2015"
+
+[testnet.limits]
+max_fee_stroops = 10000000
+max_batch_size = 25
+
+[testnet.timeouts]
+rpc_timeout_secs = 30
+tx_timeout_secs = 120
+
+[testnet.rates]
+max_requests_per_minute = 120
+max_submissions_per_hour = 20
+
+[testnet.logging]
+level = "INFO"
+retention_days = 30
+
+[testnet.canary]
+stages = [5, 25, 50, 100]
+max_error_rate = 0.02
+max_p95_latency_ms = 3000
+min_samples = 50
+observe_secs = 600
 
 [mainnet]
 rpc_url = "https://mainnet.sorobanrpc.com"
 network_passphrase = "Public Global Stellar Network ; September 2015"
 
+[mainnet.limits]
+max_fee_stroops = 10000000
+max_batch_size = 25
+
+[mainnet.timeouts]
+rpc_timeout_secs = 20
+tx_timeout_secs = 120
+
+[mainnet.rates]
+max_requests_per_minute = 60
+max_submissions_per_hour = 20
+
+[mainnet.logging]
+level = "INFO"
+retention_days = 365
+
+[mainnet.canary]
+stages = [1, 5, 25, 50, 100]
+max_error_rate = 0.01
+max_p95_latency_ms = 2000
+min_samples = 100
+observe_secs = 900
+
 [futurenet]
 rpc_url = "https://rpc-futurenet.stellar.org"
 network_passphrase = "Test SDF Future Network ; October 2022"
 
+[futurenet.limits]
+max_fee_stroops = 10000000
+max_batch_size = 25
+
+[futurenet.timeouts]
+rpc_timeout_secs = 30
+tx_timeout_secs = 120
+
+[futurenet.rates]
+max_requests_per_minute = 120
+max_submissions_per_hour = 20
+
+[futurenet.logging]
+level = "INFO"
+retention_days = 14
+
+[futurenet.canary]
+stages = [5, 25, 50, 100]
+max_error_rate = 0.02
+max_p95_latency_ms = 3000
+min_samples = 20
+observe_secs = 300
+
 [standalone]
 rpc_url = "http://localhost:8000/soroban/rpc"
 network_passphrase = "Standalone Network ; February 2017"
+
+[standalone.limits]
+max_fee_stroops = 1000000
+max_batch_size = 10
+
+[standalone.timeouts]
+rpc_timeout_secs = 30
+tx_timeout_secs = 60
+
+[standalone.rates]
+max_requests_per_minute = 600
+max_submissions_per_hour = 0
+
+[standalone.logging]
+level = "DEBUG"
+retention_days = 7
+
+[standalone.canary]
+stages = [100]
+max_error_rate = 0.5
+max_p95_latency_ms = 5000
+min_samples = 1
+observe_secs = 0
