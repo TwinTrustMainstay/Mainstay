@@ -272,6 +272,7 @@ const TOKEN_KEY: soroban_sdk::Symbol = symbol_short!("TOKEN");
 const SLASH_BAL: soroban_sdk::Symbol = symbol_short!("SL_BAL");
 #[allow(dead_code)]
 const CONFIG_KEY: soroban_sdk::Symbol = symbol_short!("CONFIG");
+const BASE_MAX_LTV_KEY: soroban_sdk::Symbol = symbol_short!("BASE_LTV");
 const PAUSED_KEY: soroban_sdk::Symbol = symbol_short!("PAUSED");
 const SLASH_BPS_KEY: soroban_sdk::Symbol = symbol_short!("SL_BPS");
 const LOAN_DURATION_KEY: soroban_sdk::Symbol = symbol_short!("LOAN_DUR");
@@ -462,6 +463,7 @@ fn get_config(env: &Env) -> Config {
         .unwrap_or(Config {
             yield_bps: 200,
             slash_bps: 5000,
+            max_ltv_bps: 0,
         })
 }
 
@@ -1173,6 +1175,10 @@ impl LendingContract {
         config.max_ltv_bps = max_ltv_bps;
         env.storage().persistent().set(&CONFIG_KEY, &config);
         extend_persistent_ttl(&env, &CONFIG_KEY);
+        env.storage()
+            .persistent()
+            .set(&BASE_MAX_LTV_KEY, &max_ltv_bps);
+        extend_persistent_ttl(&env, &BASE_MAX_LTV_KEY);
     }
 
     /// Returns the credit score for a borrower based on their repayment/default history.
@@ -1334,7 +1340,8 @@ impl LendingContract {
 
     /// Adjust LTV based on current market conditions (volatility).
     /// Reduces LTV when volatility is elevated to manage risk.
-    pub fn adjust_ltv_for_conditions(env: Env) -> u32 {
+    pub fn adjust_ltv_for_conditions(env: Env, admin: Address) -> u32 {
+        require_admin(&env, &admin);
         let market: Option<MarketCondition> = env.storage().persistent().get(&MARKET_ORACLE_KEY);
 
         let volatility = if let Some(m) = market {
@@ -1345,12 +1352,28 @@ impl LendingContract {
 
         let mut config = get_config(&env);
         let original_ltv = config.max_ltv_bps;
+        let base_ltv: u32 = if let Some(base_ltv) = env
+            .storage()
+            .persistent()
+            .get(&BASE_MAX_LTV_KEY)
+        {
+            base_ltv
+        } else {
+            env.storage()
+                .persistent()
+                .set(&BASE_MAX_LTV_KEY, &original_ltv);
+            extend_persistent_ttl(&env, &BASE_MAX_LTV_KEY);
+            original_ltv
+        };
 
-        // Reduce LTV when volatility exceeds 30 bps
+        // Reduce LTV when volatility exceeds 3000 bps
         if volatility > 3000 {
             // Reduce by 10% for every 1000 bps of volatility above 3000
-            let reduction_factor = ((volatility - 3000) / 1000).min(5000);
-            config.max_ltv_bps = original_ltv.saturating_sub(((original_ltv as u64 * reduction_factor) / 10000) as u32);
+            let reduction_bps = (((volatility - 3000) / 1000) * 1000).min(5000);
+            config.max_ltv_bps =
+                base_ltv.saturating_sub(((base_ltv as u64 * reduction_bps as u64) / 10000) as u32);
+        } else {
+            config.max_ltv_bps = base_ltv;
         }
 
         env.storage().persistent().set(&CONFIG_KEY, &config);
@@ -1364,9 +1387,18 @@ impl LendingContract {
             volatility,
         };
 
-        let loan_counter: u64 = env.storage().persistent().get(&symbol_short!("L_COUNT")).unwrap_or(0);
-        env.storage().persistent().set(&ltv_history_key(loan_counter), &history);
-        extend_persistent_ttl(&env, &ltv_history_key(loan_counter));
+        let history_index: u64 = env
+            .storage()
+            .persistent()
+            .get(&symbol_short!("LTV_CNT"))
+            .unwrap_or(0);
+        let history_key = ltv_history_key(history_index);
+        env.storage().persistent().set(&history_key, &history);
+        extend_persistent_ttl(&env, &history_key);
+        env.storage()
+            .persistent()
+            .set(&symbol_short!("LTV_CNT"), &(history_index + 1));
+        extend_persistent_ttl(&env, &symbol_short!("LTV_CNT"));
 
         // Emit event
         env.events().publish((LTV_ADJUSTED,), (original_ltv, config.max_ltv_bps, volatility));
@@ -1600,7 +1632,7 @@ impl LendingContract {
         require_not_paused(&env);
         lender.require_auth();
 
-        let insurance: InsuranceRecord = env
+        let mut insurance: InsuranceRecord = env
             .storage()
             .persistent()
             .get(&insurance_key(asset_id))
@@ -1617,6 +1649,24 @@ impl LendingContract {
 
         // Payout is capped at coverage amount
         let payout = loss_amount.min(insurance.coverage_amount);
+        insurance.coverage_amount -= payout;
+        env.storage()
+            .persistent()
+            .set(&insurance_key(asset_id), &insurance);
+        extend_persistent_ttl(&env, &insurance_key(asset_id));
+
+        if payout > 0 {
+            let token_addr = get_token(&env);
+            let tok = token::Client::new(&env, &token_addr);
+            if tok.balance(&env.current_contract_address()) < payout as i128 {
+                panic_with_error!(&env, ContractError::InsufficientFunds);
+            }
+            tok.transfer(
+                &env.current_contract_address(),
+                &lender,
+                &(payout as i128),
+            );
+        }
 
         let payout_record = InsurancePayout {
             asset_id,
