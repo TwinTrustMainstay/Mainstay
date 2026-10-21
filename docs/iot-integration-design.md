@@ -1,5 +1,7 @@
 # IoT Sensor Integration — Design Document (v2.0 Roadmap Item)
 
+> **Last updated:** 2026-08-29 · **Doc version:** 0.1.0
+
 **Status:** Draft — proposal for community and integrator feedback.
 **Target release:** v2.0 (see [docs/roadmap.md](roadmap.md)).
 

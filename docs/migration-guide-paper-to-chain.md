@@ -1,5 +1,7 @@
 # Migration Guide: Paper-to-Chain
 
+> **Last updated:** 2026-07-28 · **Doc version:** 0.1.0
+
 This guide helps asset owners migrate from paper or spreadsheet-based
 maintenance records to Mainstay's on-chain system.  It covers data cleaning,
 batch import, validation, and cost estimation.

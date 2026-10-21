@@ -57,6 +57,34 @@ variable "request_retention_seconds" {
   default     = 604800
 }
 
+variable "alb_subnet_cidrs" {
+  description = "CIDR blocks of the ALB subnets; nginx realip trusts only these when reading X-Forwarded-For"
+  type        = list(string)
+  default     = []
+}
+
+variable "prometheus_security_group_id" {
+  description = "Security group ID of the Prometheus host allowed to scrape the private metrics port"
+  type        = string
+  default     = ""
+}
+
+variable "metrics_port" {
+  description = "Private port on which the API serves Prometheus metrics (reachable only from the Prometheus host)"
+  type        = number
+  default     = 9100
+}
+
+variable "on_call_email" {
+  description = "On-call email address subscribed to API alarm notifications"
+  type        = string
+}
+
+variable "image_tag" {
+  description = "Immutable container image tag or digest (e.g. sha256:... or v1.2.3) for the API server image"
+  type        = string
+}
+
 # Data source for AZs in the region
 data "aws_availability_zones" "available" {
   state = "available"

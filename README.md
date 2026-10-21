@@ -110,26 +110,42 @@ cp .env.example .env
 Configure your environment variables in `.env`:
 
 ```bash
-# Network configuration
+# Select a network; RPC settings are loaded from environments.toml.
 STELLAR_NETWORK=testnet
-STELLAR_RPC_URL=https://soroban-testnet.stellar.org
 
 # Contract addresses (after deployment)
 CONTRACT_ASSET_REGISTRY=<your-contract-id>
 CONTRACT_ENGINEER_REGISTRY=<your-contract-id>
 CONTRACT_LIFECYCLE=<your-contract-id>
 
-# Frontend configuration
+# Optional frontend network selection
 VITE_STELLAR_NETWORK=testnet
-VITE_STELLAR_RPC_URL=https://soroban-testnet.stellar.org
 ```
 
-Network configurations are defined in `environments.toml`:
+Scripts load the selected network's RPC URL and passphrase from
+`environments.toml`. Choose a different network by changing `STELLAR_NETWORK`;
+set `STELLAR_RPC_URL` explicitly only to override the configured endpoint.
+The example environment file also lists the backup and monitoring variables
+used by the scripts.
 
 - `testnet` — Stellar testnet
+- `staging` — Pre-production validation (testnet RPC, canary-gated rollouts)
 - `mainnet` — Stellar mainnet
 - `futurenet` — Stellar futurenet
-- `standalone` — Local development
+- `dev` — Local development (localhost RPC)
+- `standalone` — Local standalone network
+
+Each environment carries limits, timeouts, rate, logging, and canary settings.
+See [Operations Infrastructure](docs/operations-infrastructure.md) for validation,
+promotion diffs, and the audit trail.
+
+Terraform network inputs are generated from the same file before planning:
+
+```bash
+python3 scripts/export-network-config.py --format terraform mainnet \
+  > terraform/network.auto.tfvars.json
+terraform -chdir=terraform plan
+```
 
 ### Deploy to Testnet
 
@@ -149,11 +165,15 @@ stellar keys generate deployer --network testnet
 ## 📖 Documentation
 
 - [Architecture Overview](docs/architecture.md)
-- [Life-Cycle Contract Design](docs/lifecycle-contract.md)
+- [Asset Lifecycle](docs/asset-lifecycle.md)
 - [Engineer Credentialing](docs/credentialing.md)
 - [Engineer Operations](docs/engineer-operations.md)
 - [Collateral Scoring Model](docs/collateral-scoring.md)
 - [Threat Model & Security](docs/threat-model.md)
+- [Data Model](docs/data-model.md)
+- [API Reference (OpenAPI, Swagger UI, curl)](docs/api/README.md)
+- [Performance Tuning Guide](docs/performance-tuning-guide.md)
+- [FAQ](docs/faq.md)
 - [Roadmap](docs/roadmap.md)
 
 ## 🎓 Smart Contract API
@@ -317,7 +337,7 @@ We welcome contributions! Please:
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
 
-See our [Code of Conduct](CODE_OF_CONDUCT.md) and [Contributing Guidelines](CONTRIBUTING.md).
+See our [Contributing Guidelines](CONTRIBUTING.md) for contribution instructions.
 
 ## 📄 License
 

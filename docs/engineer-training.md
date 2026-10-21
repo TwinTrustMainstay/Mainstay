@@ -1,5 +1,7 @@
 # Engineer Training Records
 
+> **Last updated:** 2026-07-28 · **Doc version:** 0.1.0
+
 This document describes the training record tracking system in Mainstay's engineer registry. Training records provide verifiable proof of continuing education and certification renewals for credentialed engineers.
 
 ## Overview

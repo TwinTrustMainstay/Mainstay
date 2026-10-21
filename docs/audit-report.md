@@ -1,5 +1,7 @@
 # Security Audit Report
 
+> **Last updated:** 2026-07-30 · **Doc version:** 0.1.0
+
 **Project:** Mainstay — Proof of Maintenance for Industrial Assets
 **Date:** TBD (post-audit)
 **Version:** 0.1.x

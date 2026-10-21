@@ -1,5 +1,7 @@
 # Developer Onboarding Guide
 
+> **Last updated:** 2026-09-26 · **Doc version:** 0.1.0
+
 Welcome to Mainstay! This guide will help you get up and running quickly. You'll learn how to set up the environment, run tests, deploy to testnet, and contribute effectively.
 
 **Time estimate:** 30-45 minutes for complete setup
@@ -320,7 +322,7 @@ Engineer Registry
 - **Architecture:** See [docs/architecture.md](./architecture.md) for system design
 - **ADRs:** See [docs/adr/README.md](./adr/README.md) for design decisions
 - **Deployment:** See [docs/deployment-runbook.md](./deployment-runbook.md) for testnet/mainnet procedures
-- **API Reference:** See [docs/api-reference.md](./api-reference.md) for contract functions
+- **Lifecycle Contract API:** See the [lifecycle contract source](../contracts/lifecycle/src/lib.rs) for contract functions
 
 ## Getting Help
 

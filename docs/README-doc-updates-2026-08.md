@@ -1,5 +1,7 @@
 # Documentation Update Summary (2026-08-29)
 
+> **Last updated:** 2026-08-29 · **Doc version:** 0.1.0
+
 This branch (`docs/q3-documentation-updates`) addresses four documentation gaps, one commit per issue.
 
 ## 1. `docs/credentialing.md` (Medium priority)

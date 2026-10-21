@@ -152,6 +152,47 @@ resource "aws_route53_record" "api_ap_southeast_1" {
   health_check_id = aws_route53_health_check.api_ap_southeast_1.id
 }
 
+# ── Backup bucket bootstrap ─────────────────────────────────
+# Versioning (and optionally Object Lock) must be enabled before
+# the first backup upload. This replaces the runtime best-effort
+# `put-bucket-versioning ... || true` call in backup.sh.
+resource "aws_s3_bucket" "backups" {
+  provider = aws.us_east_1
+  bucket   = var.backup_bucket_name
+
+  # Object Lock can only be enabled at bucket creation time.
+  object_lock_enabled = var.backup_object_lock_enabled
+
+  tags = {
+    Project = "Mainstay"
+    Purpose = "backups"
+  }
+}
+
+resource "aws_s3_bucket_versioning" "backups" {
+  provider = aws.us_east_1
+  bucket   = aws_s3_bucket.backups.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_object_lock_configuration" "backups" {
+  provider = aws.us_east_1
+  bucket   = aws_s3_bucket.backups.id
+  count    = var.backup_object_lock_enabled ? 1 : 0
+
+  rule {
+    default_retention {
+      mode = "GOVERNANCE"
+      days = var.backup_object_lock_retention_days
+    }
+  }
+
+  depends_on = [aws_s3_bucket_versioning.backups]
+}
+
 # ── SNS topic for cross-region cache invalidation ─────────────
 resource "aws_sns_topic" "cache_invalidation" {
   provider = aws.us_east_1
@@ -176,6 +217,33 @@ resource "aws_sns_topic_subscription" "cache_invalidation_ap" {
   endpoint  = aws_sqs_queue.cache_invalidation["ap-southeast-1"].arn
 }
 
+# Allow the us-east-1 SNS topic to deliver messages to each regional queue.
+# Without these policies SNS cannot enqueue cross-region messages.
+resource "aws_sqs_queue_policy" "cache_invalidation" {
+  for_each = var.regions
+
+  provider  = aws.eu_west_1
+  queue_url = aws_sqs_queue.cache_invalidation[each.key].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "AllowSnsSendMessage"
+        Effect    = "Allow"
+        Principal = { Service = "sns.amazonaws.com" }
+        Action    = "sqs:SendMessage"
+        Resource  = aws_sqs_queue.cache_invalidation[each.key].arn
+        Condition = {
+          StringEquals = {
+            "aws:SourceArn" = aws_sns_topic.cache_invalidation.arn
+          }
+        }
+      }
+    ]
+  })
+}
+
 # ── Per-region API server modules ───────────────────────────
 # Each region uses a separate module block because Terraform
 # requires explicit provider aliases (for_each can't dynamically
@@ -195,6 +263,7 @@ module "api_server_us_east_1" {
   allowed_origins     = var.allowed_origins
   log_retention_days  = var.log_retention_days
   request_retention_seconds = var.request_retention_seconds
+  on_call_email              = var.on_call_email
 
   providers = {
     aws = aws.us_east_1
@@ -215,6 +284,7 @@ module "api_server_eu_west_1" {
   allowed_origins     = var.allowed_origins
   log_retention_days  = var.log_retention_days
   request_retention_seconds = var.request_retention_seconds
+  on_call_email              = var.on_call_email
 
   providers = {
     aws = aws.eu_west_1
@@ -235,6 +305,7 @@ module "api_server_ap_southeast_1" {
   allowed_origins     = var.allowed_origins
   log_retention_days  = var.log_retention_days
   request_retention_seconds = var.request_retention_seconds
+  on_call_email              = var.on_call_email
 
   providers = {
     aws = aws.ap_southeast_1

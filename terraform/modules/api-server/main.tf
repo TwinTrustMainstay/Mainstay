@@ -108,6 +108,18 @@ resource "aws_security_group" "alb" {
     description = "HTTP (redirect to HTTPS)"
   }
 
+  # #1813: defining a security group with explicit ingress/egress blocks
+  # makes Terraform remove AWS's default allow-all egress rule. Without
+  # this, the ALB cannot open connections to its targets and forwarding
+  # fails entirely.
+  egress {
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [aws_security_group.api.id]
+    description     = "Forward to API targets (nginx)"
+  }
+
   tags = { Name = "mainstay-alb-sg-${var.region}" }
 }
 
@@ -130,10 +142,23 @@ resource "aws_security_group_rule" "api_from_alb" {
   type                     = "ingress"
   security_group_id        = aws_security_group.api.id
   source_security_group_id = aws_security_group.alb.id
-  from_port                = 8080
-  to_port                  = 8080
+  from_port                = 80
+  to_port                  = 80
   protocol                 = "tcp"
-  description              = "HTTP only from the ALB"
+  # #1812: the ALB targets nginx (port 80) so rate limiting, security
+  # headers, CORS and the /metrics ACL actually apply. The API container
+  # itself is bound to loopback only and is not reachable from the ALB.
+  description = "HTTP to nginx only from the ALB"
+}
+
+resource "aws_security_group_rule" "api_metrics_from_prometheus" {
+  type                     = "ingress"
+  security_group_id        = aws_security_group.api.id
+  source_security_group_id = var.prometheus_security_group_id
+  from_port                = var.metrics_port
+  to_port                  = var.metrics_port
+  protocol                 = "tcp"
+  description              = "Metrics scraping only from the Prometheus host"
 }
 
 # ── Data-subject request processing ─────────────────────────
@@ -186,12 +211,31 @@ resource "aws_cloudwatch_log_group" "nginx_error" {
   }
 }
 
+# Dead-letter queue: isolates DSAR messages that repeatedly fail processing
+# so they can be inspected and replayed instead of stalling the main queue.
+resource "aws_sqs_queue" "data_subject_requests_dlq" {
+  name                       = "mainstay-data-subject-requests-dlq-${var.region}"
+  message_retention_seconds  = var.request_retention_seconds
+  visibility_timeout_seconds = 300
+  sqs_managed_sse_enabled    = true
+
+  tags = {
+    Project = "Mainstay"
+    Region  = var.region
+  }
+}
+
 resource "aws_sqs_queue" "data_subject_requests" {
   name                       = "mainstay-data-subject-requests-${var.region}"
   message_retention_seconds = var.request_retention_seconds
   receive_wait_time_seconds = 20
   visibility_timeout_seconds = 300
   sqs_managed_sse_enabled   = true
+
+  redrive_policy = jsonencode({
+    deadLetterTargetArn = aws_sqs_queue.data_subject_requests_dlq.arn
+    maxReceiveCount     = 5
+  })
 
   tags = {
     Project = "Mainstay"
@@ -228,6 +272,11 @@ resource "aws_iam_role_policy" "api_privacy" {
         Effect   = "Allow"
         Action   = ["sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
         Resource = aws_sqs_queue.data_subject_requests.arn
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["sqs:SendMessage", "sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:GetQueueAttributes"]
+        Resource = aws_sqs_queue.data_subject_requests_dlq.arn
       }
     ]
   })
@@ -236,6 +285,14 @@ resource "aws_iam_role_policy" "api_privacy" {
 resource "aws_iam_instance_profile" "api" {
   name = "mainstay-api-${var.region}"
   role = aws_iam_role.api.name
+}
+
+# #1815: user_data.sh starts amazon-cloudwatch-agent, which ships nginx
+# logs and host metrics, but no policy granted PutLogEvents/PutMetricData,
+# so the agent's calls were silently denied.
+resource "aws_iam_role_policy_attachment" "api_cloudwatch_agent" {
+  role       = aws_iam_role.api.name
+  policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
 }
 
 # ── Application Load Balancer ──────────────────────────────
@@ -251,7 +308,10 @@ resource "aws_lb" "api" {
 
 resource "aws_lb_target_group" "api" {
   name     = "mainstay-tg-${substr(replace(var.region, "-", ""), 0, 10)}"
-  port     = 8080
+  # #1812: target nginx (80), not the API container directly, so the ALB
+  # traffic actually goes through nginx's rate limiting, security headers,
+  # CORS policy and /metrics ACL.
+  port     = 80
   protocol = "HTTP"
   vpc_id   = aws_vpc.main.id
 
@@ -285,6 +345,30 @@ resource "aws_lb_listener" "https" {
   }
 }
 
+# Deny /metrics at the ALB layer: never forwarded to the target group.
+resource "aws_lb_listener_rule" "deny_metrics" {
+  listener_arn = aws_lb_listener.https.arn
+  priority     = 1
+
+  action {
+    type = "fixed-response"
+
+    fixed_response {
+      content_type = "text/plain"
+      message_body = "Not Found"
+      status_code  = "404"
+    }
+  }
+
+  condition {
+    path_pattern {
+      values = ["/metrics", "/metrics/*"]
+    }
+  }
+
+  tags = { Name = "mainstay-deny-metrics-${var.region}" }
+}
+
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.api.arn
   port              = 80
@@ -296,24 +380,6 @@ resource "aws_lb_listener" "http" {
       protocol    = "HTTPS"
       port        = "443"
       status_code = "HTTP_301"
-    }
-
-    resource "aws_iam_role" "api" {
-      name = "mainstay-api-${var.region}"
-
-      assume_role_policy = jsonencode({
-        Version = "2012-10-17"
-        Statement = [{
-          Effect    = "Allow"
-          Principal = { Service = "ec2.amazonaws.com" }
-          Action    = "sts:AssumeRole"
-        }]
-      })
-    }
-
-    resource "aws_iam_instance_profile" "api" {
-      name = "mainstay-api-${var.region}"
-      role = aws_iam_role.api.name
     }
   }
 }
@@ -332,6 +398,8 @@ resource "aws_launch_template" "api" {
     allowed_origins = var.allowed_origins
     dsar_table_name = aws_dynamodb_table.data_subject_requests.name
     dsar_queue_url  = aws_sqs_queue.data_subject_requests.url
+    image_tag       = var.image_tag
+    metrics_port    = var.metrics_port
   }))
 
   iam_instance_profile {
@@ -346,13 +414,15 @@ resource "aws_launch_template" "api" {
       encrypted = true
     }
   }
-  iam_instance_profile {
-    name = aws_iam_instance_profile.api.name
-  }
 
   metadata_options {
     http_tokens   = "required"
     http_endpoint = "enabled"
+    # #1814: the API runs in a Docker bridge container, one network hop
+    # beyond the host. The default hop limit of 1 blocks IMDSv2 token
+    # requests made from inside the container, so the AWS SDK default
+    # credential chain (used for DynamoDB/SQS calls) would time out.
+    http_put_response_hop_limit = 2
   }
 
   tag_specifications {
@@ -400,6 +470,21 @@ resource "aws_autoscaling_group" "api" {
 }
 
 # ── CloudWatch Alarms ──────────────────────────────────────
+resource "aws_sns_topic" "alarms" {
+  name = "mainstay-api-alarms-${var.region}"
+
+  tags = {
+    Project = "Mainstay"
+    Region  = var.region
+  }
+}
+
+resource "aws_sns_topic_subscription" "alarms_on_call" {
+  topic_arn = aws_sns_topic.alarms.arn
+  protocol  = "email"
+  endpoint  = var.on_call_email
+}
+
 resource "aws_cloudwatch_metric_alarm" "api_5xx" {
   alarm_name          = "mainstay-api-5xx-${var.region}"
   comparison_operator = "GreaterThanThreshold"
@@ -410,6 +495,8 @@ resource "aws_cloudwatch_metric_alarm" "api_5xx" {
   statistic           = "Sum"
   threshold           = 5
   alarm_description   = "High 5xx error rate on API ALB"
+  alarm_actions       = [aws_sns_topic.alarms.arn]
+  ok_actions          = [aws_sns_topic.alarms.arn]
 
   dimensions = {
     LoadBalancer = aws_lb.api.arn_suffix
@@ -423,11 +510,48 @@ resource "aws_cloudwatch_metric_alarm" "api_latency" {
   metric_name         = "TargetResponseTime"
   namespace           = "AWS/ApplicationELB"
   period              = 60
-  statistic           = "p95"
+  extended_statistic  = "p95"
   threshold           = 2
   alarm_description   = "API p95 latency exceeding 2 seconds"
+  alarm_actions       = [aws_sns_topic.alarms.arn]
+  ok_actions          = [aws_sns_topic.alarms.arn]
 
   dimensions = {
     LoadBalancer = aws_lb.api.arn_suffix
+  }
+}
+
+# ── Outputs ────────────────────────────────────────────────
+output "metrics_port" {
+  description = "Private port serving Prometheus metrics (not exposed via the ALB)"
+  value       = var.metrics_port
+}
+
+output "metrics_target" {
+  description = "Private metrics scrape target for the Prometheus host"
+  value       = "mainstay-api-${var.region}:${var.metrics_port}"
+}
+
+# Any message in the DSAR DLQ means a data-subject request failed repeatedly
+# and needs manual attention. See docs/runbooks/dsar-dlq.md for replay steps.
+resource "aws_cloudwatch_metric_alarm" "dsar_dlq_depth" {
+  alarm_name          = "mainstay-dsar-dlq-depth-${var.region}"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  namespace           = "AWS/SQS"
+  period              = 300
+  statistic           = "Maximum"
+  threshold           = 0
+  treat_missing_data  = "notBreaching"
+  alarm_description   = "DSAR dead-letter queue is non-empty; failed data-subject requests require replay or manual processing"
+
+  dimensions = {
+    QueueName = aws_sqs_queue.data_subject_requests_dlq.name
+  }
+
+  tags = {
+    Project = "Mainstay"
+    Region  = var.region
   }
 }

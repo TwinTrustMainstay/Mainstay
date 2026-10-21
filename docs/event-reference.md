@@ -1,5 +1,7 @@
 # Complete Event Reference Guide
 
+> **Last updated:** 2026-08-28 · **Doc version:** 0.1.0
+
 This reference guide provides a comprehensive overview of all smart contract events emitted by the Mainstay protocol on the Stellar network (Soroban). It serves as an authoritative guide for off-chain indexers, analytics engines, subgraphs, and lender integration services.
 
 ---
