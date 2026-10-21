@@ -357,24 +357,6 @@ resource "aws_lb_listener" "http" {
       port        = "443"
       status_code = "HTTP_301"
     }
-
-    resource "aws_iam_role" "api" {
-      name = "mainstay-api-${var.region}"
-
-      assume_role_policy = jsonencode({
-        Version = "2012-10-17"
-        Statement = [{
-          Effect    = "Allow"
-          Principal = { Service = "ec2.amazonaws.com" }
-          Action    = "sts:AssumeRole"
-        }]
-      })
-    }
-
-    resource "aws_iam_instance_profile" "api" {
-      name = "mainstay-api-${var.region}"
-      role = aws_iam_role.api.name
-    }
   }
 }
 
@@ -406,9 +388,6 @@ resource "aws_launch_template" "api" {
     ebs {
       encrypted = true
     }
-  }
-  iam_instance_profile {
-    name = aws_iam_instance_profile.api.name
   }
 
   metadata_options {
@@ -466,6 +445,21 @@ resource "aws_autoscaling_group" "api" {
 }
 
 # ── CloudWatch Alarms ──────────────────────────────────────
+resource "aws_sns_topic" "alarms" {
+  name = "mainstay-api-alarms-${var.region}"
+
+  tags = {
+    Project = "Mainstay"
+    Region  = var.region
+  }
+}
+
+resource "aws_sns_topic_subscription" "alarms_on_call" {
+  topic_arn = aws_sns_topic.alarms.arn
+  protocol  = "email"
+  endpoint  = var.on_call_email
+}
+
 resource "aws_cloudwatch_metric_alarm" "api_5xx" {
   alarm_name          = "mainstay-api-5xx-${var.region}"
   comparison_operator = "GreaterThanThreshold"
@@ -476,6 +470,8 @@ resource "aws_cloudwatch_metric_alarm" "api_5xx" {
   statistic           = "Sum"
   threshold           = 5
   alarm_description   = "High 5xx error rate on API ALB"
+  alarm_actions       = [aws_sns_topic.alarms.arn]
+  ok_actions          = [aws_sns_topic.alarms.arn]
 
   dimensions = {
     LoadBalancer = aws_lb.api.arn_suffix
@@ -489,9 +485,11 @@ resource "aws_cloudwatch_metric_alarm" "api_latency" {
   metric_name         = "TargetResponseTime"
   namespace           = "AWS/ApplicationELB"
   period              = 60
-  statistic           = "p95"
+  extended_statistic  = "p95"
   threshold           = 2
   alarm_description   = "API p95 latency exceeding 2 seconds"
+  alarm_actions       = [aws_sns_topic.alarms.arn]
+  ok_actions          = [aws_sns_topic.alarms.arn]
 
   dimensions = {
     LoadBalancer = aws_lb.api.arn_suffix

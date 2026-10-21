@@ -74,6 +74,11 @@ variable "log_retention_days" {
   default     = 30
 }
 
+variable "on_call_email" {
+  description = "On-call email address subscribed to API alarm notifications"
+  type        = string
+}
+
 variable "request_retention_seconds" {
   description = "Maximum retention for data-subject request messages"
   type        = number
