@@ -54,6 +54,12 @@ jobs:
       - name: Validate all ContractError discriminants are unique per contract
         run: bash scripts/check_error_discriminants.sh
 
+      - name: Check generated API docs are up to date
+        run: python3 scripts/generate_api_docs.py --check
+
+      - name: Validate FAQ source and check generated outputs
+        run: python3 scripts/generate_faq.py --check
+
       - name: Run clippy lints
         run: cargo clippy --workspace --all-targets -- -D warnings
 

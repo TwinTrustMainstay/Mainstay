@@ -154,6 +154,10 @@ stellar keys generate deployer --network testnet
 - [Engineer Operations](docs/engineer-operations.md)
 - [Collateral Scoring Model](docs/collateral-scoring.md)
 - [Threat Model & Security](docs/threat-model.md)
+- [Data Model](docs/data-model.md)
+- [API Reference (OpenAPI, Swagger UI, curl)](docs/api/README.md)
+- [Performance Tuning Guide](docs/performance-tuning-guide.md)
+- [FAQ](docs/faq.md)
 - [Roadmap](docs/roadmap.md)
 
 ## 🎓 Smart Contract API

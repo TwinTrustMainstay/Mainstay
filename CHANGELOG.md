@@ -11,6 +11,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and hash-based maintenance evidence attachments to the lifecycle contract.
 
 ### Added
+- Frequently asked questions (#1721): 28 questions in eight topics, generated
+  from `docs/faq/faq.json` into `docs/faq.md` and a searchable page at
+  `docs/faq/index.html`. The page supports "was this helpful?" votes. An
+  optional `FEEDBACK_URL` sends votes and zero-result searches to a backend.
+  A FAQ question issue template is included.
+- Data model reference (#1720): entity relationship diagrams, state transitions
+  for assets, credentials, and loans, encoding rules for addresses, symbols,
+  hashes, timestamps, and amounts, worked JSON examples, and a data dictionary.
+- Performance tuning guide for operators (#1719): per-operation cost drivers and
+  limits, batching and pagination guidance, metrics to monitor, and a method for
+  recording before/after measurements.
+- API reference generated from the contract sources (#1718): an OpenAPI 3.0
+  spec, a Swagger UI explorer with filtering and "Try it out", and curl examples
+  for every contract function. Regenerate with `scripts/generate_api_docs.py`.
 - `scripts/export-assets.py` exports backed-up asset records to CSV and
   dependency-free Excel `.xlsx` workbooks.
 - `mainstay-sdk`: an official typed Rust facade for registration, asset lookup,
