@@ -12,6 +12,9 @@ This document lists every `ContractError` variant across the three core contract
 - [Lending](#lending)
 - [Marketplace](#marketplace)
 - [Governance](#governance)
+- [MobileApi](#mobileapi)
+- [ZkPrivacy](#zkprivacy)
+- [Timestamping](#timestamping)
 
 ---
 
@@ -282,6 +285,49 @@ The lending error codes are unique. In particular, `TimelockNotExpired` and `Pro
 ## Marketplace
 
 The `marketplace` contract implements dynamic maintenance pricing and competitive maintenance auctions.
+## MobileApi
+
+Errors returned by the `mobile-api` contract (`contracts/mobile-api`).
+
+| Code | Variant | Description |
+|------|---------|-------------|
+| 1 | `NotInitialized` | The contract has not been initialized. |
+| 2 | `AlreadyInitialized` | `initialize` was called a second time. |
+| 3 | `UnauthorizedAdmin` | The caller is not the stored admin for an admin-only call. |
+| 4 | `ClientNotRegistered` | The client must call `register_client` before reading the feed or subscribing. |
+| 5 | `UnsupportedApiVersion` | The client's API version is below `MIN_API_VERSION`. Upgrade the client app. |
+| 6 | `RateLimitExceeded` | The client used its request budget for the current window. Retry after the window resets. |
+| 7 | `InvalidLimit` | `limit` was 0 or above `MAX_PAGE_SIZE` (100). |
+| 8 | `InvalidTopics` | A subscription must have between 1 and `MAX_SUBSCRIPTION_TOPICS` (16) topics. |
+| 9 | `InvalidRateLimitConfig` | Rate-limit settings were outside the allowed bounds. |
+| 10 | `ChangeNotFound` | The sequence number is outside the retained change log. |
+| 11 | `NoSubscription` | `pull_notifications` was called before `subscribe`. |
+
+### Resolution guidance
+
+- **`UnsupportedApiVersion`** – the app is too old to talk to this server. Ship an update.
+- **`RateLimitExceeded`** – back off until the window resets (`get_rate_limit` returns the window length). Batch reads where possible.
+- **`ChangeNotFound`** – the cursor is outside the retained log. Use `sync` and check `full_resync_required` instead of calling `get_change` directly.
+
+## ZkPrivacy
+
+Errors returned by the `zk-privacy` contract (`contracts/zk-privacy`).
+
+| 3 | `UnauthorizedAdmin` | The caller is not the stored admin for a roster change. |
+| 4 | `RosterFull` | The roster already holds `MAX_ROSTER` (12) engineer commitments. |
+| 5 | `InvalidProof` | A proof did not verify against its statement (commitment, asset id, threshold, or roster). |
+| 6 | `EmptyRoster` | A maintenance proof was submitted before any engineer was registered. |
+| 7 | `SessionNotFound` | No collateral proof session is open for the asset. Call `begin_collateral_proof` first. |
+| 8 | `BitsOutOfOrder` | A bit chunk was empty, larger than `BITS_PER_TX` (4), or would run past the last bit. |
+| 9 | `IncompleteProof` | `finalize_collateral_proof` was called before all 32 bits were verified. |
+
+
+- **`InvalidProof`** – regenerate the proof from the current commitment, roster order, asset id, and threshold. Proofs are bound to all of these, so a stale or copied proof fails.
+- **`SessionNotFound` / `IncompleteProof`** – the collateral flow is begin, then bit chunks in order, then finalize. Resume from the `verified` count in `get_collateral_session`.
+
+## Timestamping
+
+Errors returned by the `timestamping` contract (`contracts/timestamping`).
 
 | Code | Variant | Description |
 |------|---------|-------------|
@@ -348,16 +394,31 @@ The `governance` contract implements voting shares, proposals, quorum-based voti
 | 16 | `InsufficientBudget` | The treasury balance does not cover the funding grant at execution time. |
 | 17 | `TooManyVotes` | The proposal has reached the cap of 500 votes. |
 
-### Resolution guidance
 
-| Variant | How to resolve |
-|---------|----------------|
 | `InsufficientShares` | Ask an admin to mint shares, or acquire them with `transfer_shares`. Proposals need at least `min_proposal_shares`. |
 | `SharesLocked` | Shares locked by a vote are released when that proposal's voting period ends. |
 | `VotingStillOpen` | Retry `finalize_proposal` once the voting period has ended. |
 | `InsufficientBudget` | The proposal passed but the treasury no longer covers it. Fund the treasury with `fund_treasury` or reject the grant. |
 
----
+| 4 | `AuthorityNotFound` | No timestamp authority is registered under this key. |
+| 5 | `AuthorityAlreadyExists` | An authority with this key is already registered, including a revoked one. |
+| 6 | `AuthorityRevoked` | The authority has been revoked and can no longer attest. |
+| 7 | `AuthorityExpired` | The attested time is past the authority's validity window. |
+| 8 | `RecordExists` | A timestamp is already recorded for this record id. |
+| 9 | `RecordNotFound` | No timestamp record exists for this id. |
+| 10 | `FutureTimestamp` | The attested time is more than `MAX_CLOCK_SKEW_SECS` (300 s) ahead of the ledger clock. |
+| 11 | `StaleRenewal` | A renewal's time is not later than the record's latest timestamp. |
+| 12 | `RecordExpired` | The record's validity has ended, so it can no longer be renewed. |
+| 13 | `InvalidValidity` | The record validity period is outside the allowed range (1 to 20 years). |
+| 14 | `InvalidAuthorityValidity` | The authority's validity end is not in the future. |
+| 15 | `HistoryFull` | The authority history has reached `MAX_HISTORY_ENTRIES` (200). |
+| 16 | `InvalidRevocationTime` | A revocation was set to take effect in the future. |
+
+
+- **`AuthorityExpired`** – the TSA key's window has ended. Renew the authority (`renew_authority`) or use a current key.
+- **`AuthorityRevoked`** – the key is revoked. Obtain attestations from the replacement authority. Revoked keys cannot be re-registered.
+- **`FutureTimestamp`** – the TSA's clock is ahead of the ledger. Check the relayer's clock sync.
+- **`HistoryFull`** – archive `get_authority_history` off-chain, then start a new deployment if the log has to be reset.
 
 ## Common patterns across all contracts
 
