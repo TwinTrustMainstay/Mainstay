@@ -379,6 +379,46 @@ fn restructure_count_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
     (RESTRUCTURE_COUNT_KEY, borrower.clone())
 }
 
+/// Accept a restructure only for the admin, a syndicate member, or the lender
+/// recorded on the loan's lien (#1860).
+fn require_restructure_caller(env: &Env, caller: &Address, loan_id: u64) {
+    let admin = get_admin(env);
+    if caller == &admin {
+        return;
+    }
+
+    if let Some(syndicate) = env
+        .storage()
+        .persistent()
+        .get::<_, Syndicate>(&syndicate_key(loan_id))
+    {
+        for member in syndicate.lenders.iter() {
+            if &member == caller {
+                return;
+            }
+        }
+    }
+
+    if let Some(asset_id) = env
+        .storage()
+        .persistent()
+        .get::<_, u64>(&loan_asset_key(loan_id))
+    {
+        let liens: Vec<LienRecord> = env
+            .storage()
+            .persistent()
+            .get(&liens_key(asset_id))
+            .unwrap_or_else(|| Vec::new(env));
+        for lien in liens.iter() {
+            if lien.loan_id == loan_id && &lien.lender == caller {
+                return;
+            }
+        }
+    }
+
+    panic_with_error!(env, ContractError::UnauthorizedLender);
+}
+
 /// A lien record representing a claim against an asset by a lender.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1540,10 +1580,14 @@ impl LendingContract {
         env.events().publish((RESTRUCTURE_PROPOSED,), (loan_id, new_deadline, reduced_payment_amount));
     }
 
-    /// Accept a loan restructure proposal (lender-only).
+    /// Accept a loan restructure proposal.
+    ///
+    /// The caller must authenticate and be the contract admin, a member of the
+    /// loan's syndicate, or the lender recorded on the loan's lien.
     pub fn accept_restructure(env: Env, lender: Address, loan_id: u64) {
         require_not_paused(&env);
         lender.require_auth();
+        require_restructure_caller(&env, &lender, loan_id);
 
         let proposal: RestructureProposal = env
             .storage()
@@ -2597,6 +2641,7 @@ mod tests {
 
         let contract_id = env.register(LendingContract, ());
         let client = LendingContractClient::new(&env, &contract_id);
+
         let deployer = Address::generate(&env);
         let admin = Address::generate(&env);
         let token = Address::generate(&env);
