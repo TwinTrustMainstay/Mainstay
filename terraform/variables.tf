@@ -34,11 +34,6 @@ variable "ami_ids" {
 variable "vpc_cidrs" {
   description = "VPC CIDR blocks per region"
   type        = map(string)
-  default = {
-    "us-east-1"      = "10.0.0.0/16"
-    "eu-west-1"      = "10.1.0.0/16"
-    "ap-southeast-1" = "10.2.0.0/16"
-  }
 }
 
 variable "acm_certificate_arns" {
@@ -49,17 +44,11 @@ variable "acm_certificate_arns" {
 variable "rpc_urls" {
   description = "Stellar RPC URLs per region"
   type        = map(string)
-  default = {
-    "us-east-1"      = "https://soroban-mainnet-us-east.stellar.org"
-    "eu-west-1"      = "https://soroban-mainnet-eu-west.stellar.org"
-    "ap-southeast-1" = "https://soroban-mainnet-ap-se.stellar.org"
-  }
 }
 
 variable "network_passphrase" {
   description = "Stellar network passphrase"
   type        = string
-  default     = "Public Global Stellar Network ; September 2015"
 }
 
 variable "allowed_origins" {
@@ -74,10 +63,25 @@ variable "log_retention_days" {
   default     = 30
 }
 
+variable "on_call_email" {
+  description = "On-call email address subscribed to API alarm notifications"
+  type        = string
+}
+
 variable "request_retention_seconds" {
   description = "Maximum retention for data-subject request messages"
   type        = number
   default     = 604800
+}
+
+variable "image_tag" {
+  description = "Immutable container image tag or digest for the API server (e.g. sha256:<digest> or v1.2.3). Mutable tags such as 'latest' are rejected."
+  type        = string
+
+  validation {
+    condition     = var.image_tag != "latest" && !endswith(var.image_tag, ":latest")
+    error_message = "image_tag must be an immutable tag or digest; 'latest' is not allowed."
+  }
 }
 
 # ── SQS queues for cross-region cache invalidation ──────────

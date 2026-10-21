@@ -1,5 +1,7 @@
 # Disaster Recovery Plan
 
+> **Last updated:** 2026-09-30 · **Doc version:** 0.1.0
+
 This document describes the disaster recovery (DR) procedures for the Mainstay
 smart contract system on Stellar Soroban.  It covers recovery from data loss,
 contract bugs, Stellar network issues, and off-chain metadata failures.
@@ -66,10 +68,16 @@ Off-chain metadata includes:
 ### Implementation
 
 1. **S3 bucket** with versioning enabled and KMS encryption (SSE-KMS).
+   Versioning and Object Lock are provisioned by Terraform as a separate
+   bootstrap step that must be applied **before** the first backup runs.
+   `scripts/backup.sh` verifies versioning with `get-bucket-versioning` before
+   uploading and aborts if versioning is not `Enabled` — it never enables
+   versioning itself.
 2. **Cross-region replication** configured for the backup bucket to a secondary
    AWS region (e.g., `us-east-1` → `us-west-2`).
 3. **Immutable backups**: Use S3 Object Lock in compliance mode for weekly
-   backups to prevent accidental or malicious deletion.
+   backups to prevent accidental or malicious deletion. Object Lock can only be
+   enabled at bucket creation, so it is part of the Terraform bootstrap.
 4. **Lifecycle policies**: Move backups older than 30 days to Glacier, older
    than 365 days to Deep Archive or delete.
 
@@ -92,9 +100,27 @@ aws s3api put-bucket-replication --bucket mainstay-backups \
     }'
 ```
 
+### Backup Integrity and Failure Handling
+
+- **Read failures are fatal.** `scripts/backup.sh` retries each failed contract
+  read with exponential backoff. If a read still fails after retries, the
+  failed IDs are recorded in `failures.json` in the backup directory and the
+  script exits non-zero. A backup that contains `failures.json` is incomplete
+  and must not be treated as a valid recovery point.
+- **Engineer credentials are exported.** `engineers.json` contains each
+  engineer's address, credential hash, issuer, and validity period, sourced
+  from the engineer registry contract view. It is no longer an empty `{}`
+  placeholder.
+- **Manifest is signed and checksum-covered.** After `manifest.json` is
+  written, every file in the backup — including `manifest.json` itself — is
+  hashed into `checksums.sha256` (only `checksums.sha256` is excluded). The
+  manifest is signed with KMS (or minisign), and `scripts/restore.sh` verifies
+  the signature and checksums before restoring anything.
+
 ### Verification
 
-- Run `scripts/backup.sh` daily and validate the manifest.
+- Run `scripts/backup.sh` daily and validate the manifest and its signature.
+- Confirm the backup run exited zero and that no `failures.json` was produced.
 - Verify S3 bucket versioning is enabled weekly via the AWS Console or CLI.
 - Perform a test restore to a staging environment monthly.
 
@@ -110,7 +136,9 @@ If persistent contract storage entries expire due to prolonged inactivity:
    ```bash
    stellar contract invoke --id $CONTRACT_ASSET_REGISTRY --network mainnet -- get_asset_count
    ```
-2. **Restore from backup**: Use the restore script:
+2. **Restore from backup**: Use the restore script. It verifies the manifest
+   signature and checksums first, and reports partial recovery if
+   `engineers.json` is empty or if the backup contains a `failures.json`:
    ```bash
    ./scripts/restore.sh s3://mainstay-backups/backups/<latest>/ --admin-key /path/to/key
    ```
@@ -138,7 +166,11 @@ If persistent contract storage entries expire due to prolonged inactivity:
 
 ### Scenario: Engineer Credential Loss
 
-1. **Query**: Get the list of engineers from a recent backup.
+1. **Query**: Get the list of engineers from a recent backup's
+   `engineers.json` (address, credential hash, issuer, validity period). If
+   `restore.sh` reported partial recovery because `engineers.json` was empty,
+   fall back to contract events and transaction history to reconstruct the
+   engineer list.
 2. **Re-register**: Have a trusted issuer re-register each engineer:
    ```bash
    stellar contract invoke --id $CONTRACT_ENGINEER_REGISTRY --source admin -- register_engineer \
@@ -255,10 +287,11 @@ Each DR test should be documented with:
 2. ...
 
 **Results**:
-- [ ] Backup verified
+- [ ] Backup verified (manifest signature and checksums valid)
+- [ ] Backup run exited zero with no `failures.json`
 - [ ] Assets restored correctly
 - [ ] Scores match pre-backup values
-- [ ] Engineers re-verifiable
+- [ ] Engineers restored from `engineers.json` (no partial-recovery warning)
 
 **Issues found**: [List issues]
 
@@ -282,13 +315,16 @@ Use this checklist when responding to any Mainstay incident:
 ### Containment (First hour)
 
 - [ ] Pause contracts if the incident involves unauthorized writes
-- [ ] Take a snapshot backup before any remediation
+- [ ] Take a snapshot backup before any remediation (confirm it exits zero and
+      produces no `failures.json`)
 - [ ] Identify the scope: which contracts, which assets, which time window
 
 ### Recovery
 
 - [ ] Execute the appropriate recovery procedure from this document
 - [ ] Verify restoration with automated tests
+- [ ] Review any partial-recovery warnings from `restore.sh` (e.g., empty
+      `engineers.json`) and remediate the missing data
 - [ ] Confirm monitoring metrics return to normal
 
 ### Post-Incident

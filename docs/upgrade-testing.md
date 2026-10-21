@@ -1,5 +1,7 @@
 # Contract Upgrade Testing
 
+> **Last updated:** 2026-07-30 · **Doc version:** 0.1.0
+
 This document describes how Mainstay validates that contract upgrades are safe, compatible with existing on-chain state, and recoverable from failures.
 
 ## Overview
@@ -57,8 +59,19 @@ Dedicated tests (`test_upgrade_error_recovery`) verify:
 - **Proposal lifecycle**: Already-executed and duplicate proposals are rejected
 - **Cross-contract recovery**: Lifecycle contract continues functioning after a dependency's upgrade failure
 
-### Stage 8: Post-Upgrade Data Integrity
-After all tests pass, view functions are called on the deployed test ledger contracts to confirm state is still readable.
+### Stage 8: Post-Upgrade Data Integrity (state capture & validation)
+Implemented by `scripts/upgrade_state.sh` (issue #1725):
+- **Pre-upgrade capture** (`capture`): before the upgrade, a normalized snapshot is written to `$RUNNER_TEMP/pre-upgrade.snapshot`. It covers the AssetRegistry admin and asset count, the EngineerRegistry admin, and the Lifecycle config.
+- **Post-upgrade validation** (`validate`): after the upgrade, the same values are re-read and diffed against the pre-upgrade snapshot. Any drift fails the job.
+
+### Stage 9: Rollback Tests
+Dedicated tests (`test_upgrade_rollback`, `tests/test_upgrade_rollback.rs`) verify that:
+- **Timelock restart**: re-proposing the previous WASM hash overwrites the bad pending proposal and restarts the 48-hour timelock, so a superseded upgrade cannot run early
+- **Rollback executes after its own delay**: a rollback proposal executes once its own timelock has elapsed
+- **Data survives rollback**: assets and counters registered before the bad upgrade attempt are unchanged afterwards
+- **Admin-only rollback**: non-admins cannot schedule a rollback
+
+Soroban has no on-chain downgrade call, so a rollback is a forward proposal of the previously deployed WASM hash through the same timelocked path.
 
 ## Test File Reference
 
@@ -67,6 +80,7 @@ After all tests pass, view functions are called on the deployed test ledger cont
 | `tests/test_storage_migration.rs` | Storage layout persistence and migration validation |
 | `tests/test_signature_compatibility.rs` | Engineer credential verification compatibility |
 | `tests/test_upgrade_error_recovery.rs` | Failed upgrade recovery and error handling |
+| `tests/test_upgrade_rollback.rs` | Rollback via re-proposal: timelock restart, delayed execution, data survival |
 | `tests/test_paused_contract.rs` | Paused state behavior across all contracts |
 | `tests/test_emergency_pause.rs` | Emergency pause and unpause transitions |
 | `tests/test_engineer_credential_expiry.rs` | Credential expiry state machine |
@@ -88,6 +102,7 @@ cargo test --workspace
 cargo test --workspace -- test_storage_migration
 cargo test --workspace -- test_signature_compatibility
 cargo test --workspace -- test_upgrade_error_recovery
+cargo test --workspace -- test_upgrade_rollback
 cargo test --workspace -- test_paused_contract
 cargo test --workspace -- test_emergency_pause
 cargo test --workspace -- test_engineer_credential_expiry

@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mainstay Video Tutorials</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 1rem; line-height: 1.5; color: #1a1a1a; background: #fff; }
+  h1 { font-size: 1.4rem; margin: 0 0 1rem; }
+  .layout { display: grid; gap: 1rem; grid-template-columns: minmax(0, 1fr); }
+  @media (min-width: 900px) { .layout { grid-template-columns: 2fr 1fr; } }
+  video { width: 100%; max-width: 100%; background: #000; aspect-ratio: 16 / 9; }
+  .notice { padding: .75rem 1rem; background: #fff7e0; border: 1px solid #e6c35c; border-radius: 6px; font-size: .9rem; }
+  .list { list-style: none; padding: 0; margin: 0; }
+  .list li { margin-bottom: .5rem; }
+  .list button { width: 100%; text-align: left; padding: .6rem .75rem; border: 1px solid #ccc; border-radius: 6px; background: #f7f7f7; cursor: pointer; font: inherit; }
+  .list button[aria-current="true"] { border-color: #2f6fed; background: #e8efff; }
+  .chapters button { display: block; width: 100%; text-align: left; padding: .4rem .5rem; border: 0; background: none; cursor: pointer; font: inherit; color: #1a4fbf; }
+  .meta { font-size: .9rem; color: #555; }
+  .transcript { font-size: .9rem; }
+  @media (prefers-color-scheme: dark) {
+    body { color: #eee; background: #111; }
+    .list button { background: #1d1d1d; border-color: #444; color: #eee; }
+    .list button[aria-current="true"] { background: #1c2d52; border-color: #5b8cff; }
+    .notice { background: #3a2f10; border-color: #8a7230; color: #eee; }
+    .meta { color: #aaa; }
+    .chapters button { color: #8ab4ff; }
+  }
+</style>
+</head>
+<body>
+<h1>Mainstay Video Tutorials</h1>
+<div class="layout">
+  <section>
+    <video id="player" controls preload="metadata"></video>
+    <p id="status" class="notice" hidden></p>
+    <h2 id="title"></h2>
+    <p id="description" class="meta"></p>
+    <h3>Chapters</h3>
+    <div id="chapters" class="chapters"></div>
+    <h3>Transcript</h3>
+    <div id="transcript" class="transcript"></div>
+  </section>
+  <aside>
+    <h2>Series</h2>
+    <ul id="videos" class="list"></ul>
+  </aside>
+</div>
+
+<script>
+// Reads docs/video-tutorials/series.json and plays the selected video.
+// Serve the repository root over HTTP (for example: python3 -m http.server)
+// because browsers block fetch() from file:// URLs.
+(function () {
+  const base = new URL("./", window.location.href);
+  const player = document.getElementById("player");
+  const status = document.getElementById("status");
+  const videosEl = document.getElementById("videos");
+  const chaptersEl = document.getElementById("chapters");
+  const transcriptEl = document.getElementById("transcript");
+
+  function fmt(seconds) {
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
+  }
+
+  function showStatus(message) {
+    status.textContent = message;
+    status.hidden = !message;
+  }
+
+  function parseCues(vtt) {
+    const cues = [];
+    const blocks = vtt.split(/\r?\n\r?\n/);
+    for (const block of blocks) {
+      const lines = block.split(/\r?\n/);
+      const idx = lines.findIndex((l) => l.includes("-->"));
+      if (idx === -1) continue;
+      const [start] = lines[idx].split("-->");
+      const text = lines.slice(idx + 1).join(" ").trim();
+      if (text) cues.push({ start: toSeconds(start.trim()), text });
+    }
+    return cues;
+  }
+
+  function toSeconds(ts) {
+    const [hms, ms] = ts.split(".");
+    const [h, m, s] = hms.split(":").map(Number);
+    return h * 3600 + m * 60 + s + Number(ms || 0) / 1000;
+  }
+
+  function select(video) {
+    for (const li of videosEl.querySelectorAll("button")) {
+      li.setAttribute("aria-current", String(li.dataset.id === video.id));
+    }
+    document.getElementById("title").textContent = video.title;
+    document.getElementById("description").textContent = video.description;
+
+    const src = new URL(video.file, base).href;
+    player.removeAttribute("src");
+    player.load();
+    if (video.status === "script-ready") {
+      player.hidden = true;
+      showStatus("This video has not been recorded yet. The chapters and captions below are the recording script.");
+    } else {
+      player.hidden = false;
+      showStatus("");
+      player.src = src;
+    }
+
+    // Replace any existing caption track with this video's captions.
+    for (const t of player.querySelectorAll("track")) t.remove();
+    const track = document.createElement("track");
+    track.kind = "captions";
+    track.srclang = "en";
+    track.label = "English";
+    track.default = true;
+    track.src = new URL(video.captions, base).href;
+    player.appendChild(track);
+
+    chaptersEl.innerHTML = "";
+    for (const chapter of video.chapters) {
+      const btn = document.createElement("button");
+      btn.textContent = fmt(chapter.start) + "  " + chapter.title;
+      btn.addEventListener("click", () => {
+        player.currentTime = chapter.start;
+        player.play().catch(() => {});
+      });
+      chaptersEl.appendChild(btn);
+    }
+
+    transcriptEl.textContent = "Loading transcript…";
+    fetch(new URL(video.captions, base))
+      .then((r) => r.text())
+      .then((vtt) => {
+        transcriptEl.innerHTML = "";
+        for (const cue of parseCues(vtt)) {
+          const p = document.createElement("p");
+          const b = document.createElement("strong");
+          b.textContent = fmt(cue.start) + " ";
+          p.appendChild(b);
+          p.appendChild(document.createTextNode(cue.text));
+          transcriptEl.appendChild(p);
+        }
+      })
+      .catch(() => {
+        transcriptEl.textContent = "Transcript unavailable. Open " + video.captions + " directly.";
+      });
+  }
+
+  fetch(new URL("series.json", base))
+    .then((r) => r.json())
+    .then((series) => {
+      for (const video of series.videos) {
+        const li = document.createElement("li");
+        const btn = document.createElement("button");
+        btn.dataset.id = video.id;
+        btn.textContent = video.title;
+        btn.addEventListener("click", () => select(video));
+        li.appendChild(btn);
+        videosEl.appendChild(li);
+      }
+      if (series.videos.length) select(series.videos[0]);
+    })
+    .catch(() => showStatus("Could not load series.json. Serve the repository over HTTP to use this page."));
+})();
+</script>
+</body>
+</html>

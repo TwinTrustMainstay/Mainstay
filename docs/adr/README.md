@@ -66,7 +66,7 @@ fn calculate_reputation_score(engineer: &Engineer) -> u32 {
 
 - [Architecture Overview](../architecture.md) — System design and component breakdown
 - [Deployment Guide](../deployment-runbook.md) — How to deploy and upgrade contracts
-- [Test Documentation](../testing.md) — Testing strategies and coverage
+- [Upgrade Testing](../upgrade-testing.md) — Contract upgrade testing strategies
 
 ## How to Contribute
 

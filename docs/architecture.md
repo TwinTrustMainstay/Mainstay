@@ -1,5 +1,7 @@
 # Architecture Overview
 
+> **Last updated:** 2026-08-29 · **Doc version:** 0.1.0
+
 Mainstay is composed of four independent Soroban smart contracts deployed on the Stellar network: **AssetRegistry**, **EngineerRegistry**, **Lifecycle**, and **Lending**. Each contract owns a distinct domain and exposes a minimal public interface. The Lifecycle contract cross-calls AssetRegistry and EngineerRegistry; a lender integration cross-calls AssetRegistry and Lifecycle directly (see [Lending](#lending) below) rather than routing loan logic through Lifecycle.
 
 ---
@@ -388,7 +390,7 @@ LOCKED key removed
 
 ## Further Reading
 
-- [Life-Cycle Contract Design](lifecycle-contract.md)
+- [Asset Lifecycle](asset-lifecycle.md)
 - [Engineer Credentialing](credentialing.md)
 - [Collateral Scoring Model](collateral-scoring.md)
 - [TTL Strategy](ttl-strategy.md)

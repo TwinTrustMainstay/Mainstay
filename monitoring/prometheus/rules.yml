@@ -1,0 +1,30 @@
+# Recording rules for Mainstay key metrics.
+# Source metrics are catalogued in monitoring/metrics-catalog.yml.
+
+groups:
+  - name: mainstay-rpc
+    rules:
+      # Fraction of read-only RPC calls that failed in the latest collection.
+      - record: mainstay:rpc_error_ratio
+        expr: |
+          mainstay_rpc_errors_last_scrape
+            / clamp_min(mainstay_rpc_requests_last_scrape, 1)
+
+      # Mean response time of a read-only RPC call in the latest collection.
+      - record: mainstay:rpc_response_time_seconds_avg
+        expr: |
+          mainstay_rpc_request_duration_seconds_sum
+            / clamp_min(mainstay_rpc_requests_last_scrape, 1)
+
+  - name: mainstay-gas
+    rules:
+      # Gas (stroops) spent per operation, averaged over one hour.
+      - record: mainstay:operation_gas_stroops:rate1h
+        expr: |
+          sum by (operation) (rate(mainstay_operation_gas_stroops_total[1h]))
+
+  - name: mainstay-alerts-support
+    rules:
+      # Scrape-level health used by the alerting rules in scripts/monitoring.
+      - record: mainstay:exporter_up:avg5m
+        expr: avg_over_time(mainstay_exporter_up[5m])

@@ -1,6 +1,10 @@
 # Collateral Lien Lifecycle Documentation
 
+> **Last updated:** 2026-10-16 · **Doc version:** 0.1.0
+
 This guide provides a comprehensive technical walkthrough of collateral liens in the Mainstay protocol. It details how physical industrial assets registered on-chain are encumbered, monitored, released, or liquidated across the loan lifecycle.
+
+> **Terminology:** terms such as *lien*, *collateral*, *covenant* and *liquidation* are defined in the [glossary](GLOSSARY.md).
 
 ---
 

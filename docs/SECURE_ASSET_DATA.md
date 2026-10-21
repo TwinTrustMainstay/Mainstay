@@ -1,5 +1,7 @@
 # Secure asset data
 
+> **Last updated:** 2026-09-25 · **Doc version:** 0.1.0
+
 The legacy `register_asset` entry point remains available for compatibility,
 but it stores the serial number in plaintext. New integrations must use
 `register_asset_encrypted`:

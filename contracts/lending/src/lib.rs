@@ -75,6 +75,14 @@ pub enum ContractError {
     InsuranceNotFound = 29,
     /// Insurance verification failed.
     InsuranceVerificationFailed = 30,
+    /// Maximum LTV must not exceed 10,000 basis points.
+    InvalidLtvBps = 31,
+    /// A lien cannot be released while its loan is active or unknown.
+    LienLoanNotFinalized = 32,
+    /// Insurance is already registered for this asset.
+    InsuranceAlreadyRegistered = 33,
+    /// Insurance coverage must be greater than zero.
+    ZeroInsuranceCoverage = 34,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -264,12 +272,14 @@ const TOKEN_KEY: soroban_sdk::Symbol = symbol_short!("TOKEN");
 const SLASH_BAL: soroban_sdk::Symbol = symbol_short!("SL_BAL");
 #[allow(dead_code)]
 const CONFIG_KEY: soroban_sdk::Symbol = symbol_short!("CONFIG");
+const BASE_MAX_LTV_KEY: soroban_sdk::Symbol = symbol_short!("BASE_LTV");
 const PAUSED_KEY: soroban_sdk::Symbol = symbol_short!("PAUSED");
 const SLASH_BPS_KEY: soroban_sdk::Symbol = symbol_short!("SL_BPS");
 const LOAN_DURATION_KEY: soroban_sdk::Symbol = symbol_short!("LOAN_DUR");
 const MIN_STAKE_KEY: soroban_sdk::Symbol = symbol_short!("MIN_STK");
 const YIELD_BPS_KEY: soroban_sdk::Symbol = symbol_short!("YIELD_BPS");
 const YIELD_NUMERATOR: u64 = DEFAULT_YIELD_NUMERATOR;
+const LOAN_STATUS_KEY: soroban_sdk::Symbol = symbol_short!("LN_STS");
 
 #[allow(dead_code)]
 const LOAN_REQUESTED: Symbol = symbol_short!("loan_req");
@@ -291,6 +301,30 @@ fn loan_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
     (symbol_short!("LOAN"), borrower.clone())
 }
 
+fn loan_borrower_key(loan_id: u64) -> (soroban_sdk::Symbol, u64) {
+    (symbol_short!("L_MAP"), loan_id)
+}
+
+fn loan_status_key(loan_id: u64) -> (soroban_sdk::Symbol, u64) {
+    (LOAN_STATUS_KEY, loan_id)
+}
+
+fn set_loan_status(env: &Env, loan_id: u64, status: LoanStatus) {
+    let key = loan_status_key(loan_id);
+    env.storage().persistent().set(&key, &status);
+    extend_persistent_ttl(env, &key);
+}
+
+fn get_loan_status(env: &Env, loan_id: u64) -> Option<LoanStatus> {
+    if let Some(status) = env.storage().persistent().get(&loan_status_key(loan_id)) {
+        return Some(status);
+    }
+
+    let borrower: Address = env.storage().persistent().get(&loan_borrower_key(loan_id))?;
+    let loan: Loan = env.storage().persistent().get(&loan_key(&borrower))?;
+    (loan.id == loan_id).then_some(loan.status)
+}
+
 fn borrower_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
     (symbol_short!("BORR"), borrower.clone())
 }
@@ -309,6 +343,7 @@ const LTV_HISTORY_KEY: soroban_sdk::Symbol = symbol_short!("LTV_HST");
 const RESTRUCTURE_KEY: soroban_sdk::Symbol = symbol_short!("REST");
 const SYNDICATE_KEY: soroban_sdk::Symbol = symbol_short!("SYND");
 const INSURANCE_KEY: soroban_sdk::Symbol = symbol_short!("INS");
+const INSURANCE_LENDER_KEY: soroban_sdk::Symbol = symbol_short!("INS_LNDR");
 const INSURANCE_PAYOUT_KEY: soroban_sdk::Symbol = symbol_short!("INS_PAY");
 const RESTRUCTURE_COUNT_KEY: soroban_sdk::Symbol = symbol_short!("REST_CNT");
 
@@ -332,12 +367,56 @@ fn insurance_key(asset_id: u64) -> (soroban_sdk::Symbol, u64) {
     (INSURANCE_KEY, asset_id)
 }
 
+fn insurance_lender_key(asset_id: u64) -> (soroban_sdk::Symbol, u64) {
+    (INSURANCE_LENDER_KEY, asset_id)
+}
+
 fn insurance_payout_key(asset_id: u64, index: u64) -> (soroban_sdk::Symbol, u64, u64) {
     (INSURANCE_PAYOUT_KEY, asset_id, index)
 }
 
 fn restructure_count_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
     (RESTRUCTURE_COUNT_KEY, borrower.clone())
+}
+
+/// Accept a restructure only for the admin, a syndicate member, or the lender
+/// recorded on the loan's lien (#1860).
+fn require_restructure_caller(env: &Env, caller: &Address, loan_id: u64) {
+    let admin = get_admin(env);
+    if caller == &admin {
+        return;
+    }
+
+    if let Some(syndicate) = env
+        .storage()
+        .persistent()
+        .get::<_, Syndicate>(&syndicate_key(loan_id))
+    {
+        for member in syndicate.lenders.iter() {
+            if &member == caller {
+                return;
+            }
+        }
+    }
+
+    if let Some(asset_id) = env
+        .storage()
+        .persistent()
+        .get::<_, u64>(&loan_asset_key(loan_id))
+    {
+        let liens: Vec<LienRecord> = env
+            .storage()
+            .persistent()
+            .get(&liens_key(asset_id))
+            .unwrap_or_else(|| Vec::new(env));
+        for lien in liens.iter() {
+            if lien.loan_id == loan_id && &lien.lender == caller {
+                return;
+            }
+        }
+    }
+
+    panic_with_error!(env, ContractError::UnauthorizedLender);
 }
 
 /// A lien record representing a claim against an asset by a lender.
@@ -424,6 +503,7 @@ fn get_config(env: &Env) -> Config {
         .unwrap_or(Config {
             yield_bps: 200,
             slash_bps: 5000,
+            max_ltv_bps: 0,
         })
 }
 
@@ -459,14 +539,14 @@ fn get_loan_duration(env: &Env) -> u64 {
 fn get_lifecycle_addr(env: &Env) -> Option<Address> {
     env.storage()
         .persistent()
-        .get(&symbol_short!(\"LIFECYCLE\"))
+        .get(&symbol_short!("LIFECYCLE"))
 }
 
 /// Retrieve the configured asset registry contract address, if any.
 fn get_asset_registry_addr(env: &Env) -> Option<Address> {
     env.storage()
         .persistent()
-        .get(&symbol_short!(\"ASSETREG\"))
+        .get(&symbol_short!("ASSETREG"))
 }
 
 // ── Inline cross-contract client: Lifecycle ────────────────────────────────
@@ -640,7 +720,9 @@ impl LendingContract {
         let loan_id_counter: u64 = env.storage().persistent().get(&symbol_short!("L_COUNT")).unwrap_or(0);
         let new_loan_id = loan_id_counter + 1;
         env.storage().persistent().set(&symbol_short!("L_COUNT"), &new_loan_id);
-        env.storage().persistent().set(&(symbol_short!("L_MAP"), new_loan_id), &borrower);
+        env.storage()
+            .persistent()
+            .set(&loan_borrower_key(new_loan_id), &borrower);
 
         let loan = Loan {
             borrower: borrower.clone(),
@@ -651,6 +733,7 @@ impl LendingContract {
         };
         env.storage().persistent().set(&key, &loan);
         extend_persistent_ttl(&env, &key);
+        set_loan_status(&env, new_loan_id, LoanStatus::Active);
 
         // Transfer the loan amount to the borrower
         tok.transfer(
@@ -731,6 +814,7 @@ impl LendingContract {
         loan.status = LoanStatus::Repaid;
         env.storage().persistent().set(&key, &loan);
         extend_persistent_ttl(&env, &key);
+        set_loan_status(&env, loan.id, LoanStatus::Repaid);
 
         // Track successful repayments in the borrower record for credit scoring.
         let borrower_key_val = borrower_key(&borrower);
@@ -877,6 +961,7 @@ impl LendingContract {
         loan.status = LoanStatus::Defaulted;
         env.storage().persistent().set(&key, &loan);
         extend_persistent_ttl(&env, &key);
+        set_loan_status(&env, loan.id, LoanStatus::Defaulted);
 
         let default_time = env.ledger().timestamp();
         env.storage().persistent().set(&(symbol_short!("DEF_TIME"), borrower.clone()), &default_time);
@@ -1051,11 +1136,8 @@ impl LendingContract {
     ) -> u64 {
         let score = u64::from(score.min(100));
         let ltv_bps = u64::from(ltv_bps.min(10_000));
-        asset_base_value
-            .saturating_mul(score)
-            .saturating_mul(ltv_bps)
-            / 100
-            / 10_000
+        ((u128::from(asset_base_value) * u128::from(score) * u128::from(ltv_bps)) / 1_000_000)
+            as u64
     }
 
     /// Returns whether the contract has been initialized.
@@ -1125,10 +1207,18 @@ impl LendingContract {
     /// A value of 0 disables LTV enforcement. A value of 7000 means 70% LTV.
     pub fn set_max_ltv_bps(env: Env, admin: Address, max_ltv_bps: u32) {
         require_admin(&env, &admin);
+        if max_ltv_bps > 10_000 {
+            panic_with_error!(&env, ContractError::InvalidLtvBps);
+        }
+
         let mut config = get_config(&env);
         config.max_ltv_bps = max_ltv_bps;
         env.storage().persistent().set(&CONFIG_KEY, &config);
         extend_persistent_ttl(&env, &CONFIG_KEY);
+        env.storage()
+            .persistent()
+            .set(&BASE_MAX_LTV_KEY, &max_ltv_bps);
+        extend_persistent_ttl(&env, &BASE_MAX_LTV_KEY);
     }
 
     /// Returns the credit score for a borrower based on their repayment/default history.
@@ -1212,7 +1302,7 @@ impl LendingContract {
             .extend_ttl(&la_key, TTL_THRESHOLD, TTL_TARGET);
     }
 
-    /// Release (remove) a previously recorded lien. Only the contract admin may call this.
+    /// Release a lien only after its loan has been repaid or defaulted.
     ///
     /// Panics with [`ContractError::LienNotFound`] if no matching lien exists
     /// for the given asset, lender, and loan_id.
@@ -1242,12 +1332,27 @@ impl LendingContract {
 
         match found_index {
             Some(idx) => {
+                if !matches!(
+                    get_loan_status(&env, loan_id),
+                    Some(LoanStatus::Repaid | LoanStatus::Defaulted)
+                ) {
+                    panic_with_error!(&env, ContractError::LienLoanNotFinalized);
+                }
+
                 liens.remove(idx);
                 if liens.is_empty() {
                     env.storage().persistent().remove(&key);
                 } else {
                     env.storage().persistent().set(&key, &liens);
                     extend_persistent_ttl(&env, &key);
+                }
+                if env
+                    .storage()
+                    .persistent()
+                    .get::<_, u64>(&loan_asset_key(loan_id))
+                    == Some(asset_id)
+                {
+                    env.storage().persistent().remove(&loan_asset_key(loan_id));
                 }
             }
             None => panic_with_error!(&env, ContractError::LienNotFound),
@@ -1275,7 +1380,8 @@ impl LendingContract {
 
     /// Adjust LTV based on current market conditions (volatility).
     /// Reduces LTV when volatility is elevated to manage risk.
-    pub fn adjust_ltv_for_conditions(env: Env) -> u32 {
+    pub fn adjust_ltv_for_conditions(env: Env, admin: Address) -> u32 {
+        require_admin(&env, &admin);
         let market: Option<MarketCondition> = env.storage().persistent().get(&MARKET_ORACLE_KEY);
 
         let volatility = if let Some(m) = market {
@@ -1286,12 +1392,28 @@ impl LendingContract {
 
         let mut config = get_config(&env);
         let original_ltv = config.max_ltv_bps;
+        let base_ltv: u32 = if let Some(base_ltv) = env
+            .storage()
+            .persistent()
+            .get(&BASE_MAX_LTV_KEY)
+        {
+            base_ltv
+        } else {
+            env.storage()
+                .persistent()
+                .set(&BASE_MAX_LTV_KEY, &original_ltv);
+            extend_persistent_ttl(&env, &BASE_MAX_LTV_KEY);
+            original_ltv
+        };
 
-        // Reduce LTV when volatility exceeds 30 bps
+        // Reduce LTV when volatility exceeds 3000 bps
         if volatility > 3000 {
             // Reduce by 10% for every 1000 bps of volatility above 3000
-            let reduction_factor = ((volatility - 3000) / 1000).min(5000);
-            config.max_ltv_bps = original_ltv.saturating_sub(((original_ltv as u64 * reduction_factor) / 10000) as u32);
+            let reduction_bps = (((volatility - 3000) / 1000) * 1000).min(5000);
+            config.max_ltv_bps =
+                base_ltv.saturating_sub(((base_ltv as u64 * reduction_bps as u64) / 10000) as u32);
+        } else {
+            config.max_ltv_bps = base_ltv;
         }
 
         env.storage().persistent().set(&CONFIG_KEY, &config);
@@ -1305,9 +1427,18 @@ impl LendingContract {
             volatility,
         };
 
-        let loan_counter: u64 = env.storage().persistent().get(&symbol_short!("L_COUNT")).unwrap_or(0);
-        env.storage().persistent().set(&ltv_history_key(loan_counter), &history);
-        extend_persistent_ttl(&env, &ltv_history_key(loan_counter));
+        let history_index: u64 = env
+            .storage()
+            .persistent()
+            .get(&symbol_short!("LTV_CNT"))
+            .unwrap_or(0);
+        let history_key = ltv_history_key(history_index);
+        env.storage().persistent().set(&history_key, &history);
+        extend_persistent_ttl(&env, &history_key);
+        env.storage()
+            .persistent()
+            .set(&symbol_short!("LTV_CNT"), &(history_index + 1));
+        extend_persistent_ttl(&env, &symbol_short!("LTV_CNT"));
 
         // Emit event
         env.events().publish((LTV_ADJUSTED,), (original_ltv, config.max_ltv_bps, volatility));
@@ -1449,10 +1580,14 @@ impl LendingContract {
         env.events().publish((RESTRUCTURE_PROPOSED,), (loan_id, new_deadline, reduced_payment_amount));
     }
 
-    /// Accept a loan restructure proposal (lender-only).
+    /// Accept a loan restructure proposal.
+    ///
+    /// The caller must authenticate and be the contract admin, a member of the
+    /// loan's syndicate, or the lender recorded on the loan's lien.
     pub fn accept_restructure(env: Env, lender: Address, loan_id: u64) {
         require_not_paused(&env);
         lender.require_auth();
+        require_restructure_caller(&env, &lender, loan_id);
 
         let proposal: RestructureProposal = env
             .storage()
@@ -1502,6 +1637,23 @@ impl LendingContract {
     ) {
         require_not_paused(&env);
         lender.require_auth();
+        if coverage_amount == 0 {
+            panic_with_error!(&env, ContractError::ZeroInsuranceCoverage);
+        }
+
+        let key = insurance_key(asset_id);
+        if env.storage().persistent().has(&key) {
+            panic_with_error!(&env, ContractError::InsuranceAlreadyRegistered);
+        }
+
+        let liens: Vec<LienRecord> = env
+            .storage()
+            .persistent()
+            .get(&liens_key(asset_id))
+            .unwrap_or_else(|| Vec::new(&env));
+        if !liens.iter().any(|lien| lien.lender == lender) {
+            panic_with_error!(&env, ContractError::UnauthorizedLender);
+        }
 
         let insurance = InsuranceRecord {
             asset_id,
@@ -1510,8 +1662,11 @@ impl LendingContract {
             registered_at: env.ledger().timestamp(),
         };
 
-        env.storage().persistent().set(&insurance_key(asset_id), &insurance);
-        extend_persistent_ttl(&env, &insurance_key(asset_id));
+        env.storage().persistent().set(&key, &insurance);
+        extend_persistent_ttl(&env, &key);
+        let lender_key = insurance_lender_key(asset_id);
+        env.storage().persistent().set(&lender_key, &lender);
+        extend_persistent_ttl(&env, &lender_key);
 
         env.events().publish((INSURANCE_REGISTERED,), (asset_id, policy_id, coverage_amount));
     }
@@ -1521,14 +1676,41 @@ impl LendingContract {
         require_not_paused(&env);
         lender.require_auth();
 
-        let insurance: InsuranceRecord = env
+        let mut insurance: InsuranceRecord = env
             .storage()
             .persistent()
             .get(&insurance_key(asset_id))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::InsuranceNotFound));
 
+        let insurance_lender: Address = env
+            .storage()
+            .persistent()
+            .get(&insurance_lender_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::UnauthorizedLender));
+        if insurance_lender != lender {
+            panic_with_error!(&env, ContractError::UnauthorizedLender);
+        }
+
         // Payout is capped at coverage amount
         let payout = loss_amount.min(insurance.coverage_amount);
+        insurance.coverage_amount -= payout;
+        env.storage()
+            .persistent()
+            .set(&insurance_key(asset_id), &insurance);
+        extend_persistent_ttl(&env, &insurance_key(asset_id));
+
+        if payout > 0 {
+            let token_addr = get_token(&env);
+            let tok = token::Client::new(&env, &token_addr);
+            if tok.balance(&env.current_contract_address()) < payout as i128 {
+                panic_with_error!(&env, ContractError::InsufficientFunds);
+            }
+            tok.transfer(
+                &env.current_contract_address(),
+                &lender,
+                &(payout as i128),
+            );
+        }
 
         let payout_record = InsurancePayout {
             asset_id,
@@ -2157,6 +2339,19 @@ mod tests {
         client.record_lien(&admin, &1, &lender, &42, &1000);
         assert_eq!(client.get_liens(&1).len(), 1);
 
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&loan_status_key(42), &LoanStatus::Active);
+        });
+        assert!(client.try_release_lien(&admin, &1, &lender, &42).is_err());
+        assert_eq!(client.get_liens(&1).len(), 1);
+
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&loan_status_key(42), &LoanStatus::Repaid);
+        });
         client.release_lien(&admin, &1, &lender, &42);
         assert_eq!(client.get_liens(&1).len(), 0);
     }
@@ -2437,5 +2632,79 @@ mod tests {
 
         let loan = client.get_loan(&borrower).unwrap();
         assert_eq!(loan.status, LoanStatus::Active);
+    }
+
+    #[test]
+    fn test_set_max_ltv_bps_rejects_values_above_100_percent() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.initialize(&deployer, &admin, &token, &0);
+
+        client.set_max_ltv_bps(&admin, &10_000);
+        assert_eq!(get_config(&env).max_ltv_bps, 10_000);
+
+        let result = client.try_set_max_ltv_bps(&admin, &10_001);
+        assert!(result.is_err());
+        assert_eq!(get_config(&env).max_ltv_bps, 10_000);
+    }
+
+    #[test]
+    fn test_get_collateral_value_large_base_value() {
+        let env = Env::default();
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        assert_eq!(
+            client.get_collateral_value(&1_000_000_000_000_000, &100, &10_000),
+            1_000_000_000_000_000
+        );
+    }
+
+    #[test]
+    fn test_collateral_insurance_requires_matching_lien_and_is_not_overwritable() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.initialize(&deployer, &admin, &token, &0);
+
+        let lender = Address::generate(&env);
+        let other_lender = Address::generate(&env);
+        client.record_lien(&admin, &7, &lender, &41, &1000);
+        client.register_collateral_insurance(&lender, &7, &123, &500);
+
+        let insurance = client.get_insurance(&7).unwrap();
+        assert_eq!(insurance.policy_id, 123);
+        assert_eq!(insurance.coverage_amount, 500);
+
+        assert!(client
+            .try_register_collateral_insurance(&other_lender, &7, &456, &0)
+            .is_err());
+        assert!(client
+            .try_register_collateral_insurance(&lender, &7, &456, &0)
+            .is_err());
+        assert!(client
+            .try_register_collateral_insurance(&other_lender, &8, &456, &500)
+            .is_err());
+        client.record_lien(&admin, &8, &lender, &42, &1000);
+        assert!(client
+            .try_register_collateral_insurance(&lender, &8, &456, &0)
+            .is_err());
+        assert!(client
+            .try_claim_insurance(&other_lender, &7, &100)
+            .is_err());
+        assert_eq!(client.get_insurance(&7), Some(insurance));
+        assert_eq!(client.claim_insurance(&lender, &7, &100), 100);
     }
 }

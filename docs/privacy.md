@@ -1,5 +1,7 @@
 # Privacy and Data Subject Requests
 
+> **Last updated:** 2026-09-25 · **Doc version:** 0.1.0
+
 Mainstay keeps personal data off-chain wherever possible. Stellar addresses,
 maintenance signatures, and asset history are public blockchain data and cannot
 be erased or rewritten after confirmation. The API must therefore store only

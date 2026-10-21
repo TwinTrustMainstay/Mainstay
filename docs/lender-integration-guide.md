@@ -1,6 +1,10 @@
 # Lender Integration Guide
 
+> **Last updated:** 2026-10-16 · **Doc version:** 0.1.0
+
 This guide provides everything a lender or lending protocol needs to integrate with Mainstay for collateral verification, lien recording, and liquidation.
+
+> **Terminology:** terms such as *lien*, *collateral*, *covenant* and *liquidation* are defined in the [glossary](GLOSSARY.md).
 
 ---
 

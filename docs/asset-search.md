@@ -1,5 +1,7 @@
 # Asset Search API
 
+> **Last updated:** 2026-09-26 · **Doc version:** 0.1.0
+
 `search_assets` is a contract-level function on the **Asset Registry** that filters and sorts registered assets in real time, eliminating the need to index the entire registry off-chain.
 
 ## Function Signature
