@@ -340,6 +340,46 @@ fn restructure_count_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
     (RESTRUCTURE_COUNT_KEY, borrower.clone())
 }
 
+/// Accept a restructure only for the admin, a syndicate member, or the lender
+/// recorded on the loan's lien (#1860).
+fn require_restructure_caller(env: &Env, caller: &Address, loan_id: u64) {
+    let admin = get_admin(env);
+    if caller == &admin {
+        return;
+    }
+
+    if let Some(syndicate) = env
+        .storage()
+        .persistent()
+        .get::<_, Syndicate>(&syndicate_key(loan_id))
+    {
+        for member in syndicate.lenders.iter() {
+            if &member == caller {
+                return;
+            }
+        }
+    }
+
+    if let Some(asset_id) = env
+        .storage()
+        .persistent()
+        .get::<_, u64>(&loan_asset_key(loan_id))
+    {
+        let liens: Vec<LienRecord> = env
+            .storage()
+            .persistent()
+            .get(&liens_key(asset_id))
+            .unwrap_or_else(|| Vec::new(env));
+        for lien in liens.iter() {
+            if lien.loan_id == loan_id && &lien.lender == caller {
+                return;
+            }
+        }
+    }
+
+    panic_with_error!(env, ContractError::UnauthorizedLender);
+}
+
 /// A lien record representing a claim against an asset by a lender.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1449,10 +1489,14 @@ impl LendingContract {
         env.events().publish((RESTRUCTURE_PROPOSED,), (loan_id, new_deadline, reduced_payment_amount));
     }
 
-    /// Accept a loan restructure proposal (lender-only).
+    /// Accept a loan restructure proposal.
+    ///
+    /// The caller must authenticate and be the contract admin, a member of the
+    /// loan's syndicate, or the lender recorded on the loan's lien.
     pub fn accept_restructure(env: Env, lender: Address, loan_id: u64) {
         require_not_paused(&env);
         lender.require_auth();
+        require_restructure_caller(&env, &lender, loan_id);
 
         let proposal: RestructureProposal = env
             .storage()
@@ -2437,5 +2481,57 @@ mod tests {
 
         let loan = client.get_loan(&borrower).unwrap();
         assert_eq!(loan.status, LoanStatus::Active);
+    }
+
+    /// #1860: A signed address that is not the admin, a syndicate member, or
+    /// the lender recorded on the loan's lien cannot accept a restructure.
+    #[test]
+    fn test_accept_restructure_rejects_non_lender() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(LendingContract, ());
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let deployer = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.initialize(&deployer, &admin, &token, &0);
+
+        let borrower = Address::generate(&env);
+        let recorded_lender = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let loan_id = 1u64;
+        let asset_id = 7u64;
+
+        env.as_contract(&contract_id, || {
+            let proposal = RestructureProposal {
+                loan_id,
+                borrower: borrower.clone(),
+                new_deadline: 9_999,
+                reduced_payment_amount: 1,
+                forbearance_end: 0,
+                status: 0,
+                proposed_at: 0,
+            };
+            env.storage()
+                .persistent()
+                .set(&restructure_key(loan_id), &proposal);
+
+            env.storage()
+                .persistent()
+                .set(&loan_asset_key(loan_id), &asset_id);
+            let mut liens: Vec<LienRecord> = Vec::new(&env);
+            liens.push_back(LienRecord {
+                lender: recorded_lender.clone(),
+                loan_id,
+                amount: 100,
+            });
+            env.storage()
+                .persistent()
+                .set(&liens_key(asset_id), &liens);
+        });
+
+        assert!(client.try_accept_restructure(&stranger, &loan_id).is_err());
     }
 }
