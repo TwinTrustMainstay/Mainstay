@@ -1,5 +1,7 @@
 # Engineer Credentialing System
 
+> **Last updated:** 2026-09-24 · **Doc version:** 0.1.0
+
 This document describes the federated credentialing system used in Mainstay to verify and manage engineer identities and qualifications for maintenance operations.
 
 ## Overview

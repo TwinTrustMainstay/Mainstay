@@ -73,11 +73,22 @@ pub enum ContractError {
     RecordNotFound = 43,
     CompressionFailed = 44,
     CompressionRequiresDecommissioned = 45,
-    /// Issue #1767/#1768: the targeted autonomous agent is not enabled.
-    AgentDisabled = 46,
-    /// Issue #1767/#1768: an agent action was attempted before
-    /// `min_interval_secs` elapsed since its last recorded action.
-    AgentRateLimited = 47,
+    /// No timestamp authority is registered under the given `authority_id` (#1750).
+    TimestampAuthorityNotFound = 46,
+    /// The timestamp authority is revoked, or is not active at the token's `issued_at` (#1750).
+    TimestampAuthorityInactive = 47,
+    /// Token window is invalid: `expires_at` must be after `issued_at`, and `issued_at` must not be in the future (#1750).
+    InvalidTimestampWindow = 48,
+    /// A renewal token's `issued_at` must be strictly later than the stored token's (#1750).
+    TimestampNotNewer = 49,
+    /// No notary is registered under the given `notary_id` (#1753).
+    NotaryNotFound = 50,
+    /// The notary is revoked (#1753).
+    NotaryInactive = 51,
+    /// The notary's accreditation credential has expired (#1753).
+    NotaryCredentialExpired = 52,
+    /// The maintenance record already has a notarization (#1753).
+    AlreadyNotarized = 53,
 }
 
 impl From<SharedContractError> for ContractError {

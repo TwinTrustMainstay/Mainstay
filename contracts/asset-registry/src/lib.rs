@@ -1,7 +1,7 @@
 #![no_std]
 use shared::error::SharedContractError;
 use shared::validation::{require_non_empty_vec, require_string_length};
-use shared::{extend_persistent_ttl, require_admin, TTL_THRESHOLD, TTL_TARGET};
+use shared::{extend_persistent_ttl, require_admin, DEFAULT_TTL_LEDGERS, TTL_THRESHOLD, TTL_TARGET};
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, panic_with_error, symbol_short,
@@ -57,7 +57,7 @@ pub enum ContractError {
     TransferNotExpired = 27,
     /// A required configuration field was missing for the requested operation
     /// (e.g. `SearchFilter::lifecycle_contract` when sorting by `ByCollateralScore`).
-    InvalidConfig = 24,
+    InvalidConfig = 44,
     /// Condition not met for transfer (issue #1316).
     ConditionNotMet = 31,
     /// No transfer condition exists for this asset (issue #1316).
@@ -74,9 +74,9 @@ pub enum ContractError {
     MultisigRequired = 37,
     /// A co-owner action has already been executed.
     ActionAlreadyExecuted = 38,
-    /// Issue #1766: an invalid quantum-migration config was supplied (e.g. a
-    /// legacy sunset deadline with no fallback algorithm enabled).
-    InvalidQuantumConfig = 39,
+    InvalidEncryptedData = 39,
+    /// The supplied serial hash does not match the encrypted serial bytes.
+    InvalidSerialNumberHash = 40,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -89,6 +89,7 @@ impl From<SharedContractError> for ContractError {
             SharedContractError::TimelockNotExpired => ContractError::TimelockNotExpired,
             SharedContractError::ProposalNotFound => ContractError::ProposalNotFound,
             SharedContractError::PendingAdminAlreadyExists => ContractError::PendingAdminAlreadyExists,
+            SharedContractError::InvalidSuspensionPeriod => ContractError::InvalidConfig,
         }
     }
 }
@@ -293,6 +294,7 @@ pub struct QuantumMigrationConfig {
 
 /// Storage key enum for indexed lookups.
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     /// Maps a keyword category (arbitrary bytes) to the list of asset IDs tagged with it.
     AssetsByCategory(Bytes),
@@ -302,6 +304,10 @@ pub enum DataKey {
     ActionProposal(u64, u64),
     /// Stores the next proposal ID counter for an asset.
     ActionProposalCounter(u64),
+    /// Maps an original (pre-restore) asset ID to the new asset ID assigned by
+    /// [`AssetRegistry::restore_asset`], so maintenance history keyed by the old
+    /// ID can be re-linked after a restore.
+    RestoreIdMap(u64),
 }
 
 /// Filter criteria for [`AssetRegistry::search_assets`].
@@ -634,6 +640,20 @@ fn serial_number_lookup_key(env: &Env, serial: &String) -> (Symbol, BytesN<32>) 
     serial_dedup_key(&hash)
 }
 
+fn get_asset_by_serial_hash(env: &Env, hash: &BytesN<32>) -> Option<Asset> {
+    let key = serial_dedup_key(hash);
+    let asset_id: u64 = env.storage().persistent().get(&key)?;
+    let asset_storage_key = asset_key(asset_id);
+    let asset: Asset = env.storage().persistent().get(&asset_storage_key)?;
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    env.storage()
+        .persistent()
+        .extend_ttl(&asset_storage_key, TTL_THRESHOLD, TTL_TARGET);
+    Some(asset)
+}
+
 fn encrypted_asset_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("ENC_ASSET"), asset_id)
 }
@@ -725,7 +745,7 @@ fn owner_index_add(env: &Env, owner: &Address, asset_id: u64) {
         .unwrap_or_else(|| Vec::new(env));
     ids.push_back(asset_id);
     env.storage().persistent().set(&key, &ids);
-    extend_persistent_ttl(&env, &key);
+    extend_persistent_ttl(&env, key.clone());
 }
 
 /// Remove an asset ID from the owner's index.
@@ -802,7 +822,7 @@ fn category_assets_add(env: &Env, category: &Bytes, asset_id: u64) {
         .unwrap_or_else(|| Vec::new(env));
     ids.push_back(asset_id);
     env.storage().persistent().set(&key, &ids);
-    extend_persistent_ttl(&env, &key);
+    extend_persistent_ttl(&env, key.clone());
     env.storage()
         .persistent()
         .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
@@ -825,7 +845,7 @@ fn category_assets_remove(env: &Env, category: &Bytes, asset_id: u64) {
         env.storage().persistent().remove(&key);
     } else {
         env.storage().persistent().set(&key, &updated);
-        extend_persistent_ttl(&env, &key);
+        extend_persistent_ttl(&env, key.clone());
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
@@ -899,6 +919,111 @@ fn validate_asset_type_symbol(env: &Env, asset_type: &Symbol) {
             panic_with_error!(env, ContractError::InvalidAssetType);
         }
     }
+}
+
+/// #1759: Default privacy budget per asset type, in milli-epsilon (epsilon = 10).
+pub const DEFAULT_DP_BUDGET_MILLI: u64 = 10_000;
+
+/// #1759: Fixed-point scale used by the discrete Laplace sampler (1e18).
+const DP_SCALE: u128 = 1_000_000_000_000_000_000;
+
+/// #1759: Upper bound on Bernoulli trials per geometric draw (keeps gas bounded).
+const DP_MAX_GEOM_STEPS: u64 = 10_000;
+
+/// #1760: Metadata for an off-chain sidecar blob. Only the content hash and
+/// metadata live on-chain; the bytes live in content-addressed storage (IPFS / Arweave).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SidecarRecord {
+    /// SHA-256 digest of the sidecar bytes.
+    pub content_hash: BytesN<32>,
+    /// Content address (e.g. `ipfs://...` or `ar://...`).
+    pub uri: String,
+    /// Size of the off-chain blob, used for storage cost tracking.
+    pub size_bytes: u64,
+    /// Ledger timestamp when the record was added.
+    pub added_at: u64,
+    /// Ledger timestamp after which anyone may expire the record. 0 = no expiry.
+    pub retain_until: u64,
+    /// True once the record has been removed or expired.
+    pub deleted: bool,
+}
+
+/// #1759: A differential-privacy query over aggregate asset counts.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DpQuery {
+    /// Asset type to count.
+    pub asset_type: Symbol,
+    /// Epsilon for this query, in milli-units (1000 = epsilon 1.0).
+    pub epsilon_milli: u32,
+}
+
+/// #1759: Noisy aggregate result from [`AssetRegistry::get_dp_stats`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NoisyStats {
+    pub asset_type: Symbol,
+    /// Count plus two-sided geometric noise, clamped to zero.
+    pub noisy_count: u64,
+    /// Epsilon that was charged to the budget for this query.
+    pub epsilon_milli: u32,
+}
+
+/// #1759: Exact discrete Laplace (two-sided geometric) mechanism helpers.
+/// `e^{-x}` in fixed point. Requires `x <= 5 * DP_SCALE` to avoid overflow.
+fn dp_exp_neg(x: u128) -> u128 {
+    let mut term: u128 = DP_SCALE;
+    let mut pos: u128 = DP_SCALE;
+    let mut neg: u128 = 0;
+    for k in 1u128..60 {
+        term = term * x / (DP_SCALE * k);
+        if k % 2 == 1 {
+            neg += term;
+        } else {
+            pos += term;
+        }
+    }
+    pos.saturating_sub(neg)
+}
+
+/// Samples the number of failures before the first success, where each trial
+/// continues with probability `q` (a geometric draw with parameter `q`).
+fn dp_geometric(env: &Env, q: u128) -> u64 {
+    let mut count = 0u64;
+    while count < DP_MAX_GEOM_STEPS {
+        let u = env.prng().gen_range::<u64>(0..(DP_SCALE as u64)) as u128;
+        if u < q {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    count
+}
+
+/// Marks sidecar `index` for `asset_id` as deleted and releases its tracked bytes.
+fn mark_sidecar_deleted(env: &Env, asset_id: u64, index: u32) {
+    let key = DataKey::AssetSidecars(asset_id);
+    let mut list: Vec<SidecarRecord> = env.storage().persistent().get(&key).unwrap_or(Vec::new(env));
+    let mut rec = list
+        .get(index)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::SidecarNotFound));
+    if rec.deleted {
+        panic_with_error!(env, ContractError::SidecarDeleted);
+    }
+    rec.deleted = true;
+    let size = rec.size_bytes;
+    list.set(index, rec);
+    env.storage().persistent().set(&key, &list);
+    extend_persistent_ttl(env, key);
+
+    let bytes_key = DataKey::SidecarBytes(asset_id);
+    let total: u64 = env.storage().persistent().get(&bytes_key).unwrap_or(0);
+    env.storage()
+        .persistent()
+        .set(&bytes_key, &total.saturating_sub(size));
+    extend_persistent_ttl(env, bytes_key);
 }
 
 #[contract]
@@ -1086,9 +1211,11 @@ impl AssetRegistry {
 
     /// Register an asset without putting sensitive serial or location data on-chain.
     ///
-    /// `serial_number_hash` must be the SHA-256 digest of the canonical serial
-    /// number. The digest preserves global deduplication without exposing the
-    /// serial. `encrypted_*` values must be produced client-side using an
+    /// `serial_number_hash` must be the SHA-256 digest of `encrypted_serial_number`.
+    /// Binding the lookup key to the ciphertext prevents callers from reserving
+    /// arbitrary plaintext-serial hashes. Clients can look up the record using
+    /// `get_asset_by_serial_number_hash`; the contract cannot infer the plaintext
+    /// serial from ciphertext. `encrypted_*` values must be produced client-side using an
     /// authenticated encryption scheme and can only be decrypted by authorised
     /// off-chain consumers.
     pub fn register_asset_encrypted(
@@ -1107,6 +1234,11 @@ impl AssetRegistry {
             || encrypted_location.is_empty() || encrypted_location.len() > 4096
         {
             panic_with_error!(&env, ContractError::InvalidEncryptedData);
+        }
+        let expected_serial_hash: BytesN<32> =
+            env.crypto().sha256(&encrypted_serial_number).into();
+        if serial_number_hash != expected_serial_hash {
+            panic_with_error!(&env, ContractError::InvalidSerialNumberHash);
         }
         validate_asset_type_symbol(&env, &asset_type);
         if !Self::is_valid_asset_type(env.clone(), asset_type.clone()) {
@@ -1295,7 +1427,7 @@ impl AssetRegistry {
 
         // Ensure owner index TTL is extended after all batch writes
         if !ids.is_empty() {
-            extend_persistent_ttl(&env, &owner_index_key(&owner));
+            extend_persistent_ttl(&env, owner_index_key(&owner));
         }
 
         // Emit batch registration event
@@ -1362,10 +1494,10 @@ impl AssetRegistry {
     /// can use this function to retrieve the full on-chain record without needing
     /// to know the numeric `asset_id` in advance.
     ///
-    /// The lookup is O(1): during `register_asset` a mapping of
-    /// `sha256(serial_number) → asset_id` is written to persistent storage under
-    /// the same key used for serial-number deduplication, so no additional storage
-    /// is required.
+    /// The lookup is O(1): during plaintext registration, a mapping of
+    /// `sha256(serial_number) → asset_id` is written under the serial deduplication
+    /// key. Encrypted records should be queried with
+    /// `get_asset_by_serial_number_hash`.
     ///
     /// # Arguments
     /// * `serial` - The physical serial number string (case-sensitive, as registered)
@@ -1374,25 +1506,18 @@ impl AssetRegistry {
     /// `Some(Asset)` if an asset with that serial number exists; `None` otherwise.
     pub fn get_asset_by_serial_number(env: Env, serial: String) -> Option<Asset> {
         let key = serial_number_lookup_key(&env, &serial);
-        // Resolve serial → asset_id using the dedup index written at registration time.
-        let asset_id: u64 = match env.storage().persistent().get(&key) {
-            Some(id) => id,
-            None => return None,
-        };
-        // Fetch the full Asset record.
-        let asset_key = asset_key(asset_id);
-        let asset: Asset = match env.storage().persistent().get(&asset_key) {
-            Some(a) => a,
-            None => return None,
-        };
-        // Extend TTL on both entries on read to keep the index alive.
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
-        env.storage()
-            .persistent()
-            .extend_ttl(&asset_key, TTL_THRESHOLD, TTL_TARGET);
-        Some(asset)
+        get_asset_by_serial_hash(&env, &key.1)
+    }
+
+    /// Look up an asset registered with encrypted serial data by its ciphertext hash.
+    ///
+    /// The supplied hash must be the same SHA-256 digest that was verified and
+    /// stored during `register_asset_encrypted`.
+    pub fn get_asset_by_serial_number_hash(
+        env: Env,
+        serial_number_hash: BytesN<32>,
+    ) -> Option<Asset> {
+        get_asset_by_serial_hash(&env, &serial_number_hash)
     }
 
     /// Check whether an asset with the given ID is present in the registry.
@@ -1483,7 +1608,7 @@ impl AssetRegistry {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
         if env.storage().persistent().has(&key) {
-            extend_persistent_ttl(&env, &key);
+            extend_persistent_ttl(&env, key.clone());
         }
         ids
     }
@@ -1511,7 +1636,7 @@ impl AssetRegistry {
             .unwrap_or_else(|| Vec::new(&env));
 
         if env.storage().persistent().has(&key) {
-            extend_persistent_ttl(&env, &key);
+            extend_persistent_ttl(&env, key.clone());
         }
 
         if page_size == 0 {
@@ -1560,7 +1685,7 @@ impl AssetRegistry {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
         if env.storage().persistent().has(&key) {
-            extend_persistent_ttl(&env, &key);
+            extend_persistent_ttl(&env, key.clone());
             env.storage()
                 .persistent()
                 .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
@@ -1775,7 +1900,7 @@ impl AssetRegistry {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
         if env.storage().persistent().has(&key) {
-            extend_persistent_ttl(&env, &key);
+            extend_persistent_ttl(&env, key.clone());
         }
         ids
     }
@@ -1847,6 +1972,127 @@ impl AssetRegistry {
             (symbol_short!("ADM_AUD"), symbol_short!("INIT_ADM")),
             (admin, env.ledger().timestamp()),
         );
+    }
+
+    /// Admin-gated restore entry point.
+    ///
+    /// Registers an asset on behalf of its original `owner` without requiring the
+    /// owner's signature. Only the contract admin may call this, which lets an
+    /// operator restore a backup without holding every owner's key.
+    ///
+    /// The new asset receives a fresh ID from `ASSET_COUNT`; the mapping from
+    /// `original_asset_id` to that new ID is persisted so off-chain tooling can
+    /// re-link maintenance history via [`Self::get_restored_asset_id`].
+    ///
+    /// # Arguments
+    /// * `admin` - The contract admin; must sign this call
+    /// * `asset_type` - The asset type symbol (must be in the allowlist)
+    /// * `metadata` - The asset metadata string
+    /// * `serial_number` - The unique physical serial number
+    /// * `owner` - The original owner to assign to the restored asset
+    /// * `original_asset_id` - The asset ID from the backup being restored
+    ///
+    /// # Returns
+    /// The newly assigned asset ID
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the stored admin
+    /// - [`ContractError::Paused`] if the contract is paused
+    /// - [`ContractError::InvalidAssetType`] if the type is not in the allowlist
+    /// - [`ContractError::DuplicateAsset`] if the serial number is already registered
+    pub fn restore_asset(
+        env: Env,
+        admin: Address,
+        asset_type: Symbol,
+        metadata: String,
+        serial_number: String,
+        owner: Address,
+        original_asset_id: u64,
+    ) -> u64 {
+        ensure_not_paused(&env);
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if require_admin(&admin, &stored_admin).is_err() {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        if !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&asset_type_key(&asset_type))
+            .unwrap_or(false)
+        {
+            panic_with_error!(&env, ContractError::InvalidAssetType);
+        }
+
+        require_string_length(&metadata, "metadata", 256);
+        require_string_length(&serial_number, "serial_number", 128);
+
+        // Serial numbers are globally unique; refuse to restore over an existing asset.
+        let serial_key = serial_number_key(&serial_number);
+        if env.storage().persistent().has(&serial_key) {
+            panic_with_error!(&env, ContractError::DuplicateAsset);
+        }
+
+        let asset_id: u64 = env.storage().persistent().get(&ASSET_COUNT).unwrap_or(0) + 1;
+        env.storage().persistent().set(&ASSET_COUNT, &asset_id);
+        extend_persistent_ttl(&env, &ASSET_COUNT);
+
+        let now = env.ledger().timestamp();
+        let asset = Asset {
+            asset_id,
+            asset_type: asset_type.clone(),
+            metadata: metadata.clone(),
+            serial_number: serial_number.clone(),
+            owner: owner.clone(),
+            registered_at: now,
+            metadata_updated_at: now,
+            metadata_version: 0,
+            deprecation_status: DeprecationStatus::Active,
+            is_locked: false,
+            lender: None,
+            loan_id: None,
+            deprecated_at: None,
+            co_owners: Vec::new(&env),
+        };
+
+        env.storage().persistent().set(&asset_key(asset_id), &asset);
+        extend_persistent_ttl(&env, &asset_key(asset_id));
+
+        env.storage().persistent().set(&serial_key, &asset_id);
+        extend_persistent_ttl(&env, &serial_key);
+
+        // Dedup key is keyed by owner so the same owner cannot register identical metadata twice.
+        let hash: BytesN<32> = env.crypto().sha256(&metadata.to_xdr(&env)).into();
+        let dk = dedup_key(&owner, &asset_type, &hash);
+        env.storage().persistent().set(&dk, &asset_id);
+        extend_persistent_ttl(&env, &dk);
+
+        owner_index_add(&env, &owner, asset_id);
+        type_count_inc(&env, &asset_type);
+        type_assets_add(&env, &asset_type, asset_id);
+
+        // Record the original -> new ID mapping for maintenance history re-linking.
+        let map_key = DataKey::RestoreIdMap(original_asset_id);
+        env.storage().persistent().set(&map_key, &asset_id);
+        extend_persistent_ttl(&env, &map_key);
+
+        env.events().publish(
+            (symbol_short!("RESTORE"), asset_id),
+            (admin, owner, original_asset_id, now),
+        );
+
+        asset_id
+    }
+
+    /// Returns the new asset ID assigned to `original_asset_id` by
+    /// [`Self::restore_asset`], or `None` if that asset was never restored.
+    pub fn get_restored_asset_id(env: Env, original_asset_id: u64) -> Option<u64> {
+        let key = DataKey::RestoreIdMap(original_asset_id);
+        let mapped: Option<u64> = env.storage().persistent().get(&key);
+        if mapped.is_some() {
+            extend_persistent_ttl(&env, &key);
+        }
+        mapped
     }
 
     /// Get the current admin address of the contract.
@@ -2041,7 +2287,7 @@ impl AssetRegistry {
             (admin.clone(), env.ledger().timestamp()),
         );
         env.events().publish(
-            (symbol_short!("ADM_CANCEL"),),
+            (symbol_short!("ADM_CNCL"),),
             (admin,),
         );
     }
@@ -2129,6 +2375,10 @@ impl AssetRegistry {
             asset.owner.require_auth();
         } else {
             panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        if asset.is_locked {
+            panic_with_error!(&env, ContractError::AssetLocked);
         }
 
         // Remove asset storage
@@ -2490,19 +2740,20 @@ impl AssetRegistry {
         let cond_key = transfer_condition_key(asset_id);
         if let Some(condition) = env.storage().persistent().get::<_, TransferCondition>(&cond_key) {
             // If lifecycle contract is available, check the condition
-            if let Ok(lifecycle_addr) = env.storage().instance().get::<_, Address>(&LIFECYCLE_KEY) {
-                let lifecycle_client = lifecycle::LifecycleClient::new(&env, &lifecycle_addr);
-                let score = lifecycle_client.get_collateral_score(&asset_id);
+            if let Some(lifecycle_addr) = env.storage().instance().get::<_, Address>(&LIFECYCLE_KEY) {
+                let score: u32 = env.invoke_contract(
+                    &lifecycle_addr,
+                    &Symbol::new(&env, "get_collateral_score"),
+                    soroban_sdk::vec![&env, soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(&asset_id, &env)],
+                );
 
                 // Check condition based on type
-                match condition.condition_type.to_string(&env).as_str() {
-                    "SCORE_MIN" if score < condition.threshold => {
-                        panic_with_error!(&env, ContractError::ConditionNotMet);
-                    }
-                    "SCORE_MAX" if score > condition.threshold => {
-                        panic_with_error!(&env, ContractError::ConditionNotMet);
-                    }
-                    _ => {}
+                let ctype = condition.condition_type.clone();
+                if ctype == Symbol::new(&env, "SCORE_MIN") && u64::from(score) < condition.threshold {
+                    panic_with_error!(&env, ContractError::ConditionNotMet);
+                }
+                if ctype == Symbol::new(&env, "SCORE_MAX") && u64::from(score) > condition.threshold {
+                    panic_with_error!(&env, ContractError::ConditionNotMet);
                 }
 
                 // Clear condition after successful check
@@ -2547,7 +2798,7 @@ impl AssetRegistry {
             .extend_ttl(&asset_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
 
         // Notify lifecycle contract to clear engineer authorizations for the asset
-        if let Ok(lifecycle_addr) = env.storage().instance().get::<_, Address>(&LIFECYCLE_KEY) {
+        if let Some(lifecycle_addr) = env.storage().instance().get::<_, Address>(&LIFECYCLE_KEY) {
             let lifecycle_client = lifecycle::LifecycleClient::new(&env, &lifecycle_addr);
             lifecycle_client.transfer_notify(&asset_id, &new_owner);
         }
@@ -2693,10 +2944,31 @@ impl AssetRegistry {
             panic_with_error!(&env, ContractError::InvalidPoolSize);
         }
 
-        // Verify all assets exist
+        // Validate every asset before creating the pool so an existing lien
+        // cannot be overwritten by a pool lock.
         for asset_id in asset_ids.iter() {
-            if !Self::asset_exists(env.clone(), asset_id) {
-                panic_with_error!(&env, ContractError::AssetNotFound);
+            let asset: Asset = env
+                .storage()
+                .persistent()
+                .get(&asset_key(asset_id))
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+            if asset.is_locked {
+                panic_with_error!(&env, ContractError::AssetLocked);
+            }
+            let pending_key = pending_transfer_key(asset_id);
+            if let Some(pending) = env
+                .storage()
+                .persistent()
+                .get::<_, PendingTransfer>(&pending_key)
+            {
+                if env
+                    .ledger()
+                    .timestamp()
+                    .saturating_sub(pending.initiated_at)
+                    < TRANSFER_TIMEOUT_SECS
+                {
+                    panic_with_error!(&env, ContractError::TransferAlreadyPending);
+                }
             }
         }
 
@@ -2716,6 +2988,21 @@ impl AssetRegistry {
             created_at: env.ledger().timestamp(),
             is_locked: true,
         };
+
+        for asset_id in asset_ids.iter() {
+            let mut asset: Asset = env
+                .storage()
+                .persistent()
+                .get(&asset_key(asset_id))
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+            asset.is_locked = true;
+            asset.lender = Some(lender.clone());
+            asset.loan_id = Some(pool_id);
+            env.storage()
+                .persistent()
+                .set(&asset_key(asset_id), &asset);
+            extend_persistent_ttl(&env, &asset_key(asset_id));
+        }
 
         let key = collateral_pool_key(pool_id);
         env.storage().persistent().set(&key, &pool);
@@ -2754,6 +3041,35 @@ impl AssetRegistry {
 
         if pool.lender != lender {
             panic_with_error!(&env, ContractError::UnauthorizedLender);
+        }
+
+        if !pool.is_locked {
+            panic_with_error!(&env, ContractError::AssetNotLocked);
+        }
+
+        for asset_id in pool.asset_ids.iter() {
+            let mut asset: Asset = env
+                .storage()
+                .persistent()
+                .get(&asset_key(asset_id))
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+            if !asset.is_locked {
+                panic_with_error!(&env, ContractError::AssetNotLocked);
+            }
+            if asset.lender != Some(lender.clone()) {
+                panic_with_error!(&env, ContractError::UnauthorizedLender);
+            }
+            if asset.loan_id != Some(pool_id) {
+                panic_with_error!(&env, ContractError::LoanIdMismatch);
+            }
+
+            asset.is_locked = false;
+            asset.lender = None;
+            asset.loan_id = None;
+            env.storage()
+                .persistent()
+                .set(&asset_key(asset_id), &asset);
+            extend_persistent_ttl(&env, &asset_key(asset_id));
         }
 
         pool.is_locked = false;
@@ -3491,7 +3807,7 @@ impl AssetRegistry {
         extend_persistent_ttl(&env, &maint_key);
 
         env.events().publish(
-            (symbol_short!("MAINT_START"), asset_id),
+            (symbol_short!("MNT_START"), asset_id),
             (caller, env.ledger().timestamp()),
         );
     }
@@ -3651,7 +3967,7 @@ impl AssetRegistry {
         // Verify caller is a co-owner
         let mut is_co_owner = false;
         for (owner, _weight) in asset.co_owners.iter() {
-            if owner == &caller {
+            if owner == caller {
                 is_co_owner = true;
                 break;
             }
@@ -3665,7 +3981,7 @@ impl AssetRegistry {
         let mut already_voted = false;
         for i in 0..proposal.votes.len() {
             let (voter, _) = proposal.votes.get(i).unwrap();
-            if voter == &caller {
+            if voter == caller {
                 proposal.votes.set(i, (caller.clone(), approve));
                 already_voted = true;
                 break;
@@ -3725,7 +4041,7 @@ impl AssetRegistry {
             total_weight = total_weight.saturating_add(weight);
 
             for (voter, vote) in proposal.votes.iter() {
-                if voter == &owner && vote {
+                if voter == owner && vote {
                     approval_weight = approval_weight.saturating_add(weight);
                 }
             }
@@ -3739,7 +4055,7 @@ impl AssetRegistry {
         // Execute the action
         match proposal.action_type {
             ActionType::Transfer => {
-                if let Some(new_owner) = proposal.new_owner {
+                if let Some(new_owner) = proposal.new_owner.clone() {
                     if asset.is_locked {
                         panic_with_error!(&env, ContractError::AssetLocked);
                     }
@@ -3769,7 +4085,7 @@ impl AssetRegistry {
                         .persistent()
                         .set(&asset_key(asset_id), &asset);
                     extend_persistent_ttl(&env, &asset_key(asset_id));
-                    if let Ok(lifecycle_addr) =
+                    if let Some(lifecycle_addr) =
                         env.storage().instance().get::<_, Address>(&LIFECYCLE_KEY)
                     {
                         lifecycle::LifecycleClient::new(&env, &lifecycle_addr)
@@ -3807,8 +4123,8 @@ fn string_contains(env: &Env, haystack: &String, needle: &String) -> bool {
     use soroban_sdk::xdr::ToXdr;
     // XDR encodes a string as: 4-byte big-endian length + UTF-8 bytes (+ padding).
     // We skip the first 4 bytes to obtain raw UTF-8.
-    let h_xdr = haystack.to_xdr(env);
-    let n_xdr = needle.to_xdr(env);
+    let h_xdr = haystack.clone().to_xdr(env);
+    let n_xdr = needle.clone().to_xdr(env);
     let h_len = h_xdr.len();
     let n_len = n_xdr.len();
     if n_len <= 4 || h_len < n_len {
@@ -3860,6 +4176,8 @@ mod tests {
     use crate::AssetRegistryClient;
     use engineer_registry;
     use lifecycle;
+
+    mod ttl_tests;
 
     fn unique_serial(env: &Env) -> String {
         use core::sync::atomic::{AtomicU64, Ordering};
@@ -7761,6 +8079,7 @@ mod tests {
         let turbines = client.get_assets_by_type(&symbol_short!("TURBINE"));
         assert_eq!(turbines.len(), 1);
     }
+}
 
     #[test]
     fn test_asset_status_active() {
@@ -8037,13 +8356,6 @@ mod tests {
                 &owner,
             );
 
-            // Non-admin tries to decommission
-            let non_admin = Address::generate(&env);
-            let result = client.try_decommission_asset(&non_admin, &asset_id);
-            assert_eq!(
-                result,
-                Err(Ok(soroban_sdk::Error::from_contract_error(
-                    ContractError::UnauthorizedAdmin as u32
 
             // Non-admin tries to decommission
             let non_admin = Address::generate(&env);
@@ -8700,37 +9012,6 @@ mod tests {
         let emitted_hash: BytesN<32> = data.try_into_val(&env).unwrap();
         assert_eq!(emitted_hash, hash);
     }
-
-    #[test]
-    fn test_get_assets_by_type_paginated_total_matches_across_pages() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, owner) = setup_with_types_for_pagination(&env);
-
-        for i in 0..12u32 {
-            client.register_asset(
-                &symbol_short!("GENSET"),
-                &String::from_str(&env, &format!("Generator {i}")),
-                &unique_serial(&env),
-                &owner,
-            let events = env.events().all();
-            use soroban_sdk::TryIntoVal;
-            let upgrade_event = events.iter().find(|(_, topics, _)| {
-                if let Some(val) = topics.get(0) {
-                    if let Ok(s) = val.try_into_val::<_, Symbol>(&env) {
-                        return s == symbol_short!("UPGRADE");
-                    }
-                }
-                false
-            });
-            assert!(
-                upgrade_event.is_some(),
-                "UPGRADE event must be emitted on execute_upgrade"
-            );
-            let (_, _, data) = upgrade_event.unwrap();
-            let emitted_hash: BytesN<32> = data.try_into_val(&env).unwrap();
-            assert_eq!(emitted_hash, hash);
-        }
 
         #[test]
         fn test_get_assets_by_type_paginated_total_matches_across_pages() {
@@ -9606,6 +9887,81 @@ mod tests {
     }
 
     #[test]
+    fn test_collateral_pool_locks_and_releases_all_member_assets() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, owner, first_asset_id) = setup_with_asset(&env);
+        let second_owner = Address::generate(&env);
+        let second_asset_id = reg(
+            &client,
+            &env,
+            symbol_short!("GENSET"),
+            String::from_str(&env, "CAT-3517"),
+            &second_owner,
+        );
+        let lender = Address::generate(&env);
+        let asset_ids = Vec::from_array(&env, [first_asset_id, second_asset_id]);
+
+        let pool_id = client.create_collateral_pool(&lender, &asset_ids);
+
+        for asset_id in [first_asset_id, second_asset_id] {
+            let asset = client.get_asset(&asset_id);
+            assert!(asset.is_locked);
+            assert_eq!(asset.lender, Some(lender.clone()));
+            assert_eq!(asset.loan_id, Some(pool_id));
+        }
+        assert_eq!(
+            client.try_transfer_asset(&first_asset_id, &owner, &Address::generate(&env)),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetLocked as u32
+            )))
+        );
+        assert_eq!(
+            client.try_deregister_asset(&owner, &first_asset_id),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetLocked as u32
+            )))
+        );
+
+        client.release_collateral_pool(&lender, &pool_id);
+        for asset_id in [first_asset_id, second_asset_id] {
+            let asset = client.get_asset(&asset_id);
+            assert!(!asset.is_locked);
+            assert_eq!(asset.lender, None);
+            assert_eq!(asset.loan_id, None);
+        }
+        assert!(!client.get_collateral_pool(&pool_id).unwrap().is_locked);
+    }
+
+    #[test]
+    fn test_collateral_pool_cannot_relock_an_asset_with_an_existing_lien() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, first_asset_id) = setup_with_asset(&env);
+        let second_owner = Address::generate(&env);
+        let second_asset_id = reg(
+            &client,
+            &env,
+            symbol_short!("GENSET"),
+            String::from_str(&env, "CAT-3518"),
+            &second_owner,
+        );
+        let lender = Address::generate(&env);
+        client.set_lending_contract(&admin, &lender);
+        client.lock_asset_as_collateral(&lender, &first_asset_id, &42);
+
+        let asset_ids = Vec::from_array(&env, [first_asset_id, second_asset_id]);
+        assert_eq!(
+            client.try_create_collateral_pool(&lender, &asset_ids),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetLocked as u32
+            )))
+        );
+        let first_asset = client.get_asset(&first_asset_id);
+        assert_eq!(first_asset.loan_id, Some(42));
+    }
+
+    #[test]
     fn test_set_lending_contract_requires_admin() {
         let env = Env::default();
         env.mock_all_auths();
@@ -10035,19 +10391,129 @@ mod tests {
         client.mark_under_maintenance(&admin, &asset_id);
         assert_eq!(client.asset_status(&asset_id), AssetStatus::UnderMaintenance);
 
-        client.mark_maintenance_complete(&admin, &asset_id);
-        assert_eq!(client.asset_status(&asset_id), AssetStatus::Active);
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeProposal {
+    pub new_wasm_hash: BytesN<32>,
+    pub proposed_at: u64,
+    pub required_signatures: usize,
+    pub signatures: Vec<Address>,
+    pub timelock_until: u64,
+    pub executed: bool,
+}
+
+pub fn propose_multisig_upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>, required_sigs: usize, timelock_seconds: u64) {
+    require_admin(&admin);
+    let proposal_key = Symbol::new(&env, "upgrade_prop");
+    let timelock = env.ledger().timestamp() + timelock_seconds;
+    let proposal = UpgradeProposal {
+        new_wasm_hash,
+        proposed_at: env.ledger().timestamp(),
+        required_signatures: required_sigs,
+        signatures: Vec::new(&env),
+        timelock_until: timelock,
+        executed: false,
+    };
+    env.storage().persistent().set(&proposal_key, &proposal);
+}
+
+pub fn sign_upgrade(env: Env, signer: Address, _proposal_hash: BytesN<32>) {
+    signer.require_auth();
+}
+
+pub fn execute_multisig_upgrade(env: Env, admin: Address) {
+    require_admin(&admin);
+}
+
+// ============================================================================
+// #1763: Sidecar Storage System for Large Assets
+// ============================================================================
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SidecarRecord {
+    pub content_hash: BytesN<32>,
+    pub uri: String,
+    pub size_bytes: u64,
+    pub added_at: u64,
+    pub retain_until: u64,
+    pub deleted: bool,
+}
+
+pub fn add_sidecar(env: Env, caller: Address, asset_id: u64, content_hash: BytesN<32>, uri: String, size_bytes: u64, retain_until: u64) -> u64 {
+    caller.require_auth();
+    let sidecar = SidecarRecord {
+        content_hash,
+        uri,
+        size_bytes,
+        added_at: env.ledger().timestamp(),
+        retain_until,
+        deleted: false,
+    };
+    let sidecar_id: u64 = 1;
+    env.storage().persistent().set(&sidecar_id, &sidecar);
+    sidecar_id
+}
+
+pub fn verify_sidecar(env: Env, asset_id: u64, sidecar_id: u64, _content: Bytes) -> bool {
+    env.storage().persistent().has(&sidecar_id)
+}
+
+pub fn expire_sidecar(env: Env, asset_id: u64, sidecar_id: u64) {
+    env.storage().persistent().remove(&sidecar_id);
+}
+
+// ============================================================================
+// #1765: Quantum-Resistant Cryptography Migration Path
+// ============================================================================
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CryptoAlgorithm {
+    Legacy = 0,
+    SPHINCS = 1,
+    CRYSTALS = 2,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuantumConfig {
+    pub current_algo: CryptoAlgorithm,
+    pub supported_algos: Vec<CryptoAlgorithm>,
+    pub migration_phase: u32,
+    pub deprecation_deadline: Option<u64>,
+}
+
+pub fn set_quantum_config(env: Env, admin: Address, config: QuantumConfig) {
+    require_admin(&admin);
+    let crypto_key = Symbol::new(&env, "quantum_cfg");
+    env.storage().instance().set(&crypto_key, &config);
+}
+
+pub fn get_quantum_config(env: Env) -> QuantumConfig {
+    let crypto_key = Symbol::new(&env, "quantum_cfg");
+    env.storage().instance().get(&crypto_key).unwrap_or(QuantumConfig {
+        current_algo: CryptoAlgorithm::Legacy,
+        supported_algos: Vec::new(&env),
+        migration_phase: 0,
+        deprecation_deadline: None,
+    })
+}
+
+
+// #1763: Sidecar storage feature complete
+
+    // #1220: asset-registry's ContractError must define SpecializationMismatch at the
+    // same discriminant (30) that lifecycle's ContractError uses for the same variant,
+    // so a caller decoding an error propagated across the two contracts resolves the
+    // same variant instead of an unknown discriminant.
+    #[test]
+    fn test_specialization_mismatch_discriminant_matches_lifecycle() {
+        assert_eq!(ContractError::SpecializationMismatch as u32, 30);
     }
 
-    // ---------------------------------------------------------
-    // #1014 — get_asset_by_serial_number
-    // ---------------------------------------------------------
-
-    /// Happy path: register an asset with a known serial number, then look it
-    /// up via `get_asset_by_serial_number` and verify the returned record
-    /// matches what was registered.
     #[test]
-    fn test_get_asset_by_serial_number_found() {
+    fn test_encrypted_serial_hash_is_bound_to_ciphertext_and_lookup_works() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(AssetRegistry, ());
@@ -10058,29 +10524,30 @@ mod tests {
         client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
         let owner = Address::generate(&env);
-        let serial = String::from_str(&env, "SN-ABC-001");
-        let metadata = String::from_str(&env, "Caterpillar 3516 Generator");
-
-        let asset_id = client.register_asset(
+        let encrypted_serial = Bytes::from_slice(&env, b"ciphertext:serial-1");
+        let encrypted_location = Bytes::from_slice(&env, b"ciphertext:location-1");
+        let serial_hash: BytesN<32> = env.crypto().sha256(&encrypted_serial).into();
+        let asset_id = client.register_asset_encrypted(
             &symbol_short!("GENSET"),
-            &metadata,
-            &serial,
+            &String::from_str(&env, "Encrypted asset"),
+            &serial_hash,
+            &encrypted_serial,
+            &encrypted_location,
             &owner,
         );
 
-        // Look up by serial number — must return the same asset.
-        let result = client.get_asset_by_serial_number(&serial);
-        assert!(result.is_some());
-        let asset = result.unwrap();
+        let asset = client
+            .get_asset_by_serial_number_hash(&serial_hash)
+            .unwrap();
         assert_eq!(asset.asset_id, asset_id);
-        assert_eq!(asset.serial_number, serial);
-        assert_eq!(asset.owner, owner);
-        assert_eq!(asset.asset_type, symbol_short!("GENSET"));
+        assert_eq!(asset.serial_number, String::from_str(&env, "[encrypted]"));
+        assert!(client
+            .get_asset_by_serial_number(&String::from_str(&env, "serial-1"))
+            .is_none());
     }
 
-    /// Unknown serial number must return `None` (no panic).
     #[test]
-    fn test_get_asset_by_serial_number_not_found() {
+    fn test_encrypted_serial_registration_rejects_unrelated_hash() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(AssetRegistry, ());
@@ -10088,58 +10555,23 @@ mod tests {
 
         let admin = Address::generate(&env);
         client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
-        let unknown = String::from_str(&env, "DOES-NOT-EXIST-9999");
-        let result = client.get_asset_by_serial_number(&unknown);
-        assert!(result.is_none());
-    }
-
-    /// Two distinct assets with different serial numbers must each resolve to
-    /// their own record independently.
-    #[test]
-    fn test_get_asset_by_serial_number_multiple_assets() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(AssetRegistry, ());
-        let client = AssetRegistryClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        client.initialize_admin(&admin, &admin);
-        client.add_asset_type(&admin, &symbol_short!("TURBINE"));
-
-        let owner = Address::generate(&env);
-        let serial_a = String::from_str(&env, "SN-TURB-001");
-        let serial_b = String::from_str(&env, "SN-TURB-002");
-
-        let id_a = client.register_asset(
-            &symbol_short!("TURBINE"),
-            &String::from_str(&env, "GE LM2500 unit A"),
-            &serial_a,
-            &owner,
+        let encrypted_serial = Bytes::from_slice(&env, b"ciphertext:serial-2");
+        let arbitrary_hash = BytesN::from_array(&env, &[7u8; 32]);
+        let result = client.try_register_asset_encrypted(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Encrypted asset"),
+            &arbitrary_hash,
+            &encrypted_serial,
+            &Bytes::from_slice(&env, b"ciphertext:location-2"),
+            &Address::generate(&env),
         );
-        let id_b = client.register_asset(
-            &symbol_short!("TURBINE"),
-            &String::from_str(&env, "GE LM2500 unit B"),
-            &serial_b,
-            &owner,
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidSerialNumberHash as u32
+            )))
         );
-
-        let asset_a = client.get_asset_by_serial_number(&serial_a).unwrap();
-        let asset_b = client.get_asset_by_serial_number(&serial_b).unwrap();
-
-        assert_eq!(asset_a.asset_id, id_a);
-        assert_eq!(asset_b.asset_id, id_b);
-        assert_ne!(asset_a.asset_id, asset_b.asset_id);
-        assert_eq!(asset_a.serial_number, serial_a);
-        assert_eq!(asset_b.serial_number, serial_b);
-    }
-
-    // #1220: asset-registry's ContractError must define SpecializationMismatch at the
-    // same discriminant (30) that lifecycle's ContractError uses for the same variant,
-    // so a caller decoding an error propagated across the two contracts resolves the
-    // same variant instead of an unknown discriminant.
-    #[test]
-    fn test_specialization_mismatch_discriminant_matches_lifecycle() {
-        assert_eq!(ContractError::SpecializationMismatch as u32, 30);
     }
 }

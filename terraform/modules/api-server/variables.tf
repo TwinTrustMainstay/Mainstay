@@ -57,18 +57,31 @@ variable "request_retention_seconds" {
   default     = 604800
 }
 
-variable "vault_address" {
-  description = "Address of the Vault server used by the AWS auth method on API instances"
+variable "alb_subnet_cidrs" {
+  description = "CIDR blocks of the ALB subnets; nginx realip trusts only these when reading X-Forwarded-For"
+  type        = list(string)
+  default     = []
+}
+
+variable "prometheus_security_group_id" {
+  description = "Security group ID of the Prometheus host allowed to scrape the private metrics port"
+  type        = string
+  default     = ""
+}
+
+variable "metrics_port" {
+  description = "Private port on which the API serves Prometheus metrics (reachable only from the Prometheus host)"
+  type        = number
+  default     = 9100
+}
+
+variable "on_call_email" {
+  description = "On-call email address subscribed to API alarm notifications"
   type        = string
 }
 
-variable "vault_aws_role" {
-  description = "Vault AWS auth role the API instance assumes via its IAM role"
-  type        = string
-}
-
-variable "vault_secret_path" {
-  description = "Vault KV path holding the API server's secrets (stellar_rpc_url, third_party_api_key)"
+variable "image_tag" {
+  description = "Immutable container image tag or digest (e.g. sha256:... or v1.2.3) for the API server image"
   type        = string
 }
 

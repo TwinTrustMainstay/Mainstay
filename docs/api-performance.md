@@ -1,5 +1,7 @@
 # API performance integration
 
+> **Last updated:** 2026-09-26 · **Doc version:** 0.1.0
+
 Mainstay's API service is deployed separately from this repository. The
 contract workspace provides bounded aggregation and batch primitives that an
 API gateway can expose without issuing one RPC request per related record.

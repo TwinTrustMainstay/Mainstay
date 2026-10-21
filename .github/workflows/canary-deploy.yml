@@ -1,0 +1,142 @@
+name: Canary Deploy
+
+# Staged rollout of a new Lifecycle WASM (#1728).
+#
+# Job 1 deploys the new WASM as a canary instance and ramps traffic through the
+# stages in environments.toml, observing health metrics at each one. It stops
+# before 100%.
+#
+# Job 2 resumes the rollout to 100% from the state job 1 left behind. It runs in
+# the `production-approval` GitHub environment, so a required reviewer must
+# approve before traffic moves fully to the canary. A failed health gate
+# rolls the rollout back to 0% and fails the run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_environment:
+        description: Environment to roll out to
+        type: choice
+        options: [staging, testnet, futurenet, mainnet]
+        required: true
+      stable_contract_id:
+        description: Lifecycle contract ID currently serving all traffic
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: canary-${{ inputs.target_environment }}
+  cancel-in-progress: false
+
+jobs:
+  canary:
+    name: Deploy canary and ramp to approval gate
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.target_environment }}
+    env:
+      TARGET_ENV: ${{ inputs.target_environment }}
+      STABLE_ID: ${{ inputs.stable_contract_id }}
+      CANARY_METRICS_URL: ${{ vars.CANARY_METRICS_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install Stellar CLI
+        run: |
+          # Keep in sync with the upgrade-test job in ci.yml.
+          STELLAR_CLI_VER="22.5.0"
+          curl -sSfL "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VER}/stellar-cli_${STELLAR_CLI_VER}_linux_amd64.tar.gz" -o stellar-cli.tar.gz
+          tar -xzf stellar-cli.tar.gz
+          chmod +x stellar
+          sudo mv stellar /usr/local/bin/stellar
+
+      - name: Build contracts
+        run: ./scripts/build.sh
+
+      - name: Configure network and deployer identity
+        env:
+          DEPLOYER_SECRET_KEY: ${{ secrets.DEPLOYER_SECRET_KEY }}
+        run: |
+          RPC_URL="$(python3 -m scripts.ops.config show --env "$TARGET_ENV" | jq -r .rpc_url)"
+          PASSPHRASE="$(python3 -m scripts.ops.config show --env "$TARGET_ENV" | jq -r .network_passphrase)"
+          stellar network add "$TARGET_ENV" --rpc-url "$RPC_URL" --network-passphrase "$PASSPHRASE"
+          echo "$DEPLOYER_SECRET_KEY" | stellar keys add deployer --secret-key
+
+      - name: Deploy canary Lifecycle instance
+        run: |
+          CANARY_ID="$(stellar contract deploy \
+            --wasm target/wasm32-unknown-unknown/release/lifecycle.wasm \
+            --network "$TARGET_ENV" \
+            --source deployer)"
+          echo "CANARY_ID=$CANARY_ID" >> "$GITHUB_ENV"
+          echo "Canary instance: $CANARY_ID"
+
+      - name: Start rollout
+        run: |
+          python3 -m scripts.ops.canary --state deploy/canary-state.json \
+            start --env "$TARGET_ENV" --stable-id "$STABLE_ID" --canary-id "$CANARY_ID"
+
+      - name: Ramp to approval gate
+        run: |
+          # Exit code 2 means the rollout is held at the approval gate, which is expected here.
+          rc=0
+          python3 -m scripts.ops.canary --state deploy/canary-state.json \
+            advance --env "$TARGET_ENV" || rc=$?
+          case "$rc" in
+            0) echo "Rollout completed without approval gate" ;;
+            2) echo "Rollout held at approval gate; promote from the approval job" ;;
+            *) echo "Rollout rolled back or failed (exit $rc)"; exit "$rc" ;;
+          esac
+
+      - name: Upload rollout state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: canary-state-${{ github.run_id }}
+          path: deploy/canary-state.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  promote:
+    name: Promote canary to 100% (approval required)
+    needs: canary
+    runs-on: ubuntu-latest
+    environment: production-approval
+    env:
+      TARGET_ENV: ${{ inputs.target_environment }}
+      CANARY_METRICS_URL: ${{ vars.CANARY_METRICS_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download rollout state
+        uses: actions/download-artifact@v4
+        with:
+          name: canary-state-${{ github.run_id }}
+          path: deploy
+
+      - name: Promote to 100%
+        run: |
+          python3 -m scripts.ops.canary --state deploy/canary-state.json \
+            advance --env "$TARGET_ENV" --approve-final
+
+      - name: Upload rollout state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: canary-final-state-${{ github.run_id }}
+          path: deploy/canary-state.json
+          if-no-files-found: warn
+          retention-days: 90

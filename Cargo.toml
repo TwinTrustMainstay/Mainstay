@@ -5,8 +5,22 @@ members = [
     "contracts/engineer-registry",
     "contracts/lifecycle",
     "contracts/lending",
+    "contracts/incident-management",
+    "contracts/engineer-bond",
+    "contracts/asset-nft",
+    "contracts/insurance-pool",
+    "contracts/marketplace",
+    "contracts/governance",
+    "contracts/bridge",
+    "contracts/mobile-api",
+    "contracts/zk-privacy",
+    "contracts/timestamping",
     "tests",
     "sdk/rust",
+    "sdk/mobile-api",
+    "analytics",
+    "verification",
+    "benches",
 ]
 resolver = "2"
 

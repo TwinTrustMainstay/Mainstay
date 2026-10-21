@@ -1,0 +1,10 @@
+[package]
+name = "verification"
+version = "0.1.0"
+edition = "2021"
+description = "Executable explicit-state model of the maintenance-record ledger; mirrors verification/tla/MaintenanceRecords.tla (issue #1756)"
+publish = false
+
+[lib]
+
+[dependencies]

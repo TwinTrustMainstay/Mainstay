@@ -1,0 +1,101 @@
+# Catalog of key Mainstay metrics.
+#
+# Every metric the exporter or cost tooling emits should be listed here.
+# `retention` names a tier defined in docs/monitoring/METRICS_COLLECTION.md.
+# scripts/check_metrics_catalog.sh verifies the catalog stays in sync with
+# the code that emits the metrics.
+
+metrics:
+  - name: mainstay_rpc_errors_last_scrape
+    type: gauge
+    unit: calls
+    retention: raw
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Failed read-only RPC calls in the latest collection.
+
+  - name: mainstay_rpc_requests_last_scrape
+    type: gauge
+    unit: calls
+    retention: raw
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Read-only RPC calls made in the latest collection.
+
+  - name: mainstay_rpc_request_duration_seconds_sum
+    type: gauge
+    unit: seconds
+    retention: raw
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Total RPC call time in the latest collection (response time = sum / requests).
+
+  - name: mainstay_operation_gas_stroops_total
+    type: counter
+    unit: stroops
+    labels: [operation, department]
+    retention: daily
+    source: scripts/finops/cost_tracker.py
+    description: Cumulative gas (fee) spend per contract operation and department.
+
+  - name: mainstay_assets_total
+    type: gauge
+    unit: assets
+    retention: raw
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Total registered assets.
+
+  - name: mainstay_engineers_total
+    type: gauge
+    unit: engineers
+    retention: raw
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Total registered engineers.
+
+  - name: mainstay_avg_collateral_score
+    type: gauge
+    unit: score
+    retention: raw
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Average collateral score across scored assets.
+
+  - name: mainstay_scored_assets_count
+    type: gauge
+    unit: assets
+    retention: raw
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Assets with a non-zero collateral score.
+
+  - name: mainstay_maintenance_records_total
+    type: gauge
+    unit: records
+    retention: raw
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Total maintenance records across all assets.
+
+  - name: mainstay_collateral_score
+    type: gauge
+    unit: score
+    labels: [asset_id]
+    retention: daily
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Per-asset collateral score (0-100).
+
+  - name: mainstay_days_since_last_service
+    type: gauge
+    unit: days
+    labels: [asset_id]
+    retention: daily
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Days since last service per asset (-1 if never serviced).
+
+  - name: mainstay_metrics_collection_seconds
+    type: gauge
+    unit: unix_seconds
+    retention: raw
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Timestamp of the last successful collection.
+
+  - name: mainstay_exporter_up
+    type: gauge
+    unit: boolean
+    retention: raw
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Exporter liveness (1 = up).

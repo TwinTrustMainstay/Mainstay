@@ -9,7 +9,7 @@ groups:
       # --- Availability ---
 
       - alert: MainstayExporterDown
-        expr: mainstay_exporter_up == 0
+        expr: (mainstay_exporter_up == 0) or absent(mainstay_exporter_up) or (up{job="mainstay"} == 0)
         for: 5m
         labels:
           severity: critical
@@ -72,25 +72,6 @@ groups:
             for the past 30 minutes. Check the Lifecycle contract and
             engineer credential validity.
 
-      - alert: HighMaintenanceFailureRate
-        expr: |
-          (
-            rate(mainstay_maintenance_submit_errors_total[10m])
-            /
-            (rate(mainstay_maintenance_records_total[10m]) + rate(mainstay_maintenance_submit_errors_total[10m]))
-          ) > 0.1
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High maintenance submission failure rate"
-          description: >
-            More than 10% of maintenance submissions may be failing.
-            Check for expired credentials, asset-lock issues, or
-            paused contracts. Note: this alert requires a separate
-            error counter (not yet exported); set up error tracking
-            from application logs.
-
       # --- Collateral Score Health ---
 
       - alert: AvgCollateralScoreDropping
@@ -131,10 +112,26 @@ groups:
             The number of registered engineers has decreased over the past day.
             This may indicate mass credential revocations or data issues.
 
+      # --- DSAR Queue Health ---
+
+      - alert: MainstayDsarDlqNotEmpty
+        expr: mainstay_dsar_dlq_depth > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "DSAR dead-letter queue is not empty"
+          description: >
+            One or more data-subject requests have been moved to the DSAR
+            dead-letter queue after exceeding maxReceiveCount. These requests
+            are no longer being retried and require manual investigation.
+            Inspect the DLQ messages, fix the underlying processing failure,
+            then replay them to the main queue (see docs/runbooks/dsar-dlq.md).
+
       # --- Data Freshness ---
 
       - alert: StaleMetrics
-        expr: time() - mainstay_metrics_collection_seconds > 120
+        expr: (time() - mainstay_metrics_collection_seconds > 120) or absent(mainstay_metrics_collection_seconds)
         for: 5m
         labels:
           severity: critical

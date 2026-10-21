@@ -1,5 +1,7 @@
 # Soroban Storage & TTL Strategy
 
+> **Last updated:** 2026-09-27 · **Doc version:** 0.1.0
+
 Soroban persistent storage entries expire if their Time-To-Live (TTL) is not extended. To prevent silent data loss, Mainstay contracts follow a standardized TTL management approach.
 
 ## Storage Types

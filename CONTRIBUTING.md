@@ -63,7 +63,7 @@ Document changes in the following categories (when applicable):
 
 A `CHANGELOG.md` entry is **required**, not optional, for any PR that:
 - Adds, removes, or renumbers a `ContractError` variant in any contract's `errors.rs`
-- Adds or renames a persistent-storage key (e.g. anything returned from `lifecycle/src/storage.rs` key helpers)
+- Adds or renames a persistent-storage key (e.g. anything returned from `contracts/lifecycle/src/storage.rs` key helpers)
 - Adds, removes, or changes the default of a `Config` field
 
 Reviewers should block merge on such PRs until the changelog entry is present. This keeps integrators
