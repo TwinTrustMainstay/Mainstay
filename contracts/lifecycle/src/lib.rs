@@ -34,6 +34,8 @@ use crate::types::{
     MaintenanceRecord, MaintenanceRoi, Priority, RecurringTask,
     ScoreEntry, TimelockProposal, TransferRecord, WeightProposal, MaintenanceAuditEntry,
     MaintenanceAttestation, MaintenanceSignature,
+    // Issue #1754 - Maintenance Record Notarization
+    NotarizationRecord, NotaryInfo,
     // Issue #1637 - Cross-Contract Score Consensus
     ExternalScoreEntry,
     // Issue #1639 - Score Anomaly Detection

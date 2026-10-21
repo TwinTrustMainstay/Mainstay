@@ -18,6 +18,8 @@ members = [
     "tests",
     "sdk/rust",
     "sdk/mobile-api",
+    "analytics",
+    "verification",
 ]
 resolver = "2"
 
