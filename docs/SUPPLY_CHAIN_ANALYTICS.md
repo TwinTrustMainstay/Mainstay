@@ -1,5 +1,7 @@
 # Supply-chain cost analytics
 
+> **Last updated:** 2026-09-25 · **Doc version:** 0.1.0
+
 Maintenance records can include a cost in stroops. The lifecycle contract
 exposes `get_maintenance_cost_summary(asset_id)`, which groups recorded spend
 by task type and returns total cost, record count, and average cost. Records

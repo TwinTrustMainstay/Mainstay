@@ -1,5 +1,7 @@
 # Engineer Operations
 
+> **Last updated:** 2026-09-25 · **Doc version:** 0.1.0
+
 Mainstay records the operational information needed to develop engineers and
 respond to maintenance risk without relying on informal spreadsheets.
 
@@ -8,8 +10,8 @@ respond to maintenance risk without relying on informal spreadsheets.
 `start_apprenticeship` creates a mentor-owned agreement with a required number
 of hours. The mentor records progress with `record_apprenticeship_hours` and
 completes the agreement with `complete_apprenticeship`. `get_apprenticeship`
-returns the active agreement, while `MENTOR_START`, `MENTOR_HOURS`, and
-`MENTOR_DONE` events provide an audit trail.
+returns the active agreement, while `MNT_START`, `MNT_HOURS`, and
+`MNT_DONE` events provide an audit trail.
 
 ## Safety incidents
 

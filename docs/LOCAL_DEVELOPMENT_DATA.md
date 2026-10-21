@@ -1,5 +1,7 @@
 # Local development data
 
+> **Last updated:** 2026-09-25 · **Doc version:** 0.1.0
+
 Never point local tooling at a production export. To create a safe fixture from
 a testnet or standalone backup, run:
 

@@ -1,5 +1,7 @@
 # Mainstay Roadmap
 
+> **Last updated:** 2026-08-29 · **Doc version:** 0.1.0
+
 This document expands on the high-level roadmap summarized in the [README](../README.md#-roadmap).
 
 ## v1.0 (Current)

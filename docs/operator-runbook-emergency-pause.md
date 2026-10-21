@@ -1,5 +1,7 @@
 # Operator Runbook: Emergency Pause
 
+> **Last updated:** 2026-07-28 · **Doc version:** 0.1.0
+
 This runbook provides operators with the procedures for triggering, verifying, and recovering from an emergency pause across all Mainstay contracts.
 
 ## Overview

@@ -51,6 +51,8 @@ pub enum ContractError {
     InvalidWorkWindow = 34,
     EngineerUnavailable = 35,
     WorkAssignmentNotFound = 36,
+    /// Quality bonus must be between 1 and `MAX_QUALITY_BONUS` points inclusive.
+    InvalidReputationBonus = 37,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -63,6 +65,7 @@ impl From<SharedContractError> for ContractError {
             SharedContractError::TimelockNotExpired => ContractError::TimelockNotExpired,
             SharedContractError::ProposalNotFound => ContractError::ProposalNotFound,
             SharedContractError::PendingAdminAlreadyExists => ContractError::PendingAdminAlreadyExists,
+            SharedContractError::InvalidSuspensionPeriod => ContractError::InvalidSuspensionPeriod,
         }
     }
 }
@@ -210,8 +213,38 @@ pub struct TimelockProposal {
     pub executed: bool,
 }
 
+/// Read-only summary of an engineer's credential state and issuer relationship.
+/// Used by off-chain tooling (e.g. `backup.sh`'s `export_engineers`) to export
+/// the full engineer registry without needing to know each engineer's address.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EngineerSummary {
+    pub address: Address,
+    pub issuer: Address,
+    pub credential_hash: BytesN<32>,
+    pub active: bool,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub suspension_end_time: Option<u64>,
+    pub status: CredentialStatus,
+}
+
 fn engineer_key(addr: &Address) -> (Symbol, Address) {
     (symbol_short!("ENG"), addr.clone())
+}
+
+/// Build a read-only summary from a stored engineer record and its current status.
+fn engineer_summary(record: &Engineer, status: CredentialStatus) -> EngineerSummary {
+    EngineerSummary {
+        address: record.address.clone(),
+        issuer: record.issuer.clone(),
+        credential_hash: record.credential_hash.clone(),
+        active: record.active,
+        issued_at: record.issued_at,
+        expires_at: record.expires_at,
+        suspension_end_time: record.suspension_end_time,
+        status,
+    }
 }
 
 fn revoke_timelock_key(engineer: &Address) -> (Symbol, Address) {
@@ -253,6 +286,11 @@ const NEXT_ASSIGNMENT_ID_KEY: Symbol = symbol_short!("NXT_ASG");
 const DEFAULT_DECAY_INTERVAL_SECS: u64 = 90 * 86_400;
 /// Default decay rate: 5% per interval (#1315)
 const DEFAULT_DECAY_RATE_BPS: u32 = 500; // 5% in basis points
+/// Maximum reputation score an engineer can reach (#1742 cap).
+const MAX_REPUTATION: u32 = 1000;
+/// Largest single quality bonus an admin may award in one call (#1742).
+const MAX_QUALITY_BONUS: u32 = 50;
+const QUALITY_BONUS_EVENT: Symbol = symbol_short!("QUAL_BON");
 
 fn is_paused(env: &Env) -> bool {
     env.storage().persistent().get(&PAUSED_KEY).unwrap_or(false)
@@ -381,6 +419,26 @@ pub struct EngineerRegistry;
 
 #[contractimpl]
 impl EngineerRegistry {
+    /// Returns a summary of every registered engineer, including credential state
+    /// and issuer relationship. Intended for off-chain backup/export tooling.
+    pub fn get_engineers(env: Env) -> Vec<EngineerSummary> {
+        let addresses: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&ENGINEER_LIST)
+            .unwrap_or_else(|| Vec::new(&env));
+        let now = env.ledger().timestamp();
+        let mut out: Vec<EngineerSummary> = Vec::new(&env);
+        for addr in addresses.iter() {
+            let key = engineer_key(&addr);
+            if let Some(record) = env.storage().persistent().get::<_, Engineer>(&key) {
+                let status = Self::verify_engineer(env.clone(), addr.clone(), None);
+                out.push_back(engineer_summary(&record, status));
+            }
+        }
+        out
+    }
+
     /// Store the deployer address at deploy time.
     pub fn __constructor(env: Env, deployer: Address) {
         env.storage().instance().set(&DEPLOYER_KEY, &deployer);
@@ -1031,7 +1089,7 @@ impl EngineerRegistry {
             (admin.clone(), env.ledger().timestamp()),
         );
         env.events().publish(
-            (symbol_short!("ADM_CANCEL"),),
+            (symbol_short!("ADM_CNCL"),),
             (admin,),
         );
     }
@@ -1642,17 +1700,69 @@ impl EngineerRegistry {
             .persistent()
             .get(&engineer_key(&engineer))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
-        let new_rep = (record.reputation_score as i64)
+        // Decay must be applied to the stored score before the delta, otherwise an
+        // inactive engineer's lost reputation would reappear on the next update.
+        let now = env.ledger().timestamp();
+        let decayed = apply_reputation_decay(&record, now) as i64;
+        let new_rep = decayed
             .saturating_add(delta as i64)
-            .clamp(0, 1000) as u32;
+            .clamp(0, MAX_REPUTATION as i64) as u32;
         record.reputation_score = new_rep;
-        record.last_active_at = env.ledger().timestamp();
+        record.last_active_at = now;
         env.storage()
             .persistent()
             .set(&engineer_key(&engineer), &record);
         env.storage()
             .persistent()
             .extend_ttl(&engineer_key(&engineer), TTL_THRESHOLD, TTL_TARGET);
+    }
+
+    /// Admin-only: reward an engineer for high-quality work with a bounded bonus.
+    ///
+    /// The bonus is added to the engineer's decayed reputation and the result is
+    /// capped at 1000. Quality bonuses are awarded on top of the per-submission
+    /// increments applied by the lifecycle contract, so they are the mechanism for
+    /// recognising outstanding work (e.g. a client sign-off) without unbounded growth.
+    ///
+    /// # Arguments
+    /// * `admin` - Must match the stored admin
+    /// * `engineer` - The engineer receiving the bonus
+    /// * `bonus` - Points to award, between 1 and 50 inclusive
+    ///
+    /// # Panics
+    /// - [`ContractError::Paused`] if the contract is paused
+    /// - [`ContractError::UnauthorizedAdmin`] if `admin` is not the stored admin
+    /// - [`ContractError::InvalidReputationBonus`] if `bonus` is 0 or above 50
+    /// - [`ContractError::EngineerNotFound`] if no record exists for `engineer`
+    pub fn award_quality_bonus(env: Env, admin: Address, engineer: Address, bonus: u32) {
+        ensure_not_paused(&env);
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if require_admin(&admin, &stored_admin).is_err() {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if bonus == 0 || bonus > MAX_QUALITY_BONUS {
+            panic_with_error!(&env, ContractError::InvalidReputationBonus);
+        }
+        let mut record: Engineer = env
+            .storage()
+            .persistent()
+            .get(&engineer_key(&engineer))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
+
+        let now = env.ledger().timestamp();
+        let current = apply_reputation_decay(&record, now);
+        let new_rep = current.saturating_add(bonus).min(MAX_REPUTATION);
+        record.reputation_score = new_rep;
+        record.last_active_at = now;
+        env.storage()
+            .persistent()
+            .set(&engineer_key(&engineer), &record);
+        extend_persistent_ttl(&env, engineer_key(&engineer));
+
+        env.events().publish(
+            (symbol_short!("QUAL_BON"), engineer.clone()),
+            (admin, bonus, new_rep, now),
+        );
     }
 
     /// Get an engineer's current reputation score (range: 0–1000).
@@ -2142,7 +2252,7 @@ impl EngineerRegistry {
         }
         env.storage()
             .persistent()
-            .set(&(CE_REQUIREMENT_KEY, specialization), &(hours, frequency_secs));
+            .set(&(CE_REQUIREMENT_KEY, specialization.clone()), &(hours, frequency_secs));
         extend_persistent_ttl(&env, &(CE_REQUIREMENT_KEY, specialization));
     }
 
@@ -2233,7 +2343,7 @@ impl EngineerRegistry {
         record.tier = EngineerTier::Apprentice;
         env.storage().persistent().set(&engineer_key(&apprentice), &record);
         extend_persistent_ttl(&env, &engineer_key(&apprentice));
-        let key = (APP_KEY, apprentice);
+        let key = (APP_KEY, apprentice.clone());
         env.storage().persistent().set(
             &key,
             &Apprenticeship {
@@ -2245,14 +2355,14 @@ impl EngineerRegistry {
         );
         extend_persistent_ttl(&env, &key);
         env.events().publish(
-            (symbol_short!("MENTOR_START"), apprentice),
+            (symbol_short!("MNT_START"), apprentice.clone()),
             (env.ledger().timestamp(), hours_required),
         );
     }
 
     pub fn record_apprenticeship_hours(env: Env, apprentice: Address, hours: u32) {
         ensure_not_paused(&env);
-        let key = (APP_KEY, apprentice);
+        let key = (APP_KEY, apprentice.clone());
         let mut apprenticeship: Apprenticeship = env
             .storage()
             .persistent()
@@ -2266,7 +2376,7 @@ impl EngineerRegistry {
         env.storage().persistent().set(&key, &apprenticeship);
         extend_persistent_ttl(&env, &key);
         env.events().publish(
-            (symbol_short!("MENTOR_HOURS"), apprentice),
+            (symbol_short!("MNT_HOURS"), apprentice.clone()),
             (hours, apprenticeship.hours_completed),
         );
     }
@@ -2293,7 +2403,7 @@ impl EngineerRegistry {
         env.storage().persistent().remove(&key);
         extend_persistent_ttl(&env, &engineer_key(&apprentice));
         env.events().publish(
-            (symbol_short!("MENTOR_DONE"), apprentice),
+            (symbol_short!("MNT_DONE"), apprentice.clone()),
             env.ledger().timestamp(),
         );
     }
@@ -2396,6 +2506,9 @@ impl EngineerRegistry {
 }
 
 #[cfg(test)]
+mod reputation_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use soroban_sdk::{
@@ -2405,6 +2518,8 @@ mod tests {
         testutils::{Events, Ledger},
         BytesN, Env, IntoVal, Symbol,
     };
+
+    mod ttl_tests;
 
     fn setup<'a>(env: &'a Env) -> (EngineerRegistryClient<'a>, Address) {
         let contract_id = env.register(EngineerRegistry, ());
@@ -4136,6 +4251,51 @@ mod tests {
     }
 
     #[test]
+    fn test_get_engineers_returns_summaries_with_credential_state() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let issuer = Address::generate(&env);
+        let eng1 = Address::generate(&env);
+        let eng2 = Address::generate(&env);
+        let hash1 = BytesN::from_array(&env, &[1u8; 32]);
+        let hash2 = BytesN::from_array(&env, &[2u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&eng1, &hash1, &issuer, &31_536_000, &None);
+        client.register_engineer(&eng2, &hash2, &issuer, &31_536_000, &None);
+        client.revoke_credential(&eng2);
+
+        let summaries = client.get_engineers();
+        assert_eq!(summaries.len(), 2);
+
+        let s1 = summaries.get(0).unwrap();
+        assert_eq!(s1.address, eng1);
+        assert_eq!(s1.issuer, issuer);
+        assert_eq!(s1.credential_hash, hash1);
+        assert!(s1.active);
+        assert_eq!(s1.status, CredentialStatus::Valid);
+        assert!(s1.suspension_end_time.is_none());
+
+        let s2 = summaries.get(1).unwrap();
+        assert_eq!(s2.address, eng2);
+        assert_eq!(s2.issuer, issuer);
+        assert_eq!(s2.credential_hash, hash2);
+        assert!(!s2.active);
+        assert_eq!(s2.status, CredentialStatus::Revoked);
+    }
+
+    #[test]
+    fn test_get_engineers_empty_when_no_engineers() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+
+        assert_eq!(client.get_engineers().len(), 0);
+    }
+
+    #[test]
     fn test_get_engineer_status_active() {
         let env = Env::default();
         env.mock_all_auths();
@@ -5845,12 +6005,27 @@ mod tests {
             Err(Ok(soroban_sdk::Error::from_contract_error(
                 ContractError::InvalidSuspensionPeriod as u32
             ))),
-            )))
         );
     }
 
     #[test]
     fn test_batch_revoke_credentials_non_admin_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+
+        let outsider = Address::generate(&env);
+        let batch = Vec::new(&env);
+        let result = client.try_batch_revoke_credentials(&outsider, &batch);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32,
+            ))),
+        );
+    }
+
+    #[test]
     fn test_suspend_with_current_timestamp_fails() {
         let env = Env::default();
         env.mock_all_auths();

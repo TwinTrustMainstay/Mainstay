@@ -1,5 +1,7 @@
 # Contract Interaction Sequence Diagrams
 
+> **Last updated:** 2026-07-29 · **Doc version:** 0.1.0
+
 Detailed sequence and timing diagrams for the flows that span more than one
 Mainstay contract. This document complements [architecture.md](architecture.md)
 (contract responsibilities and storage) and

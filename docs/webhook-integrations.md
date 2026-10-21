@@ -1,5 +1,7 @@
 # Real-time lifecycle integrations
 
+> **Last updated:** 2026-09-25 · **Doc version:** 0.1.0
+
 Soroban contracts cannot make outbound HTTP requests. Mainstay exposes a
 durable subscription list and emits lifecycle events so an off-chain relay can
 deliver webhooks without clients polling contract state.

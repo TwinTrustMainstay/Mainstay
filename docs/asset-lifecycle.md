@@ -1,5 +1,7 @@
 # Asset Lifecycle
 
+> **Last updated:** 2026-08-27 · **Doc version:** 0.1.0
+
 This document describes the full lifecycle of an industrial asset in Mainstay, focusing on the distinction between **deprecation** and **deletion (deregistration)**.
 
 ## Lifecycle States

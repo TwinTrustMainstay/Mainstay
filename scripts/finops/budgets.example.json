@@ -1,0 +1,7 @@
+{
+  "departments": {
+    "field-ops": { "monthly_stroops": 50000000 },
+    "lending": { "monthly_stroops": 80000000 },
+    "compliance": { "monthly_stroops": 20000000 }
+  }
+}

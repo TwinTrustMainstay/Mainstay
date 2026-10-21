@@ -1,5 +1,7 @@
 # Collateral Scoring Model
 
+> **Last updated:** 2026-08-29 · **Doc version:** 0.1.0
+
 This document describes the collateral scoring model used in the Mainstay lifecycle contract to assess the value and eligibility of assets based on their maintenance history.
 
 ## Overview
