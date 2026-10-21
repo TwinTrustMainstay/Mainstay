@@ -459,14 +459,14 @@ fn get_loan_duration(env: &Env) -> u64 {
 fn get_lifecycle_addr(env: &Env) -> Option<Address> {
     env.storage()
         .persistent()
-        .get(&symbol_short!(\"LIFECYCLE\"))
+        .get(&symbol_short!("LIFECYCLE"))
 }
 
 /// Retrieve the configured asset registry contract address, if any.
 fn get_asset_registry_addr(env: &Env) -> Option<Address> {
     env.storage()
         .persistent()
-        .get(&symbol_short!(\"ASSETREG\"))
+        .get(&symbol_short!("ASSETREG"))
 }
 
 // ── Inline cross-contract client: Lifecycle ────────────────────────────────

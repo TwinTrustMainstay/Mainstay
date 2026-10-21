@@ -1,5 +1,7 @@
 # Threat Model & Security Analysis
 
+> **Last updated:** 2026-08-31 · **Doc version:** 0.1.0
+
 This document provides a structured threat model for the Mainstay smart contract system using the STRIDE methodology. It is intended to serve as input for security auditors and as a reference for integrators and operators.
 
 ---

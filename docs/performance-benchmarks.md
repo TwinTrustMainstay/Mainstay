@@ -1,6 +1,6 @@
 # Performance Benchmarks
 
-Last updated: July 28, 2026
+> **Last updated:** 2026-07-28 · **Doc version:** 0.1.0
 
 This document records performance baselines for collateral scoring, batch asset registration, and search queries. Benchmarks are implemented using [Criterion.rs](https://github.com/bheisler/criterion.rs) in the `benches/` directory.
 

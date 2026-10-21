@@ -183,6 +183,11 @@ path = "test_ttl_extension.rs"
 name = "test_upgrade_compatibility"
 path = "test_upgrade_compatibility.rs"
 
+# Issue #1725: rollback testing for contract upgrades
+[[test]]
+name = "test_upgrade_rollback"
+path = "test_upgrade_rollback.rs"
+
 # Issue #996: get_maintenance_history_paginated
 [[test]]
 name = "test_maintenance_history_paginated"

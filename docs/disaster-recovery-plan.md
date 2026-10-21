@@ -1,5 +1,7 @@
 # Disaster Recovery Plan
 
+> **Last updated:** 2026-09-30 · **Doc version:** 0.1.0
+
 This document describes the disaster recovery (DR) procedures for the Mainstay
 smart contract system on Stellar Soroban.  It covers recovery from data loss,
 contract bugs, Stellar network issues, and off-chain metadata failures.

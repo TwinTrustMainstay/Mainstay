@@ -1,5 +1,7 @@
 # Mainstay API Rate Limiting
 
+> **Last updated:** 2026-09-25 · **Doc version:** 0.1.0
+
 ## Overview
 
 Rate limiting protects Mainstay API servers from abuse and ensures fair resource allocation across all clients. Limits are enforced at the reverse proxy (nginx) layer before requests reach the API server.

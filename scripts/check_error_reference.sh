@@ -27,8 +27,13 @@ for src in "${ERROR_SOURCE_FILES[@]}"; do
   path="${REPO_ROOT}/${src}"
   [ -f "$path" ] || continue
 
-  # Extract variant names from `VariantName = <number>,` lines inside ContractError enums.
-  variants=$(grep -oE '^\s*[A-Za-z][A-Za-z0-9]* = [0-9]+,' "$path" | sed -E 's/^\s*([A-Za-z][A-Za-z0-9]*) = .*/\1/' || true)
+  # Extract variant names from `VariantName = <number>,` lines inside the
+  # `enum ContractError` block only (other enums, e.g. LoanStatus, must not match).
+  variants=$(awk '
+    /enum ContractError/ { inside = 1; next }
+    inside && /^}/ { inside = 0 }
+    inside && /^[[:space:]]*[A-Za-z][A-Za-z0-9]* = [0-9]+,/ { print }
+  ' "$path" | sed -E 's/^[[:space:]]*([A-Za-z][A-Za-z0-9]*) = .*/\1/' || true)
 
   for variant in $variants; do
     if ! grep -qE "\`${variant}\`" "$DOC_FILE"; then

@@ -1,5 +1,7 @@
 # Real-time operations dashboard
 
+> **Last updated:** 2026-09-25 · **Doc version:** 0.1.0
+
 Static reports should be treated as historical exports, not the operational
 view. `scripts/stream-events.sh` provides a small, deployment-neutral event
 feed for a dashboard or alerting service. It polls Soroban `getEvents`, emits

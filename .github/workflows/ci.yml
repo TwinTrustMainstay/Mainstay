@@ -48,6 +48,15 @@ jobs:
       - name: Check ContractError variants are documented
         run: bash scripts/check_error_reference.sh
 
+      - name: Validate doc versioning and maintenance metadata (#1724)
+        run: bash scripts/check_doc_metadata.sh
+
+      - name: Validate glossary terms and anchors (#1723)
+        run: bash scripts/check_glossary.sh
+
+      - name: Validate video tutorial manifest and captions (#1722)
+        run: python3 scripts/video_tutorials.py check
+
       - name: Validate symbol_short! usages are within 9-character limit
         run: bash scripts/check_symbol_short.sh
 
@@ -191,12 +200,15 @@ jobs:
           echo "Test data bootstrapped successfully"
 
       # ── Step 4: Snapshot contract state ──────────────────
-      - name: Snapshot pre-upgrade state
+      - name: Snapshot pre-upgrade state (#1725)
         run: |
           echo "=== Pre-Upgrade State Snapshot ==="
 
-          stellar contract invoke --id "$LC_ID" --network local --source deployer \
-            -- get_config
+          # Captures admin, asset count and lifecycle config to a file so the
+          # post-upgrade step can diff against it. See scripts/upgrade_state.sh.
+          PRE_SNAPSHOT="$RUNNER_TEMP/pre-upgrade.snapshot"
+          bash scripts/upgrade_state.sh capture "$PRE_SNAPSHOT"
+          echo "PRE_UPGRADE_SNAPSHOT=$PRE_SNAPSHOT" >> $GITHUB_ENV
 
           echo "Pre-upgrade state captured"
 
@@ -323,6 +335,10 @@ jobs:
           # - Cross-contract recovery (lifecycle functions after dependency failure)
           cargo test --workspace -- test_upgrade_error_recovery -- --nocapture
 
+          # Rollback tests (#1725): rollback proposals restart the timelock,
+          # execute after their own delay, and leave storage intact
+          cargo test --workspace -- test_upgrade_rollback -- --nocapture
+
           # Existing pause/recovery tests
           cargo test --workspace -- test_paused_contract -- --nocapture
           cargo test --workspace -- test_emergency_pause -- --nocapture
@@ -330,20 +346,13 @@ jobs:
           echo "Error recovery tests complete"
 
       # ── Step 8: Verify data integrity post-upgrade ───────
-      - name: Verify post-upgrade data integrity
+      - name: Verify post-upgrade data integrity (#1725)
         run: |
           echo "=== Post-Upgrade Data Integrity ==="
 
-          # Verify config is readable
-          stellar contract invoke --id "$LC_ID" --network local --source deployer \
-            -- get_config
-
-          # Verify admin is intact
-          stellar contract invoke --id "$AR_ID" --network local --source deployer \
-            -- get_admin
-
-          stellar contract invoke --id "$ER_ID" --network local --source deployer \
-            -- get_admin
+          # Diff post-upgrade state against the pre-upgrade snapshot.
+          # Fails the job if admin, asset count or lifecycle config changed.
+          bash scripts/upgrade_state.sh validate "$PRE_UPGRADE_SNAPSHOT"
 
           echo "Data integrity verification complete"
 

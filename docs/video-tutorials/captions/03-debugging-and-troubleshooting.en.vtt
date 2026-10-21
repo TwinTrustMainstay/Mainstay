@@ -1,0 +1,21 @@
+WEBVTT
+NOTE
+Draft captions from the recording script. Re-time every cue against the final recording before publishing.
+
+00:00:00.000 --> 00:00:30.000
+When a contract call fails, the error code tells you which rule rejected it. This tutorial shows how to read that code and find the cause.
+
+00:00:30.000 --> 00:01:50.000
+A failed call reports a contract error with a name and a number. Note both before you change anything.
+
+00:01:50.000 --> 00:03:10.000
+Open the error reference. Each contract lists its errors, what causes them, and how to resolve them.
+
+00:03:10.000 --> 00:04:30.000
+Most failures come from a missing authorization, a credential that has expired, or a timelock that has not elapsed.
+
+00:04:30.000 --> 00:05:30.000
+To reproduce a failure, write a small test in the tests crate and run it with cargo test. Run only that test to keep the output short.
+
+00:05:30.000 --> 00:06:30.000
+Events show what the contract did before it failed. Use the event reference to decode the topics for the failing call.

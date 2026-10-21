@@ -1,0 +1,71 @@
+{
+  "series": "Mainstay Video Tutorial Series",
+  "doc_version": "0.1.0",
+  "last_updated": "2026-10-16",
+  "videos": [
+    {
+      "id": "01-first-asset-and-maintenance",
+      "title": "Register an asset and record maintenance",
+      "description": "Walk through registering an industrial asset, authorizing an engineer, and submitting a first maintenance record.",
+      "status": "script-ready",
+      "file": "videos/01-first-asset-and-maintenance.mp4",
+      "duration_seconds": null,
+      "captions": "captions/01-first-asset-and-maintenance.en.vtt",
+      "chapters": [
+        { "start": 0, "title": "Introduction" },
+        { "start": 25, "title": "Register an asset" },
+        { "start": 95, "title": "Register and verify an engineer" },
+        { "start": 170, "title": "Submit a maintenance record" },
+        { "start": 250, "title": "Read the history and score" }
+      ]
+    },
+    {
+      "id": "02-deploy-to-testnet",
+      "title": "Deploy to testnet",
+      "description": "Build the contracts, deploy them to Stellar testnet with scripts/deploy_testnet.sh, and confirm each contract is live.",
+      "status": "script-ready",
+      "file": "videos/02-deploy-to-testnet.mp4",
+      "duration_seconds": null,
+      "captions": "captions/02-deploy-to-testnet.en.vtt",
+      "chapters": [
+        { "start": 0, "title": "Introduction and prerequisites" },
+        { "start": 30, "title": "Build the contracts" },
+        { "start": 90, "title": "Configure the deployer identity" },
+        { "start": 150, "title": "Run the deploy script" },
+        { "start": 240, "title": "Confirm the deployment" }
+      ]
+    },
+    {
+      "id": "03-debugging-and-troubleshooting",
+      "title": "Debugging and troubleshooting",
+      "description": "Find the cause of a failed contract call using the error reference, the event log, and local tests.",
+      "status": "script-ready",
+      "file": "videos/03-debugging-and-troubleshooting.mp4",
+      "duration_seconds": null,
+      "captions": "captions/03-debugging-and-troubleshooting.en.vtt",
+      "chapters": [
+        { "start": 0, "title": "Introduction" },
+        { "start": 30, "title": "Read a contract error" },
+        { "start": 110, "title": "Look up the error reference" },
+        { "start": 190, "title": "Reproduce with a local test" },
+        { "start": 270, "title": "Check events for the failing call" }
+      ]
+    },
+    {
+      "id": "04-upgrade-testing",
+      "title": "Testing a contract upgrade",
+      "description": "Run the upgrade test suites locally and read the CI upgrade-test job before proposing a production upgrade.",
+      "status": "script-ready",
+      "file": "videos/04-upgrade-testing.mp4",
+      "duration_seconds": null,
+      "captions": "captions/04-upgrade-testing.en.vtt",
+      "chapters": [
+        { "start": 0, "title": "Introduction" },
+        { "start": 30, "title": "Why upgrades are tested" },
+        { "start": 100, "title": "Run the upgrade test suites" },
+        { "start": 200, "title": "Read the CI upgrade-test job" },
+        { "start": 290, "title": "Propose and execute after the timelock" }
+      ]
+    }
+  ]
+}

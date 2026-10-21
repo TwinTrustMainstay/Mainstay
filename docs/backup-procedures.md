@@ -1,5 +1,7 @@
 # Backup Procedures
 
+> **Last updated:** 2026-07-28 · **Doc version:** 0.1.0
+
 This document describes the backup and restore workflow for Mainstay on-chain
 asset metadata, engineer credentials, and maintenance history.
 

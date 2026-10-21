@@ -1,5 +1,7 @@
 # Access Control Model
 
+> **Last updated:** 2026-09-25 · **Doc version:** 0.1.0
+
 ## submit_maintenance
 
 Maintenance submission uses owner-approved per-asset authorization.

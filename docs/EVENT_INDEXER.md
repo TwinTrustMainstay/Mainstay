@@ -1,5 +1,7 @@
 # Stellar Horizon Event Indexer Integration Guide
 
+> **Last updated:** 2026-09-24 · **Doc version:** 0.1.0
+
 This guide provides comprehensive documentation and example code for building real-time monitoring systems that index and track Mainstay on-chain events using the Stellar Horizon API and Soroban event streams.
 
 ## Overview

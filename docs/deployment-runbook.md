@@ -1,5 +1,7 @@
 # Mainstay Deployment Runbook
 
+> **Last updated:** 2026-09-25 · **Doc version:** 0.1.0
+
 This guide covers the deployment and initialization of Mainstay contracts on Stellar networks (Testnet, Mainnet).
 
 Note: `scripts/deploy_testnet.sh` hard-requires `STELLAR_NETWORK=testnet` (from `.env`) and explicitly passes `--network testnet` to all Stellar CLI calls to prevent accidentally deploying to the wrong network.

@@ -1,5 +1,7 @@
 # Maintenance Compliance Standard Registry
 
+> **Last updated:** 2026-09-26 · **Doc version:** 0.1.0
+
 This document describes the on-chain maintenance compliance standard registry system, which enables fleet operators and asset financiers to define and enforce maintenance standards for different asset types.
 
 ## Overview

@@ -1,5 +1,7 @@
 # Mainstay Operations Runbook
 
+> **Last updated:** 2026-09-28 · **Doc version:** 0.1.0
+
 Use this page as the operator entry point. Follow the linked procedure for
 details, keep an incident log, and do not make production changes without the
 normal change approval and an identified incident or change owner.
