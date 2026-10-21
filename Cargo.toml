@@ -5,6 +5,10 @@ members = [
     "contracts/engineer-registry",
     "contracts/lifecycle",
     "contracts/lending",
+    "contracts/incident-management",
+    "contracts/engineer-bond",
+    "contracts/asset-nft",
+    "contracts/insurance-pool",
     "tests",
     "sdk/rust",
 ]
