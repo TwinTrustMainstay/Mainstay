@@ -1,5 +1,7 @@
 # Monitoring Guide
 
+> **Last updated:** 2026-07-28 · **Doc version:** 0.1.0
+
 This guide explains how to set up monitoring for Mainstay smart contracts
 using Prometheus and Grafana.  The setup tracks contract health metrics,
 asset growth, maintenance activity, and collateral scores.
@@ -65,10 +67,29 @@ chmod +x scripts/monitoring/prometheus-exporter.sh
 The exporter starts an HTTP server on port 9600 (configurable) and serves
 Prometheus-style metrics at `http://localhost:9600/metrics`.
 
+> **Important:** The exporter's metrics port must **not** be exposed through
+> the public ALB.  The ALB listener has a rule that returns a fixed `404` for
+> any request to `/metrics`, so the endpoint is never reachable from the
+> public internet even if the application serves it.  Metrics are served on a
+> separate private port that is reachable only from the Prometheus host (via
+> the security group / private network).  Prometheus scrapes the exporter
+> directly over that private port rather than through the ALB.
+
 ### 1.3 Verify the Exporter
 
+Run this from the Prometheus host (or over the private network), not through
+the public ALB:
+
 ```bash
-curl http://localhost:9600/metrics
+curl http://<exporter-private-host>:9600/metrics
+```
+
+Requesting `/metrics` through the public ALB should return a non-200
+response (a fixed `404`):
+
+```bash
+curl -i https://<alb-dns-name>/metrics
+# HTTP/2 404
 ```
 
 Expected output:
@@ -102,7 +123,10 @@ scrape_configs:
     scrape_interval: 60s
     scrape_timeout: 50s
     static_configs:
-      - targets: ['localhost:9600']
+      # Scrape the exporter over its private port directly from the
+      # Prometheus host.  Do NOT point this at the public ALB: the ALB
+      # returns a fixed 404 for /metrics.
+      - targets: ['<exporter-private-host>:9600']
         labels:
           network: 'mainnet'
           project: 'mainstay'
@@ -273,3 +297,12 @@ sudo systemctl status mainstay-exporter
 - The per-asset iteration for `mainstay_maintenance_records_total` can be expensive
   for large numbers of assets.  Increase `SCRAPE_INTERVAL` or use the caching
   variant of the exporter for production deployments with 1,000+ assets.
+
+### `/metrics` returns 404 through the ALB
+
+- This is expected.  The ALB listener has a rule that returns a fixed `404`
+  for `/metrics` so the endpoint is never public.  Scrape the exporter over
+  its private port from the Prometheus host instead (see Step 2.1).
+- If Prometheus reports the target as down, verify the Prometheus host can
+  reach the exporter's private port (security group / network ACL) and that
+  the exporter is listening on that port.

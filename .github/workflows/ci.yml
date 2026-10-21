@@ -39,6 +39,26 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace
 
+  # ── Operations tooling (#1726-#1729) ─────────────────────────
+  #
+  # Stdlib-only Python tooling under scripts/ops: environment config
+  # validation, state snapshots, canary rollout, and structured logging.
+  ops-tooling:
+    name: Ops tooling tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s scripts/ops/tests -t . -v
+
+      - name: Validate every environment in environments.toml
+        run: python3 -m scripts.ops.config validate --env all
+
   docs:
     name: Validate error reference docs
     runs-on: ubuntu-latest
@@ -48,20 +68,26 @@ jobs:
       - name: Check ContractError variants are documented
         run: bash scripts/check_error_reference.sh
 
+      - name: Validate doc versioning and maintenance metadata (#1724)
+        run: bash scripts/check_doc_metadata.sh
+
+      - name: Validate glossary terms and anchors (#1723)
+        run: bash scripts/check_glossary.sh
+
+      - name: Validate video tutorial manifest and captions (#1722)
+        run: python3 scripts/video_tutorials.py check
+
       - name: Validate symbol_short! usages are within 9-character limit
         run: bash scripts/check_symbol_short.sh
 
       - name: Validate all ContractError discriminants are unique per contract
         run: bash scripts/check_error_discriminants.sh
 
-      - name: Test backup verification and retention tooling
-        run: bash scripts/test_backup_tooling.sh
+      - name: Check generated API docs are up to date
+        run: python3 scripts/generate_api_docs.py --check
 
-      - name: Check metrics catalog is in sync with emitting scripts
-        run: bash scripts/check_metrics_catalog.sh
-
-      - name: Test FinOps cost tracker
-        run: python3 -m unittest discover -s scripts/finops -p 'test_*.py' -v
+      - name: Validate FAQ source and check generated outputs
+        run: python3 scripts/generate_faq.py --check
 
       - name: Run clippy lints
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -194,12 +220,15 @@ jobs:
           echo "Test data bootstrapped successfully"
 
       # ── Step 4: Snapshot contract state ──────────────────
-      - name: Snapshot pre-upgrade state
+      - name: Snapshot pre-upgrade state (#1725)
         run: |
           echo "=== Pre-Upgrade State Snapshot ==="
 
-          stellar contract invoke --id "$LC_ID" --network local --source deployer \
-            -- get_config
+          # Captures admin, asset count and lifecycle config to a file so the
+          # post-upgrade step can diff against it. See scripts/upgrade_state.sh.
+          PRE_SNAPSHOT="$RUNNER_TEMP/pre-upgrade.snapshot"
+          bash scripts/upgrade_state.sh capture "$PRE_SNAPSHOT"
+          echo "PRE_UPGRADE_SNAPSHOT=$PRE_SNAPSHOT" >> $GITHUB_ENV
 
           echo "Pre-upgrade state captured"
 
@@ -326,6 +355,10 @@ jobs:
           # - Cross-contract recovery (lifecycle functions after dependency failure)
           cargo test --workspace -- test_upgrade_error_recovery -- --nocapture
 
+          # Rollback tests (#1725): rollback proposals restart the timelock,
+          # execute after their own delay, and leave storage intact
+          cargo test --workspace -- test_upgrade_rollback -- --nocapture
+
           # Existing pause/recovery tests
           cargo test --workspace -- test_paused_contract -- --nocapture
           cargo test --workspace -- test_emergency_pause -- --nocapture
@@ -333,20 +366,13 @@ jobs:
           echo "Error recovery tests complete"
 
       # ── Step 8: Verify data integrity post-upgrade ───────
-      - name: Verify post-upgrade data integrity
+      - name: Verify post-upgrade data integrity (#1725)
         run: |
           echo "=== Post-Upgrade Data Integrity ==="
 
-          # Verify config is readable
-          stellar contract invoke --id "$LC_ID" --network local --source deployer \
-            -- get_config
-
-          # Verify admin is intact
-          stellar contract invoke --id "$AR_ID" --network local --source deployer \
-            -- get_admin
-
-          stellar contract invoke --id "$ER_ID" --network local --source deployer \
-            -- get_admin
+          # Diff post-upgrade state against the pre-upgrade snapshot.
+          # Fails the job if admin, asset count or lifecycle config changed.
+          bash scripts/upgrade_state.sh validate "$PRE_UPGRADE_SNAPSHOT"
 
           echo "Data integrity verification complete"
 
@@ -376,22 +402,6 @@ jobs:
   # For manual upgrade procedures, see docs/deployment-runbook.md.
   # For multi-region deployments, see docs/multi-region-deployment-guide.md.
 
-  audit:
-    name: Dependency Audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
-
-      - name: Audit dependencies
-        run: cargo audit
-
   security-scan:
     name: Automated Security Scanning
     runs-on: ubuntu-latest
@@ -404,17 +414,43 @@ jobs:
 
       - name: Run Semgrep SAST scan
         run: |
+          # No `|| echo` fallback: a failed scan must fail the job.
           semgrep --config=p/owasp-top-ten --config=p/security-audit \
-            --json -o semgrep-results.json . || echo "Semgrep scan completed with issues"
-          cat semgrep-results.json || true
+            --json -o semgrep-results.json .
+          cat semgrep-results.json
 
-      - name: Block on critical findings
+      - name: Block on ERROR-severity findings
         run: |
-          if grep -q '"severity": "CRITICAL"' semgrep-results.json 2>/dev/null; then
-            echo "❌ Critical security issues found"
+          # Semgrep reports severities as ERROR, WARNING and INFO (never
+          # "CRITICAL"), so gate on ERROR via jq rather than grepping.
+          if [ ! -s semgrep-results.json ]; then
+            echo "❌ semgrep-results.json is missing or empty"
             exit 1
           fi
-          echo "✓ No critical security issues detected"
+          count=$(jq '[.results[] | select(.extra.severity == "ERROR")] | length' semgrep-results.json)
+          if [ "$count" -gt 0 ]; then
+            echo "❌ $count ERROR-severity security issue(s) found"
+            jq -r '.results[] | select(.extra.severity == "ERROR") | "\(.check_id) \(.path):\(.start.line)"' semgrep-results.json
+            exit 1
+          fi
+          echo "✓ No ERROR-severity security issues detected"
+
+      - name: Verify gate fails on known finding (fixture)
+        run: |
+          # Fixture contains a known ERROR-severity finding; the gate must
+          # exit non-zero on it. This proves the gate can actually trigger.
+          fixture=".github/fixtures/semgrep-results-error.json"
+          count=$(jq '[.results[] | select(.extra.severity == "ERROR")] | length' "$fixture")
+          if [ "$count" -eq 0 ]; then
+            echo "❌ Fixture does not contain an ERROR-severity finding"
+            exit 1
+          fi
+          if jq -e '[.results[] | select(.extra.severity == "ERROR")] | length > 0' "$fixture" > /dev/null; then
+            echo "✓ Gate correctly detects the fixture's ERROR finding"
+          else
+            echo "❌ Gate failed to detect the fixture's ERROR finding"
+            exit 1
+          fi
 
       - name: Upload security scan results
         if: always()
@@ -431,21 +467,31 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - uses: Swatinem/rust-cache@v2
+
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
       - name: Audit Rust dependencies
         run: |
-          cargo audit --json -o audit-results.json || echo "Audit completed with vulnerabilities"
-          cat audit-results.json || true
+          # No `|| echo` fallback: cargo-audit exits non-zero on any advisory
+          # at or above the threshold configured in .cargo/audit.toml.
+          cargo audit --json -o audit-results.json
+          cat audit-results.json
 
-      - name: Block on critical vulnerabilities
+      - name: Validate audit JSON parsing against sample
         run: |
-          if grep -q '"severity": "critical"' audit-results.json 2>/dev/null; then
-            echo "❌ Critical vulnerabilities found in dependencies"
+          # Guard against cargo-audit output schema drift: parse a checked-in
+          # sample advisory file and assert the expected fields exist.
+          sample=".github/fixtures/cargo-audit-sample.json"
+          if [ ! -s "$sample" ]; then
+            echo "❌ Sample audit file $sample is missing or empty"
             exit 1
           fi
-          echo "✓ No critical dependency vulnerabilities detected"
+          jq -e '.vulnerabilities.list | length > 0' "$sample" > /dev/null
+          jq -e '.vulnerabilities.list[0].advisory.id' "$sample" > /dev/null
+          jq -e '.vulnerabilities.list[0].package.name' "$sample" > /dev/null
+          echo "✓ cargo-audit JSON schema validated against sample"
 
       - name: Upload audit results
         if: always()

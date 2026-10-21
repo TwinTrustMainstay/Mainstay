@@ -1,5 +1,7 @@
 # Collateral Scoring Formula
 
+> **Last updated:** 2026-08-29 · **Doc version:** 0.1.0
+
 This document provides the precise mathematical formula and supporting calculations used by the Mainstay Lifecycle contract to compute an asset's collateral score. It is intended for lenders, auditors, and integrators who need to reproduce or verify on-chain score calculations.
 
 > For a narrative overview of the scoring model (thresholds, eligibility, best practices), see [docs/collateral-scoring.md](collateral-scoring.md).
@@ -385,4 +387,4 @@ When integrating collateral scoring into lending workflows:
 
 ---
 
-*This document is maintained alongside the Mainstay smart contract system. For implementation details, refer to the source code in `lifecycle/src/lib.rs`.*
+*This document is maintained alongside the Mainstay smart contract system. For implementation details, refer to the source code in `contracts/lifecycle/src/lib.rs`.*

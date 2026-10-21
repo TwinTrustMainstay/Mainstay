@@ -1,5 +1,7 @@
 # Maintenance record corrections
 
+> **Last updated:** 2026-09-25 · **Doc version:** 0.1.0
+
 Maintenance records remain immutable after submission. An administrator can
 publish a correction with `correct_maintenance_record`, which appends a
 versioned `MaintenanceCorrection` linked to the original asset and history

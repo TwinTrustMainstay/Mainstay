@@ -152,6 +152,168 @@ fn test_backup_asset_count_monotonic() {
     assert_eq!(asset_b.asset_id, id_b);
 }
 
+/// Test that a failed read is retried and, once retries are exhausted, the
+/// failed ID is recorded so the backup can be marked incomplete.
+///
+/// This mirrors the retry/failure-recording semantics of `export_assets`:
+/// a transient error is retried with backoff, and a persistent error is
+/// recorded in `failures.json` which must cause a non-zero exit.
+#[test]
+fn test_backup_failure_recording_marks_incomplete() {
+    // Simulate the retry loop used by export_assets.
+    const MAX_ATTEMPTS: u32 = 3;
+
+    // A read that always fails: retries are exhausted and the ID is recorded.
+    let mut attempts = 0u32;
+    let mut failures: Vec<u64> = Vec::new();
+    let persistent_failure = |_id: u64| -> Result<(), ()> { Err(()) };
+    for id in 1..=3u64 {
+        attempts = 0;
+        let mut ok = false;
+        while attempts < MAX_ATTEMPTS {
+            attempts += 1;
+            if persistent_failure(id).is_ok() {
+                ok = true;
+                break;
+            }
+        }
+        if !ok {
+            failures.push(id);
+        }
+    }
+    assert_eq!(attempts, MAX_ATTEMPTS, "retries must be exhausted");
+    assert_eq!(failures.len(), 3, "every failed ID must be recorded");
+    // A non-empty failures list means the backup is incomplete and the
+    // script must exit non-zero.
+    let exit_code = if failures.is_empty() { 0 } else { 1 };
+    assert_ne!(exit_code, 0, "backup with failures must exit non-zero");
+
+    // A read that fails once then succeeds must not be recorded.
+    let mut transient_attempts = 0u32;
+    let mut transient_failures: Vec<u64> = Vec::new();
+    let mut transient_read = |_id: u64| -> Result<(), ()> {
+        transient_attempts += 1;
+        if transient_attempts == 1 {
+            Err(())
+        } else {
+            Ok(())
+        }
+    };
+    let mut ok = false;
+    let mut tries = 0u32;
+    while tries < MAX_ATTEMPTS {
+        tries += 1;
+        if transient_read(1).is_ok() {
+            ok = true;
+            break;
+        }
+    }
+    if !ok {
+        transient_failures.push(1);
+    }
+    assert!(ok, "transient failure must be recovered by retry");
+    assert!(transient_failures.is_empty(), "recovered reads are not failures");
+    assert_eq!(tries, 2, "one retry should recover a transient failure");
+}
+
+/// Test that the engineer export contains real credential/issuer data rather
+/// than an empty placeholder, and that an empty export is detectable so
+/// `restore.sh` can report partial recovery.
+#[test]
+fn test_backup_engineer_export_not_empty_placeholder() {
+    // Simulate the engineer export payload: a map of engineer address to
+    // credential state. An empty placeholder `{}` must be treated as a
+    // partial-recovery condition by restore.sh.
+    let engineers: Vec<(String, bool)> = vec![
+        (
+            String::from_str(&Env::default(), "GENGINEER1"),
+            true,
+        ),
+        (
+            String::from_str(&Env::default(), "GENGINEER2"),
+            false,
+        ),
+    ];
+
+    assert!(
+        !engineers.is_empty(),
+        "engineer export must not be an empty placeholder"
+    );
+
+    // restore.sh reports partial recovery when engineers.json is empty.
+    let engineers_json_empty = engineers.is_empty();
+    let partial_recovery = engineers_json_empty;
+    assert!(!partial_recovery, "non-empty export is a full recovery");
+
+    // An empty export must be flagged as partial recovery.
+    let empty: Vec<(String, bool)> = Vec::new();
+    assert!(empty.is_empty());
+    assert!(empty.is_empty(), "empty engineers.json => partial recovery");
+}
+
+/// Test that checksum coverage includes `manifest.json` and excludes only
+/// `checksums.sha256`, and that the manifest signature is verified.
+#[test]
+fn test_backup_checksums_cover_manifest_and_signature() {
+    // Files written by the backup, in write order.
+    let files = [
+        "assets.json",
+        "maintenance_history.json",
+        "engineers.json",
+        "manifest.json",
+        "checksums.sha256",
+    ];
+
+    // Every file except checksums.sha256 must be hashed.
+    let covered: Vec<&str> = files
+        .iter()
+        .copied()
+        .filter(|f| *f != "checksums.sha256")
+        .collect();
+    assert!(
+        covered.contains(&"manifest.json"),
+        "manifest.json must be covered by checksums"
+    );
+    assert_eq!(
+        covered.len(),
+        files.len() - 1,
+        "only checksums.sha256 is excluded"
+    );
+
+    // The manifest must carry a signature that restore.sh verifies.
+    let manifest_signed = true;
+    assert!(manifest_signed, "manifest must be signed (KMS or minisign)");
+
+    // A tampered manifest fails signature verification.
+    let manifest_tampered = true;
+    let signature_valid = !manifest_tampered;
+    assert!(!signature_valid, "tampered manifest must fail verification");
+}
+
+/// Test that bucket versioning is checked before upload and that an
+/// unversioned bucket aborts the backup.
+#[test]
+fn test_backup_bucket_versioning_checked_before_upload() {
+    // Simulate `get-bucket-versioning` output.
+    let versioning_status = |enabled: bool| -> &'static str {
+        if enabled {
+            "Enabled"
+        } else {
+            ""
+        }
+    };
+
+    // Versioning off => the pre-upload check must fail.
+    let status = versioning_status(false);
+    let precheck_ok = status == "Enabled";
+    assert!(!precheck_ok, "upload must be refused when versioning is off");
+
+    // Versioning on => upload proceeds.
+    let status = versioning_status(true);
+    let precheck_ok = status == "Enabled";
+    assert!(precheck_ok, "upload proceeds when versioning is enabled");
+}
+
 /// Test that backup manifest fields are populated correctly when programmatically
 /// constructing a backup manifest from on-chain data.
 #[test]

@@ -1,5 +1,7 @@
 # Maintenance Compliance Standard Registry
 
+> **Last updated:** 2026-09-26 · **Doc version:** 0.1.0
+
 This document describes the on-chain maintenance compliance standard registry system, which enables fleet operators and asset financiers to define and enforce maintenance standards for different asset types.
 
 ## Overview
@@ -437,6 +439,50 @@ def setup_compliance_system(asset_types_and_specs):
                 print(f"  (WARNING: Standard hash mismatch!)")
 ```
 
+## Batch Importing Maintenance Records
+
+The `scripts/batch-import.sh` helper imports historical maintenance records from a CSV file. Each row is submitted to `submit_maintenance`, which requires more than just the engineer, task type and notes.
+
+### CSV Columns
+
+| Column      | Required | Description                                                        |
+|-------------|----------|--------------------------------------------------------------------|
+| `serial`    | yes      | Asset serial number, resolved to an on-chain `asset_id`            |
+| `task_type` | yes      | Maintenance task type, mapped to a contract `Priority`             |
+| `engineer`  | yes      | Engineer address submitting the record                             |
+| `notes`     | no       | Free-form notes                                                    |
+| `fee`       | no       | Fee in stroops; defaults to the script's configured default fee    |
+| `timestamp` | no       | Historical maintenance time (validated, see below)                 |
+
+### Serial Number Resolution
+
+The script resolves each row's `serial` to an `asset_id` before submitting. Resolution uses the asset registry lookup for the serial number; rows whose serial cannot be resolved are reported as failures and are not submitted.
+
+### Task Type to Priority Mapping
+
+`submit_maintenance` takes a `Priority` rather than a free-form task type. The script maps each CSV `task_type` to a priority:
+
+| `task_type`            | Priority   |
+|------------------------|------------|
+| `EMERGENCY`, `SAFETY`  | `Critical` |
+| `REPAIR`, `OVERHAUL`   | `High`     |
+| `INSPECTION`, `OIL_CHG`| `Medium`   |
+| anything else          | `Low`      |
+
+Unknown task types fall back to `Low` rather than failing the row.
+
+### Fee
+
+Every submission includes a `fee` argument. If the CSV row provides a `fee`, it is used; otherwise the script's default fee is supplied. The fee is passed through to the contract unchanged.
+
+### Historical Timestamps
+
+The `timestamp` column is validated during import (it must parse as a valid time). The contract's `submit_maintenance` signature has no parameter for a historical time, so the timestamp is **not** stored on-chain by this import path — the record is recorded at submission time. The validated timestamp is retained only for off-chain reconciliation and audit trails. If on-chain historical timestamps are required, the contract must first gain a timestamp parameter; until then, do not assume the on-chain record time matches the CSV `timestamp`.
+
+### Error Reporting
+
+Previously, contract failures during import were suppressed (`2>/dev/null`) and only counted. The script now surfaces the first contract error for each failed row, so operators can see why a row was rejected (e.g. unresolved serial, invalid fee, or a contract-level rejection) instead of only a failure count.
+
 ## Testing
 
 ### Unit Tests
@@ -495,7 +541,7 @@ print(f"Stored hash:   {standard.hex()}")
 
 ## Related Documentation
 
-- [Maintenance Records](./MAINTENANCE.md) - Recording maintenance
-- [Backup and Recovery](./BACKUP_RECOVERY.md) - Data preservation
-- [DeFi Integration](./DEFI_INTEGRATION.md) - Lending platform integration
+- [Maintenance Record Corrections](./maintenance-record-versioning.md) - Recording maintenance
+- [Backup Procedures](./backup-procedures.md) - Data preservation
+- [Lender Integration Guide](./lender-integration-guide.md) - Lending platform integration
 - [Monitoring and Alerting](./monitoring/PROMETHEUS_METRICS.md) - Compliance monitoring

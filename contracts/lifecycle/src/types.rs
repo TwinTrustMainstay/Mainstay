@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contracttype, Address, Bytes, String, Symbol, Map, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN, String, Symbol, Map, Vec};
 
 /// A single ownership-transfer event recorded in the on-chain transfer history.
 #[contracttype]
@@ -37,7 +37,15 @@ pub struct MaintenanceRecord {
     pub priority: Priority,
     pub notes: String,
     pub engineer: Address,
+    /// Ledger timestamp at which this record was written on-chain.
     pub timestamp: u64,
+    /// Historical timestamp of when the maintenance work actually took place,
+    /// as supplied by the submitter (e.g. imported from an off-chain log).
+    ///
+    /// This may differ from `timestamp` (the ledger time of submission) for
+    /// back-filled or batch-imported records. `None` means the work is assumed
+    /// to have occurred at `timestamp`.
+    pub recorded_at: Option<u64>,
     /// Maintenance cost in stroops (1 stroop = 10^-7 XLM).
     /// `None` indicates no cost was recorded for this maintenance event.
     pub cost: Option<u64>,
@@ -520,6 +528,94 @@ pub enum DataKey {
     AttestorAuth(u64, Address),
     MaintenanceSignatures(u64),
     CompressedHistory(u64),
+    /// Registered trusted timestamp authorities, append-only: `Vec<TimestampAuthority>` (#1750).
+    /// An authority's position in this list is its `authority_id`.
+    TimestampAuthorities,
+    /// Latest trusted timestamp for `(asset_id, record_timestamp)`: `TrustedTimestamp` (#1750).
+    TrustedTimestamp(u64, u64),
+    /// Registered notaries, append-only: `Vec<Notary>` (#1753).
+    /// A notary's position in this list is its `notary_id`.
+    Notaries,
+    /// Notarization of `(asset_id, record_timestamp)`: `NotarizationRecord` (#1753).
+    Notarization(u64, u64),
+    /// Record timestamps notarized for an asset, in notarization order: `Vec<u64>` (#1753).
+    NotarizedRecords(u64),
+    /// Ledger-ordered `AssetState` log for an asset: `Vec<AssetState>` (#1751).
+    StateHistory(u64),
+}
+
+/// A signing authority that issues trusted timestamps for maintenance records (#1750).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimestampAuthority {
+    pub id: u32,
+    /// Ed25519 public key used to verify tokens issued by this authority.
+    pub public_key: BytesN<32>,
+    /// Ledger time at which the authority was registered.
+    pub registered_at: u64,
+    /// Ledger time at which the authority was revoked. `None` while active.
+    /// Revocation stops new tokens from being accepted; tokens issued before it stay valid.
+    pub revoked_at: Option<u64>,
+}
+
+/// A timestamp token issued over a maintenance record (#1750).
+///
+/// The authority signs `sha256(record) || issued_at || expires_at` with a domain
+/// prefix. Renewal is submitting a newer token (larger `issued_at`) for the same record.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrustedTimestamp {
+    pub asset_id: u64,
+    pub record_timestamp: u64,
+    pub authority_id: u32,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub signature: BytesN<64>,
+}
+
+/// A notary registered to notarize maintenance records (#1753).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Notary {
+    pub id: u32,
+    /// Ed25519 public key used to verify notarization signatures.
+    pub public_key: BytesN<32>,
+    /// Hash of the notary's accreditation credential document, kept on-chain for audit.
+    pub credential_hash: BytesN<32>,
+    /// Ledger time after which the accreditation no longer permits new notarizations.
+    pub credential_expires_at: u64,
+    pub registered_at: u64,
+    /// Ledger time at which the notary was revoked. `None` while active.
+    pub revoked_at: Option<u64>,
+}
+
+/// A notarization of a maintenance record by a registered notary (#1753).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NotarizationRecord {
+    pub asset_id: u64,
+    pub record_timestamp: u64,
+    pub notary_id: u32,
+    /// Hash of the off-chain notarial certificate. The certificate itself stays off-chain.
+    pub certificate_hash: BytesN<32>,
+    /// Notary's Ed25519 signature over `NOTARY_DOMAIN || sha256(record) || certificate_hash`.
+    pub signature: BytesN<64>,
+    pub notarized_at: u64,
+}
+
+/// Snapshot of an asset's state at a ledger, recorded at every state change (#1751).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetState {
+    pub asset_id: u64,
+    /// Ledger sequence number at which this state was recorded.
+    pub ledger_sequence: u32,
+    pub collateral_score: u32,
+    /// Number of maintenance records retained in the asset's history at this ledger.
+    pub maintenance_count: u32,
+    pub frozen: bool,
+    /// Ledger of the most recent ownership transfer, `None` if never transferred.
+    pub owner_start_ledger: Option<u64>,
 }
 
 /// A dispute record for challenging maintenance record authenticity (issue #1319).

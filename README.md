@@ -127,9 +127,15 @@ VITE_STELLAR_RPC_URL=https://soroban-testnet.stellar.org
 Network configurations are defined in `environments.toml`:
 
 - `testnet` — Stellar testnet
+- `staging` — Pre-production validation (testnet RPC, canary-gated rollouts)
 - `mainnet` — Stellar mainnet
 - `futurenet` — Stellar futurenet
-- `standalone` — Local development
+- `dev` — Local development (localhost RPC)
+- `standalone` — Local standalone network
+
+Each environment carries limits, timeouts, rate, logging, and canary settings.
+See [Operations Infrastructure](docs/operations-infrastructure.md) for validation,
+promotion diffs, and the audit trail.
 
 ### Deploy to Testnet
 
@@ -149,11 +155,15 @@ stellar keys generate deployer --network testnet
 ## 📖 Documentation
 
 - [Architecture Overview](docs/architecture.md)
-- [Life-Cycle Contract Design](docs/lifecycle-contract.md)
+- [Asset Lifecycle](docs/asset-lifecycle.md)
 - [Engineer Credentialing](docs/credentialing.md)
 - [Engineer Operations](docs/engineer-operations.md)
 - [Collateral Scoring Model](docs/collateral-scoring.md)
 - [Threat Model & Security](docs/threat-model.md)
+- [Data Model](docs/data-model.md)
+- [API Reference (OpenAPI, Swagger UI, curl)](docs/api/README.md)
+- [Performance Tuning Guide](docs/performance-tuning-guide.md)
+- [FAQ](docs/faq.md)
 - [Roadmap](docs/roadmap.md)
 
 ## 🎓 Smart Contract API
@@ -317,7 +327,7 @@ We welcome contributions! Please:
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
 
-See our [Code of Conduct](CODE_OF_CONDUCT.md) and [Contributing Guidelines](CONTRIBUTING.md).
+See our [Contributing Guidelines](CONTRIBUTING.md) for contribution instructions.
 
 ## 📄 License
 

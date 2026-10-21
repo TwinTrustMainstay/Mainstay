@@ -1,5 +1,7 @@
 # Error Reference
 
+> **Last updated:** 2026-09-27 · **Doc version:** 0.1.0
+
 This document lists every `ContractError` variant across the three core contracts — **AssetRegistry**, **EngineerRegistry**, and **Lifecycle** — together with the **Lending** contract. For each code you'll find the numeric value, when it is raised, and how to resolve it.
 
 ---

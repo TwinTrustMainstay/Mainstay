@@ -52,6 +52,21 @@ CWAGENT
 systemctl enable amazon-cloudwatch-agent
 systemctl start amazon-cloudwatch-agent
 
+# #1815: fail the bootstrap if the agent isn't actually running, rather than
+# silently shipping no logs or metrics. Give it a few seconds to come up.
+for i in $(seq 1 10); do
+  if systemctl is-active --quiet amazon-cloudwatch-agent; then
+    echo "amazon-cloudwatch-agent is running"
+    break
+  fi
+  if [ "$i" -eq 10 ]; then
+    echo "FATAL: amazon-cloudwatch-agent failed to start" >&2
+    systemctl status amazon-cloudwatch-agent --no-pager >&2 || true
+    exit 1
+  fi
+  sleep 2
+done
+
 # Authenticate with Vault using the instance IAM role. Secrets are rendered
 # locally with restrictive permissions and never enter Terraform state, user
 # data, Docker arguments, or proxy logs.
@@ -93,7 +108,7 @@ docker pull ghcr.io/mainstay/api-server:latest
 docker run -d \
   --name mainstay-api \
   --restart always \
-  -p 8080:8080 \
+  -p 127.0.0.1:8080:8080 \
   -e STELLAR_RPC_URL="$RPC_URL" \
   -e STELLAR_NETWORK_PASSPHRASE="$NETWORK" \
   -e DEPLOY_REGION="$REGION" \
@@ -130,7 +145,17 @@ proxy_cache_path /var/cache/nginx/mainstay-api
                  inactive=60m
                  use_temp_path=off;
 
-limit_req_zone $binary_remote_addr zone=ip_limit:10m rate=100r/m;
+# Trust the ALB as the source of the real client address. Only the ALB
+# subnets may set X-Forwarded-For; anything else keeps its socket address.
+%{ for cidr in alb_subnet_cidrs ~}
+set_real_ip_from ${cidr};
+%{ endfor ~}
+real_ip_header X-Forwarded-For;
+real_ip_recursive on;
+
+# Key the per-IP limit on the resolved client address ($remote_addr after
+# realip processing), not the ALB node address.
+limit_req_zone $remote_addr zone=ip_limit:10m rate=100r/m;
 limit_req_zone $http_x_api_key zone=key_limit:10m rate=17r/m;
 
 log_format ratelimit '$remote_addr [$time_local] request_id=$mainstay_request_id "$request_method $uri" $status '
@@ -143,18 +168,12 @@ upstream api_backend {
 }
 
 server {
+    # #1812: this is the ALB's target (port 80). The ALB terminates TLS
+    # with the real ACM certificate and forwards plaintext HTTP to nginx
+    # inside the VPC; the instance's security group only accepts traffic
+    # from the ALB, so there is no direct-internet path to this listener.
     listen 80;
-    return 301 https://$host$request_uri;
-}
-
-server {
-    listen 443 ssl http2;
     server_name _;
-
-    ssl_certificate     /etc/nginx/ssl/cert.pem;
-    ssl_certificate_key /etc/nginx/ssl/key.pem;
-    ssl_protocols       TLSv1.2 TLSv1.3;
-    ssl_ciphers         HIGH:!aNULL:!MD5;
 
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     add_header X-Content-Type-Options "nosniff" always;
@@ -223,21 +242,39 @@ server {
         access_log off;
     }
 
+    # /metrics is intentionally not served on the public listener.
+    location /metrics {
+        return 404;
+    }
+}
+
+# Private metrics listener. Bound to the internal interface only and
+# reachable solely from the Prometheus host; never exposed via the ALB.
+server {
+    listen ${metrics_private_ip}:${metrics_port};
+    server_name _;
+
+    access_log /var/log/nginx/metrics-access.log;
+    error_log  /var/log/nginx/metrics-error.log warn;
+
     location /metrics {
         allow 127.0.0.1;
-        allow 10.0.0.0/8;
+%{ for cidr in prometheus_allowed_cidrs ~}
+        allow ${cidr};
+%{ endfor ~}
         deny all;
         proxy_pass http://api_backend;
+    }
+
+    location / {
+        return 404;
     }
 }
 NGINX
 
-# Self-signed certificate placeholder (replace with real cert via ACM/Let's Encrypt)
-mkdir -p /etc/nginx/ssl
-openssl req -x509 -nodes -days 30 -newkey rsa:2048 \
-  -keyout /etc/nginx/ssl/key.pem \
-  -out /etc/nginx/ssl/cert.pem \
-  -subj "/CN=api.$${REGION}.mainstay.io"
+# #1812: nginx no longer terminates TLS itself — the ALB does, with the
+# real ACM certificate — so the self-signed placeholder cert this instance
+# used to generate for its own :443 listener is no longer needed.
 
 systemctl enable nginx
 systemctl restart nginx

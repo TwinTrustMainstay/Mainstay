@@ -1,24 +1,19 @@
-# Add operational analytics for lenders, engineers, finance, and fleet management
+# Fix broken documentation links and declare the project license
 
 ## Summary
 
-Mainstay now exposes deterministic, typed lifecycle analytics views for the four identified visibility gaps:
-
-- **Collateral portfolio health:** Aggregates current owner assets, collateral scores, eligibility, and locked collateral for lender risk review.
-- **Engineer productivity:** Reports an engineer's maintained asset count, maintenance volume, recorded cost, average cost, and latest activity, with timestamp filtering.
-- **Cost analysis and forecasting:** Summarizes historical maintenance costs and estimates future-period cost from the observed retained cost rate.
-- **Fleet performance:** Aggregates fleet service coverage, maintenance volume, maintenance cost, collateral score, locked assets, and decommissioned assets.
-
-All calculations use existing on-chain registry, lifecycle, maintenance, and ownership data. No new mutable state or authorization path was introduced.
+- Replace stale or incorrectly based documentation links with paths to existing guides.
+- Correct case-sensitive and relative-path references in the event indexer, monitoring, architecture, onboarding, and ADR documentation.
+- Add the MIT license, consistent with the Rust SDK package metadata, and remove the README reference to a nonexistent code of conduct.
 
 ## Commits
 
-1. `Add collateral portfolio health analytics`
-2. `Add engineer productivity analytics`
-3. `Add maintenance cost forecasting analytics`
-4. `Add fleet performance analytics`
+1. `docs: fix maintenance documentation links`
+2. `docs: repair monitoring and event indexer links`
+3. `docs: fix architecture and onboarding references`
+4. `docs: add MIT license and correct README references`
 
 ## Validation
 
+- Verified the changed relative links resolve to files in the repository.
 - `git diff --check` passes.
-- Rust tests and formatting could not be run in this environment because `cargo` is not installed.

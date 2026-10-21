@@ -1,5 +1,7 @@
 # Scoring Algorithm Deep Dive
 
+> **Last updated:** 2026-07-29 · **Doc version:** 0.1.0
+
 A component-by-component, diagram-driven walkthrough of how the Lifecycle
 contract computes an asset's collateral score. This document exists to give
 stakeholders — lenders, auditors, new contributors — an intuitive,
