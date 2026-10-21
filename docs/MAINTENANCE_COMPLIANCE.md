@@ -497,7 +497,7 @@ print(f"Stored hash:   {standard.hex()}")
 
 ## Related Documentation
 
-- [Maintenance Records](./MAINTENANCE.md) - Recording maintenance
-- [Backup and Recovery](./BACKUP_RECOVERY.md) - Data preservation
-- [DeFi Integration](./DEFI_INTEGRATION.md) - Lending platform integration
+- [Maintenance Record Corrections](./maintenance-record-versioning.md) - Recording maintenance
+- [Backup Procedures](./backup-procedures.md) - Data preservation
+- [Lender Integration Guide](./lender-integration-guide.md) - Lending platform integration
 - [Monitoring and Alerting](./monitoring/PROMETHEUS_METRICS.md) - Compliance monitoring

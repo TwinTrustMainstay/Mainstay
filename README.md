@@ -155,7 +155,7 @@ stellar keys generate deployer --network testnet
 ## 📖 Documentation
 
 - [Architecture Overview](docs/architecture.md)
-- [Life-Cycle Contract Design](docs/lifecycle-contract.md)
+- [Asset Lifecycle](docs/asset-lifecycle.md)
 - [Engineer Credentialing](docs/credentialing.md)
 - [Engineer Operations](docs/engineer-operations.md)
 - [Collateral Scoring Model](docs/collateral-scoring.md)
@@ -327,7 +327,7 @@ We welcome contributions! Please:
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
 
-See our [Code of Conduct](CODE_OF_CONDUCT.md) and [Contributing Guidelines](CONTRIBUTING.md).
+See our [Contributing Guidelines](CONTRIBUTING.md) for contribution instructions.
 
 ## 📄 License
 
