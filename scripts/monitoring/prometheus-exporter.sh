@@ -15,6 +15,9 @@
 #   STELLAR_NETWORK             - Stellar network
 #   STELLAR_RPC_URL             - Stellar RPC endpoint
 #   EXPORTER_PORT               - HTTP port (default: 9600)
+#   EXPORTER_BIND_ADDRESS       - Interface to bind (default: 127.0.0.1)
+#                                 Set to the private metrics interface IP so only
+#                                 the Prometheus host can reach the exporter.
 #   SCRAPE_INTERVAL             - Seconds between scrapes (default: 60)
 # =============================================================================
 
@@ -28,6 +31,7 @@ source .env 2>/dev/null || true
 
 : "${STELLAR_NETWORK:=testnet}"
 : "${EXPORTER_PORT:=9600}"
+: "${EXPORTER_BIND_ADDRESS:=127.0.0.1}"
 : "${SCRAPE_INTERVAL:=60}"
 
 # Temp file for the latest metrics page
@@ -158,8 +162,9 @@ EOF
 
 serve_http() {
     local port="$1"
+    local bind_addr="$2"
 
-    echo "[$(date -u +%H:%M:%S)] Starting Prometheus metrics exporter on :$port"
+    echo "[$(date -u +%H:%M:%S)] Starting Prometheus metrics exporter on ${bind_addr}:${port}"
     echo "[$(date -u +%H:%M:%S)] Scrape interval: ${SCRAPE_INTERVAL}s"
 
     # Initial collection
@@ -181,13 +186,14 @@ serve_http() {
 
     if command -v socat &> /dev/null; then
         echo "[$(date -u +%H:%M:%S)] Using socat for HTTP server"
-        socat TCP-LISTEN:"$port",reuseaddr,fork \
+        socat TCP-LISTEN:"$port",bind="$bind_addr",reuseaddr,fork \
             EXEC:"printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n'; cat $METRICS_FILE"
     elif command -v python3 &> /dev/null; then
         echo "[$(date -u +%H:%M:%S)] Using Python for HTTP server"
         python3 -c "
 import http.server, os
 METRICS_FILE = '$METRICS_FILE'
+BIND_ADDRESS = '$bind_addr'
 class MetricsHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/metrics' or self.path == '/':
@@ -209,7 +215,7 @@ class MetricsHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
     def log_message(self, fmt, *args):
         pass
-http.server.HTTPServer(('0.0.0.0', $port), MetricsHandler).serve_forever()
+http.server.HTTPServer((BIND_ADDRESS, $port), MetricsHandler).serve_forever()
 " 2>/dev/null
     else
         echo "[$(date -u +%H:%M:%S)] Neither socat nor python3 found."
@@ -225,6 +231,7 @@ http.server.HTTPServer(('0.0.0.0', $port), MetricsHandler).serve_forever()
 # ---------------------------------------------------------------------------
 
 PORT="${EXPORTER_PORT}"
+BIND_ADDR="${EXPORTER_BIND_ADDRESS}"
 
 if [[ "${1:-}" == "--port" ]]; then
     PORT="${2:-9600}"
@@ -233,4 +240,4 @@ fi
 echo "=== Mainstay Prometheus Exporter ==="
 echo "Network: ${STELLAR_NETWORK}"
 
-serve_http "$PORT"
+serve_http "$PORT" "$BIND_ADDR"

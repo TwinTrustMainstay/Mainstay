@@ -130,7 +130,17 @@ proxy_cache_path /var/cache/nginx/mainstay-api
                  inactive=60m
                  use_temp_path=off;
 
-limit_req_zone $binary_remote_addr zone=ip_limit:10m rate=100r/m;
+# Trust the ALB as the source of the real client address. Only the ALB
+# subnets may set X-Forwarded-For; anything else keeps its socket address.
+%{ for cidr in alb_subnet_cidrs ~}
+set_real_ip_from ${cidr};
+%{ endfor ~}
+real_ip_header X-Forwarded-For;
+real_ip_recursive on;
+
+# Key the per-IP limit on the resolved client address ($remote_addr after
+# realip processing), not the ALB node address.
+limit_req_zone $remote_addr zone=ip_limit:10m rate=100r/m;
 limit_req_zone $http_x_api_key zone=key_limit:10m rate=17r/m;
 
 log_format ratelimit '$remote_addr [$time_local] request_id=$mainstay_request_id "$request_method $uri" $status '
@@ -223,11 +233,32 @@ server {
         access_log off;
     }
 
+    # /metrics is intentionally not served on the public listener.
+    location /metrics {
+        return 404;
+    }
+}
+
+# Private metrics listener. Bound to the internal interface only and
+# reachable solely from the Prometheus host; never exposed via the ALB.
+server {
+    listen ${metrics_private_ip}:${metrics_port};
+    server_name _;
+
+    access_log /var/log/nginx/metrics-access.log;
+    error_log  /var/log/nginx/metrics-error.log warn;
+
     location /metrics {
         allow 127.0.0.1;
-        allow 10.0.0.0/8;
+%{ for cidr in prometheus_allowed_cidrs ~}
+        allow ${cidr};
+%{ endfor ~}
         deny all;
         proxy_pass http://api_backend;
+    }
+
+    location / {
+        return 404;
     }
 }
 NGINX
