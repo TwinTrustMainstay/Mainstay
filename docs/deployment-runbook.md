@@ -110,27 +110,65 @@ Compile all contracts to optimized WASM:
 ```
 
 ## 2. Deploy & Bind Registries
-Deploy contracts in order and store their IDs.
 
-### 2.1 Asset Registry
+### 2.1 Automated Deployment (recommended)
+
+Run the deployment script:
+```bash
+./scripts/deploy_testnet.sh
+```
+
+The script performs the full testnet deployment in one pass:
+
+1. **Deployer key setup** — generates the `deployer` identity if it does not exist.
+   Key-generation failures are no longer suppressed; the script aborts if the key
+   cannot be created.
+2. **Deployer funding** — checks the deployer balance and, if it is zero, funds the
+   account through Friendbot (`stellar keys fund deployer --network testnet`). This
+   makes the script usable on a fresh machine without a manual funding step.
+3. **Deployment** — deploys `asset_registry`, `engineer_registry`, `lifecycle`, and
+   `lending` in order, capturing each contract ID from the CLI output.
+4. **ID capture** — writes the IDs to `deployments/testnet.env` as
+   `CONTRACT_ASSET_REGISTRY`, `CONTRACT_ENGINEER_REGISTRY`, `CONTRACT_LIFECYCLE`, and
+   `CONTRACT_LENDING`, and prints a summary table of the deployed contracts.
+5. **Initialization** — runs the same `initialize_admin` / `initialize` calls as the
+   CI upgrade job (`.github/workflows/ci.yml`), using the deployer as admin. The
+   script fails if any initialization call fails.
+
+After the script completes, load the IDs into your shell for use by `backup.sh`,
+`batch-import.sh`, and the exporter:
+```bash
+set -a; source deployments/testnet.env; set +a
+```
+
+> **Security: deployer-only initialization**
+> Each `initialize_admin` / `initialize` call requires the `deployer` argument to sign the
+> transaction. The script passes `--source deployer` for every call, so initialization
+> happens immediately after deployment and the front-run window is closed.
+
+### 2.2 Manual Deployment (fallback)
+
+If you must deploy by hand, deploy contracts in order and record their IDs yourself.
+
+#### 2.2.1 Asset Registry
 ```bash
 stellar contract deploy --wasm target/wasm32-unknown-unknown/release/asset_registry.wasm --network testnet --source deployer
 ```
 *Note the Asset Registry ID (AR_ID).*
 
-### 2.2 Engineer Registry
+#### 2.2.2 Engineer Registry
 ```bash
 stellar contract deploy --wasm target/wasm32-unknown-unknown/release/engineer_registry.wasm --network testnet --source deployer
 ```
 *Note the Engineer Registry ID (ER_ID).*
 
-### 2.3 Lifecycle Contract
+#### 2.2.3 Lifecycle Contract
 ```bash
 stellar contract deploy --wasm target/wasm32-unknown-unknown/release/lifecycle.wasm --network testnet --source deployer
 ```
 *Note the Lifecycle Contract ID (LC_ID).*
 
-### 2.4 Lending Contract
+#### 2.2.4 Lending Contract
 ```bash
 stellar contract deploy --wasm target/wasm32-unknown-unknown/release/lending.wasm --network testnet --source deployer
 ```
@@ -144,6 +182,10 @@ stellar contract deploy --wasm target/wasm32-unknown-unknown/release/lending.was
 > **Complete all four initialization steps in the same block as deployment** (or immediately
 > after) to eliminate the window in which an observer could front-run initialization with their
 > own address.
+
+`./scripts/deploy_testnet.sh` runs all four initialization calls automatically (with the
+deployer as admin) and aborts if any of them fails. The manual commands below are the
+fallback for operators who deployed by hand in §2.2.
 
 ### 3.1 Initialize Asset Registry Admin
 ```bash
