@@ -1,7 +1,7 @@
 #![no_std]
 use shared::error::SharedContractError;
 use shared::validation::{require_non_empty_vec, require_string_length};
-use shared::{extend_persistent_ttl, require_admin, TTL_THRESHOLD, TTL_TARGET};
+use shared::{extend_persistent_ttl, require_admin, DEFAULT_TTL_LEDGERS, TTL_THRESHOLD, TTL_TARGET};
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, panic_with_error, symbol_short,
@@ -57,7 +57,7 @@ pub enum ContractError {
     TransferNotExpired = 27,
     /// A required configuration field was missing for the requested operation
     /// (e.g. `SearchFilter::lifecycle_contract` when sorting by `ByCollateralScore`).
-    InvalidConfig = 24,
+    InvalidConfig = 44,
     /// Condition not met for transfer (issue #1316).
     ConditionNotMet = 31,
     /// No transfer condition exists for this asset (issue #1316).
@@ -89,6 +89,7 @@ impl From<SharedContractError> for ContractError {
             SharedContractError::TimelockNotExpired => ContractError::TimelockNotExpired,
             SharedContractError::ProposalNotFound => ContractError::ProposalNotFound,
             SharedContractError::PendingAdminAlreadyExists => ContractError::PendingAdminAlreadyExists,
+            SharedContractError::InvalidSuspensionPeriod => ContractError::InvalidConfig,
         }
     }
 }
@@ -260,6 +261,7 @@ pub enum AssetStatus {
 
 /// Storage key enum for indexed lookups.
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     /// Maps a keyword category (arbitrary bytes) to the list of asset IDs tagged with it.
     AssetsByCategory(Bytes),
@@ -708,7 +710,7 @@ fn owner_index_add(env: &Env, owner: &Address, asset_id: u64) {
         .unwrap_or_else(|| Vec::new(env));
     ids.push_back(asset_id);
     env.storage().persistent().set(&key, &ids);
-    extend_persistent_ttl(&env, &key);
+    extend_persistent_ttl(&env, key.clone());
 }
 
 /// Remove an asset ID from the owner's index.
@@ -785,7 +787,7 @@ fn category_assets_add(env: &Env, category: &Bytes, asset_id: u64) {
         .unwrap_or_else(|| Vec::new(env));
     ids.push_back(asset_id);
     env.storage().persistent().set(&key, &ids);
-    extend_persistent_ttl(&env, &key);
+    extend_persistent_ttl(&env, key.clone());
     env.storage()
         .persistent()
         .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
@@ -808,7 +810,7 @@ fn category_assets_remove(env: &Env, category: &Bytes, asset_id: u64) {
         env.storage().persistent().remove(&key);
     } else {
         env.storage().persistent().set(&key, &updated);
-        extend_persistent_ttl(&env, &key);
+        extend_persistent_ttl(&env, key.clone());
         env.storage()
             .persistent()
             .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
@@ -882,6 +884,111 @@ fn validate_asset_type_symbol(env: &Env, asset_type: &Symbol) {
             panic_with_error!(env, ContractError::InvalidAssetType);
         }
     }
+}
+
+/// #1759: Default privacy budget per asset type, in milli-epsilon (epsilon = 10).
+pub const DEFAULT_DP_BUDGET_MILLI: u64 = 10_000;
+
+/// #1759: Fixed-point scale used by the discrete Laplace sampler (1e18).
+const DP_SCALE: u128 = 1_000_000_000_000_000_000;
+
+/// #1759: Upper bound on Bernoulli trials per geometric draw (keeps gas bounded).
+const DP_MAX_GEOM_STEPS: u64 = 10_000;
+
+/// #1760: Metadata for an off-chain sidecar blob. Only the content hash and
+/// metadata live on-chain; the bytes live in content-addressed storage (IPFS / Arweave).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SidecarRecord {
+    /// SHA-256 digest of the sidecar bytes.
+    pub content_hash: BytesN<32>,
+    /// Content address (e.g. `ipfs://...` or `ar://...`).
+    pub uri: String,
+    /// Size of the off-chain blob, used for storage cost tracking.
+    pub size_bytes: u64,
+    /// Ledger timestamp when the record was added.
+    pub added_at: u64,
+    /// Ledger timestamp after which anyone may expire the record. 0 = no expiry.
+    pub retain_until: u64,
+    /// True once the record has been removed or expired.
+    pub deleted: bool,
+}
+
+/// #1759: A differential-privacy query over aggregate asset counts.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DpQuery {
+    /// Asset type to count.
+    pub asset_type: Symbol,
+    /// Epsilon for this query, in milli-units (1000 = epsilon 1.0).
+    pub epsilon_milli: u32,
+}
+
+/// #1759: Noisy aggregate result from [`AssetRegistry::get_dp_stats`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NoisyStats {
+    pub asset_type: Symbol,
+    /// Count plus two-sided geometric noise, clamped to zero.
+    pub noisy_count: u64,
+    /// Epsilon that was charged to the budget for this query.
+    pub epsilon_milli: u32,
+}
+
+/// #1759: Exact discrete Laplace (two-sided geometric) mechanism helpers.
+/// `e^{-x}` in fixed point. Requires `x <= 5 * DP_SCALE` to avoid overflow.
+fn dp_exp_neg(x: u128) -> u128 {
+    let mut term: u128 = DP_SCALE;
+    let mut pos: u128 = DP_SCALE;
+    let mut neg: u128 = 0;
+    for k in 1u128..60 {
+        term = term * x / (DP_SCALE * k);
+        if k % 2 == 1 {
+            neg += term;
+        } else {
+            pos += term;
+        }
+    }
+    pos.saturating_sub(neg)
+}
+
+/// Samples the number of failures before the first success, where each trial
+/// continues with probability `q` (a geometric draw with parameter `q`).
+fn dp_geometric(env: &Env, q: u128) -> u64 {
+    let mut count = 0u64;
+    while count < DP_MAX_GEOM_STEPS {
+        let u = env.prng().gen_range::<u64>(0..(DP_SCALE as u64)) as u128;
+        if u < q {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    count
+}
+
+/// Marks sidecar `index` for `asset_id` as deleted and releases its tracked bytes.
+fn mark_sidecar_deleted(env: &Env, asset_id: u64, index: u32) {
+    let key = DataKey::AssetSidecars(asset_id);
+    let mut list: Vec<SidecarRecord> = env.storage().persistent().get(&key).unwrap_or(Vec::new(env));
+    let mut rec = list
+        .get(index)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::SidecarNotFound));
+    if rec.deleted {
+        panic_with_error!(env, ContractError::SidecarDeleted);
+    }
+    rec.deleted = true;
+    let size = rec.size_bytes;
+    list.set(index, rec);
+    env.storage().persistent().set(&key, &list);
+    extend_persistent_ttl(env, key);
+
+    let bytes_key = DataKey::SidecarBytes(asset_id);
+    let total: u64 = env.storage().persistent().get(&bytes_key).unwrap_or(0);
+    env.storage()
+        .persistent()
+        .set(&bytes_key, &total.saturating_sub(size));
+    extend_persistent_ttl(env, bytes_key);
 }
 
 #[contract]
@@ -1285,7 +1392,7 @@ impl AssetRegistry {
 
         // Ensure owner index TTL is extended after all batch writes
         if !ids.is_empty() {
-            extend_persistent_ttl(&env, &owner_index_key(&owner));
+            extend_persistent_ttl(&env, owner_index_key(&owner));
         }
 
         // Emit batch registration event
@@ -1466,7 +1573,7 @@ impl AssetRegistry {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
         if env.storage().persistent().has(&key) {
-            extend_persistent_ttl(&env, &key);
+            extend_persistent_ttl(&env, key.clone());
         }
         ids
     }
@@ -1494,7 +1601,7 @@ impl AssetRegistry {
             .unwrap_or_else(|| Vec::new(&env));
 
         if env.storage().persistent().has(&key) {
-            extend_persistent_ttl(&env, &key);
+            extend_persistent_ttl(&env, key.clone());
         }
 
         if page_size == 0 {
@@ -1543,7 +1650,7 @@ impl AssetRegistry {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
         if env.storage().persistent().has(&key) {
-            extend_persistent_ttl(&env, &key);
+            extend_persistent_ttl(&env, key.clone());
             env.storage()
                 .persistent()
                 .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
@@ -1758,7 +1865,7 @@ impl AssetRegistry {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
         if env.storage().persistent().has(&key) {
-            extend_persistent_ttl(&env, &key);
+            extend_persistent_ttl(&env, key.clone());
         }
         ids
     }
@@ -2534,19 +2641,20 @@ impl AssetRegistry {
         let cond_key = transfer_condition_key(asset_id);
         if let Some(condition) = env.storage().persistent().get::<_, TransferCondition>(&cond_key) {
             // If lifecycle contract is available, check the condition
-            if let Ok(lifecycle_addr) = env.storage().instance().get::<_, Address>(&LIFECYCLE_KEY) {
-                let lifecycle_client = lifecycle::LifecycleClient::new(&env, &lifecycle_addr);
-                let score = lifecycle_client.get_collateral_score(&asset_id);
+            if let Some(lifecycle_addr) = env.storage().instance().get::<_, Address>(&LIFECYCLE_KEY) {
+                let score: u32 = env.invoke_contract(
+                    &lifecycle_addr,
+                    &Symbol::new(&env, "get_collateral_score"),
+                    soroban_sdk::vec![&env, soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(&asset_id, &env)],
+                );
 
                 // Check condition based on type
-                match condition.condition_type.to_string(&env).as_str() {
-                    "SCORE_MIN" if score < condition.threshold => {
-                        panic_with_error!(&env, ContractError::ConditionNotMet);
-                    }
-                    "SCORE_MAX" if score > condition.threshold => {
-                        panic_with_error!(&env, ContractError::ConditionNotMet);
-                    }
-                    _ => {}
+                let ctype = condition.condition_type.clone();
+                if ctype == Symbol::new(&env, "SCORE_MIN") && u64::from(score) < condition.threshold {
+                    panic_with_error!(&env, ContractError::ConditionNotMet);
+                }
+                if ctype == Symbol::new(&env, "SCORE_MAX") && u64::from(score) > condition.threshold {
+                    panic_with_error!(&env, ContractError::ConditionNotMet);
                 }
 
                 // Clear condition after successful check
@@ -2591,7 +2699,7 @@ impl AssetRegistry {
             .extend_ttl(&asset_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
 
         // Notify lifecycle contract to clear engineer authorizations for the asset
-        if let Ok(lifecycle_addr) = env.storage().instance().get::<_, Address>(&LIFECYCLE_KEY) {
+        if let Some(lifecycle_addr) = env.storage().instance().get::<_, Address>(&LIFECYCLE_KEY) {
             let lifecycle_client = lifecycle::LifecycleClient::new(&env, &lifecycle_addr);
             lifecycle_client.transfer_notify(&asset_id, &new_owner);
         }
@@ -3600,7 +3708,7 @@ impl AssetRegistry {
         extend_persistent_ttl(&env, &maint_key);
 
         env.events().publish(
-            (symbol_short!("MAINT_START"), asset_id),
+            (symbol_short!("MNT_START"), asset_id),
             (caller, env.ledger().timestamp()),
         );
     }
@@ -3760,7 +3868,7 @@ impl AssetRegistry {
         // Verify caller is a co-owner
         let mut is_co_owner = false;
         for (owner, _weight) in asset.co_owners.iter() {
-            if owner == &caller {
+            if owner == caller {
                 is_co_owner = true;
                 break;
             }
@@ -3774,7 +3882,7 @@ impl AssetRegistry {
         let mut already_voted = false;
         for i in 0..proposal.votes.len() {
             let (voter, _) = proposal.votes.get(i).unwrap();
-            if voter == &caller {
+            if voter == caller {
                 proposal.votes.set(i, (caller.clone(), approve));
                 already_voted = true;
                 break;
@@ -3834,7 +3942,7 @@ impl AssetRegistry {
             total_weight = total_weight.saturating_add(weight);
 
             for (voter, vote) in proposal.votes.iter() {
-                if voter == &owner && vote {
+                if voter == owner && vote {
                     approval_weight = approval_weight.saturating_add(weight);
                 }
             }
@@ -3848,7 +3956,7 @@ impl AssetRegistry {
         // Execute the action
         match proposal.action_type {
             ActionType::Transfer => {
-                if let Some(new_owner) = proposal.new_owner {
+                if let Some(new_owner) = proposal.new_owner.clone() {
                     if asset.is_locked {
                         panic_with_error!(&env, ContractError::AssetLocked);
                     }
@@ -3878,7 +3986,7 @@ impl AssetRegistry {
                         .persistent()
                         .set(&asset_key(asset_id), &asset);
                     extend_persistent_ttl(&env, &asset_key(asset_id));
-                    if let Ok(lifecycle_addr) =
+                    if let Some(lifecycle_addr) =
                         env.storage().instance().get::<_, Address>(&LIFECYCLE_KEY)
                     {
                         lifecycle::LifecycleClient::new(&env, &lifecycle_addr)
@@ -3916,8 +4024,8 @@ fn string_contains(env: &Env, haystack: &String, needle: &String) -> bool {
     use soroban_sdk::xdr::ToXdr;
     // XDR encodes a string as: 4-byte big-endian length + UTF-8 bytes (+ padding).
     // We skip the first 4 bytes to obtain raw UTF-8.
-    let h_xdr = haystack.to_xdr(env);
-    let n_xdr = needle.to_xdr(env);
+    let h_xdr = haystack.clone().to_xdr(env);
+    let n_xdr = needle.clone().to_xdr(env);
     let h_len = h_xdr.len();
     let n_len = n_xdr.len();
     if n_len <= 4 || h_len < n_len {
