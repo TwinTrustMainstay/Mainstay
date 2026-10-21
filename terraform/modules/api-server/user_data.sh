@@ -74,14 +74,14 @@ mkdir -p /etc/vault.d /run/mainstay
 cat > /etc/vault.d/mainstay-agent.hcl <<VAULT
 pid_file = "/run/vault-agent.pid"
 vault {
-  address = "${VAULT_ADDR}"
+  address = "$${VAULT_ADDR}"
 }
 auto_auth {
   method "aws" {
     mount_path = "auth/aws"
     config = {
       type = "iam"
-      role = "${VAULT_AWS_ROLE}"
+      role = "$${VAULT_AWS_ROLE}"
     }
   }
   sink "file" {
@@ -95,7 +95,7 @@ template {
 }
 VAULT
 cat > /etc/vault.d/mainstay.env.tpl <<'VAULT_TEMPLATE'
-{{- with secret "${VAULT_SECRET_PATH}" }}
+{{- with secret "${vault_secret_path}" }}
 STELLAR_RPC_URL={{ .Data.data.stellar_rpc_url }}
 THIRD_PARTY_API_KEY={{ .Data.data.third_party_api_key }}
 {{- end }}

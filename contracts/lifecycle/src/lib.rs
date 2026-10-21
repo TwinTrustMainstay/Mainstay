@@ -7,6 +7,7 @@ mod types;
 pub(crate) mod storage;
 pub(crate) mod events;
 pub(crate) mod admin;
+pub(crate) mod agent_policy;
 
 // Re-export storage key helpers at the crate root so that
 // `super::history_key(...)` etc. in scoring.rs keep working unchanged.
@@ -1814,6 +1815,58 @@ impl Lifecycle {
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     pub fn unpause(env: Env, admin: Address) {
         crate::admin::unpause(env, admin);
+    }
+
+    /// Issue #1767/#1768: admin-only. Configure an autonomous agent's policy.
+    pub fn set_agent_policy(
+        env: Env,
+        admin: Address,
+        agent_type: crate::types::AgentType,
+        enabled: bool,
+        min_interval_secs: u64,
+        threshold: u32,
+    ) {
+        crate::agent_policy::set_agent_policy(
+            env,
+            admin,
+            agent_type,
+            enabled,
+            min_interval_secs,
+            threshold,
+        );
+    }
+
+    /// Issue #1767/#1768: current policy for an autonomous agent type.
+    pub fn get_agent_policy(
+        env: Env,
+        agent_type: crate::types::AgentType,
+    ) -> crate::types::AgentPolicy {
+        crate::agent_policy::get_agent_policy(env, agent_type)
+    }
+
+    /// Issue #1767/#1768: called by an off-chain agent runner once it has
+    /// taken an action, to record it on the audit trail.
+    ///
+    /// # Panics
+    /// - [`ContractError::AgentDisabled`] if the agent type is disabled
+    /// - [`ContractError::AgentRateLimited`] if called before the policy's
+    ///   `min_interval_secs` has elapsed since the agent's last action
+    pub fn record_agent_action(
+        env: Env,
+        executor: Address,
+        agent_type: crate::types::AgentType,
+        target_id: u64,
+        action: Symbol,
+    ) {
+        crate::agent_policy::record_agent_action(env, executor, agent_type, target_id, action);
+    }
+
+    /// Issue #1767/#1768: full on-chain audit trail for an agent type.
+    pub fn get_agent_action_history(
+        env: Env,
+        agent_type: crate::types::AgentType,
+    ) -> Vec<crate::types::AgentActionRecord> {
+        crate::agent_policy::get_agent_action_history(env, agent_type)
     }
 
      /// Propose pausing the contract using the admin timelock.

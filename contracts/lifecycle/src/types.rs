@@ -190,6 +190,51 @@ pub struct BatchRecord {
     pub notes: String,
 }
 
+/// Issue #1767/#1768: identifies which autonomous operational agent a policy
+/// or audit record belongs to. Soroban contracts have no native scheduler;
+/// an off-chain runner (bot/cron) reads `AgentPolicy` to decide what to do
+/// and when, then calls the matching contract entry point, which records the
+/// action here.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum AgentType {
+    /// Schedules routine maintenance based on `threshold` = days-until-due.
+    MaintenanceScheduler = 0,
+    /// Flags/executes collateral rebalancing based on `threshold` = drift in bps.
+    CollateralRebalancer = 1,
+    /// Monitors covenant compliance based on `threshold` = breach tolerance in bps.
+    CovenantMonitor = 2,
+}
+
+/// Issue #1767/#1768: declarative policy for one agent type. Deliberately a
+/// small set of typed knobs rather than a general rule DSL — a rule engine
+/// evaluated on-chain would add significant audit surface for little benefit
+/// over a few agent-specific numeric thresholds.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentPolicy {
+    pub agent_type: AgentType,
+    pub enabled: bool,
+    /// Minimum seconds between two recorded actions of this agent type.
+    pub min_interval_secs: u64,
+    /// Agent-specific threshold; see `AgentType` variant docs for meaning.
+    pub threshold: u32,
+}
+
+/// Issue #1767/#1768: one entry in an agent type's on-chain audit trail.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentActionRecord {
+    pub agent_type: AgentType,
+    pub timestamp: u64,
+    /// Asset or loan ID the action applied to.
+    pub target_id: u64,
+    pub action: Symbol,
+    /// Address that invoked the entry point which recorded this action
+    /// (the off-chain agent's signing key, or an admin acting on its behalf).
+    pub executor: Address,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Config {

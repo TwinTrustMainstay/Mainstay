@@ -259,6 +259,39 @@ pub enum AssetStatus {
     UnderMaintenance = 2,
 }
 
+/// Issue #1766: signature algorithm identifiers for the quantum-resistance
+/// migration. Soroban's host does not currently expose native CRYSTALS or
+/// SPHINCS+ verification primitives, so `Crystals`/`Sphincs` here identify
+/// which scheme a signer has migrated to for off-chain/future on-chain
+/// verification plumbing — they are not yet backed by on-chain signature
+/// checks. See docs/post-quantum-migration.md for the phased plan.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum CryptoAlgorithm {
+    /// Ed25519, used throughout this contract today via `require_auth`.
+    /// Vulnerable to a sufficiently large quantum computer (Shor's algorithm).
+    Legacy = 0,
+    /// CRYSTALS-Dilithium (NIST FIPS 204) — lattice-based PQ signature scheme.
+    Crystals = 1,
+    /// SPHINCS+ (NIST FIPS 205) — hash-based PQ signature scheme.
+    Sphincs = 2,
+}
+
+/// Issue #1766: contract-wide post-quantum migration configuration.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuantumMigrationConfig {
+    /// The algorithm new signers are expected to migrate to.
+    pub active_algorithm: CryptoAlgorithm,
+    /// When true, Legacy (Ed25519) signatures remain accepted alongside
+    /// `active_algorithm` so existing signers can migrate gradually instead
+    /// of being cut off immediately.
+    pub dual_algorithm_enabled: bool,
+    /// Ledger timestamp after which Legacy signatures are rejected outright.
+    /// Zero means no sunset deadline has been set yet.
+    pub legacy_sunset_at: u64,
+}
+
 /// Storage key enum for indexed lookups.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -425,6 +458,8 @@ const ASSET_TYPE_PREFIX: Symbol = symbol_short!("AST_TYPE");
 const PENDING_ADMIN_KEY: Symbol = symbol_short!("PADMIN");
 const DECOMM_PREFIX: Symbol = symbol_short!("DECOMM");
 const LIFECYCLE_KEY: Symbol = symbol_short!("LIFECYCLE");
+/// Issue #1766: post-quantum migration config singleton.
+const QUANTUM_CONFIG_KEY: Symbol = symbol_short!("QNTM_CFG");
 const DEPLOYER_KEY: Symbol = symbol_short!("DEPLOYER");
 const ALLOWED_ASSET_TYPES_KEY: Symbol = symbol_short!("A_TYPES");
 
@@ -2090,6 +2125,70 @@ impl AssetRegistry {
         }
         env.storage().instance().set(&LIFECYCLE_KEY, &lifecycle_addr);
         env.storage().instance().extend_ttl(518400, 518400);
+    }
+
+    /// Issue #1766: set the contract's post-quantum migration config. Only the
+    /// admin may call this. See docs/post-quantum-migration.md for the phased
+    /// rollout this is designed to support.
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::InvalidQuantumConfig`] if `legacy_sunset_at` is set
+    ///   (nonzero) while Legacy is the active algorithm with dual-algorithm
+    ///   support disabled — that combination would brick all existing signers.
+    pub fn set_quantum_config(
+        env: Env,
+        admin: Address,
+        active_algorithm: CryptoAlgorithm,
+        dual_algorithm_enabled: bool,
+        legacy_sunset_at: u64,
+    ) {
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if require_admin(&admin, &stored_admin).is_err() {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        if legacy_sunset_at != 0
+            && active_algorithm == CryptoAlgorithm::Legacy
+            && !dual_algorithm_enabled
+        {
+            panic_with_error!(&env, ContractError::InvalidQuantumConfig);
+        }
+
+        let config = QuantumMigrationConfig {
+            active_algorithm,
+            dual_algorithm_enabled,
+            legacy_sunset_at,
+        };
+        env.storage().instance().set(&QUANTUM_CONFIG_KEY, &config);
+        env.storage().instance().extend_ttl(518400, 518400);
+    }
+
+    /// Issue #1766: current post-quantum migration config. Defaults to
+    /// Legacy-only (today's actual behavior) if never explicitly set.
+    pub fn get_quantum_config(env: Env) -> QuantumMigrationConfig {
+        env.storage()
+            .instance()
+            .get(&QUANTUM_CONFIG_KEY)
+            .unwrap_or(QuantumMigrationConfig {
+                active_algorithm: CryptoAlgorithm::Legacy,
+                dual_algorithm_enabled: false,
+                legacy_sunset_at: 0,
+            })
+    }
+
+    /// Issue #1766: whether a Legacy (Ed25519) signature should still be
+    /// accepted right now, per the current migration config and ledger time.
+    pub fn is_legacy_signature_accepted(env: Env) -> bool {
+        let config = Self::get_quantum_config(env.clone());
+        match config.active_algorithm {
+            CryptoAlgorithm::Legacy => true,
+            _ => {
+                config.dual_algorithm_enabled
+                    && (config.legacy_sunset_at == 0
+                        || env.ledger().timestamp() < config.legacy_sunset_at)
+            }
+        }
     }
 
     /// Get the configured lifecycle contract address.
