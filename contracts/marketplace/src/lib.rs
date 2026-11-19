@@ -634,18 +634,32 @@ impl Marketplace {
 
         // Only bids whose engineer still holds a valid credential at finalization
         // are eligible. A lapsed winner falls through to the next valid bidder.
+        let committers = load_committers(&env, auction_id);
         let bids = load_bids(&env, auction_id);
         let mut eligible: Vec<Bid> = Vec::new(&env);
-        for bid in bids.iter() {
-            if is_credentialed(&env, &bid.engineer) {
-                eligible.push_back(bid);
+        if committers.is_empty() {
+            // Open auction: bids are already in placement order.
+            for bid in bids.iter() {
+                if is_credentialed(&env, &bid.engineer) {
+                    eligible.push_back(bid);
+                }
+            }
+        } else {
+            // Sealed auction: bids are stored in reveal order. Walk the committers
+            // in commit order so that ties resolve to the earliest commitment.
+            for engineer in committers.iter() {
+                if let Some(idx) = auction::find_bid(&bids, &engineer) {
+                    let bid = bids.get(idx).unwrap();
+                    if is_credentialed(&env, &bid.engineer) {
+                        eligible.push_back(bid);
+                    }
+                }
             }
         }
         auction.finalized_at = now;
 
         // Unrevealed commitments are forfeited. Remove them and the committer
         // index now so no sealed-bid state outlives the auction.
-        let committers = load_committers(&env, auction_id);
         for engineer in committers.iter() {
             env.storage()
                 .persistent()

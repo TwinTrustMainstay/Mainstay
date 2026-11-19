@@ -660,3 +660,76 @@ fn finalize_clears_unrevealed_commitments_from_storage() {
     // The revealed bid still decides the award.
     assert_eq!(ctx.client.get_auction(&id).winner, Some(revealer));
 }
+
+// ---------- Deterministic tie-breaking (#1940) ----------
+
+#[test]
+fn sealed_tie_goes_to_earliest_commitment_not_earliest_reveal() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
+    let first = engineer(&ctx, CredentialStatus::Valid, 0);
+    let second = engineer(&ctx, CredentialStatus::Valid, 0);
+    let salt_1 = BytesN::from_array(&env, &[4u8; 32]);
+    let salt_2 = BytesN::from_array(&env, &[5u8; 32]);
+
+    ctx.client
+        .commit_bid(&first, &id, &commitment(&env, id, &first, 1_500, &salt_1));
+    ctx.client
+        .commit_bid(&second, &id, &commitment(&env, id, &second, 1_500, &salt_2));
+
+    // The later committer reveals first, trying to take the tie by timing.
+    at(&env, BID_END + 1);
+    ctx.client.reveal_bid(&second, &id, &1_500, &salt_2);
+    ctx.client.reveal_bid(&first, &id, &1_500, &salt_1);
+
+    at(&env, REVEAL_END + 1);
+    ctx.client.finalize_auction(&id);
+    assert_eq!(ctx.client.get_auction(&id).winner, Some(first));
+}
+
+#[test]
+fn sealed_reputation_tie_goes_to_earliest_commitment() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let id = ctx.client.create_auction(
+        &ctx.admin,
+        &sealed_params(WinnerCriterion::HighestReputation),
+    );
+    let first = engineer(&ctx, CredentialStatus::Valid, 800);
+    let second = engineer(&ctx, CredentialStatus::Valid, 800);
+    let salt_1 = BytesN::from_array(&env, &[6u8; 32]);
+    let salt_2 = BytesN::from_array(&env, &[7u8; 32]);
+
+    ctx.client
+        .commit_bid(&first, &id, &commitment(&env, id, &first, 2_000, &salt_1));
+    ctx.client
+        .commit_bid(&second, &id, &commitment(&env, id, &second, 2_000, &salt_2));
+
+    at(&env, BID_END + 1);
+    ctx.client.reveal_bid(&second, &id, &2_000, &salt_2);
+    ctx.client.reveal_bid(&first, &id, &2_000, &salt_1);
+
+    at(&env, REVEAL_END + 1);
+    ctx.client.finalize_auction(&id);
+    assert_eq!(ctx.client.get_auction(&id).winner, Some(first));
+}
+
+#[test]
+fn open_auction_tie_goes_to_first_placed_bid() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &open_params(&ctx, WinnerCriterion::LowestPrice));
+    let first = engineer(&ctx, CredentialStatus::Valid, 0);
+    let second = engineer(&ctx, CredentialStatus::Valid, 0);
+    ctx.client.place_bid(&first, &id, &1_200);
+    ctx.client.place_bid(&second, &id, &1_200);
+
+    at(&env, BID_END + 1);
+    ctx.client.finalize_auction(&id);
+    assert_eq!(ctx.client.get_auction(&id).winner, Some(first));
+}
