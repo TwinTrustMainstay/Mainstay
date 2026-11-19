@@ -1,6 +1,6 @@
 //! Tests for the cross-chain bridge contract (#1743, #1744).
 
-use bridge::{Bridge, BridgeClient, ChainConfig, ReleaseParams, SwapStatus};
+use bridge::{Bridge, BridgeClient, ChainConfig, ReleaseParams, SwapStatus, SWAP_SCOPE};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
@@ -384,6 +384,8 @@ fn test_window_resets_after_window_elapses() {
 // ── Atomic swaps (hashed timelock) ───────────────────────────
 
 fn open_swap(ctx: &Ctx, preimage: &Bytes, expiry: u64) -> (u64, Address, Address) {
+    ctx.client
+        .set_token_allowed(&ctx.admin, &SWAP_SCOPE, &ctx.token, &true);
     let sender = Address::generate(&ctx.env);
     let recipient = Address::generate(&ctx.env);
     mint(ctx, &sender, 500);
@@ -695,4 +697,81 @@ fn test_only_admin_can_set_token_allowlist() {
         .try_set_token_allowed(&stranger, &ETH, &other_token, &true)
         .is_err());
     assert!(!ctx.client.is_token_allowed(&ETH, &other_token));
+}
+
+// ── Swap token allowlist (#1924) ─────────────────────────────
+
+fn swap_hashlock(ctx: &Ctx, preimage: &Bytes) -> BytesN<32> {
+    ctx.env.crypto().sha256(preimage).into()
+}
+
+#[test]
+fn test_create_swap_rejects_unlisted_token() {
+    let ctx = setup();
+    let sender = Address::generate(&ctx.env);
+    let other_token = ctx
+        .env
+        .register_stellar_asset_contract_v2(Address::generate(&ctx.env))
+        .address();
+    StellarAssetClient::new(&ctx.env, &other_token).mint(&sender, &500);
+    let hashlock = swap_hashlock(&ctx, &Bytes::from_slice(&ctx.env, b"secret"));
+
+    assert!(ctx
+        .client
+        .try_create_swap(
+            &sender,
+            &Address::generate(&ctx.env),
+            &other_token,
+            &200,
+            &hashlock,
+            &1_000,
+        )
+        .is_err());
+    assert_eq!(
+        TokenClient::new(&ctx.env, &other_token).balance(&sender),
+        500
+    );
+}
+
+#[test]
+fn test_create_swap_accepts_listed_token() {
+    let ctx = setup();
+    ctx.client
+        .set_token_allowed(&ctx.admin, &SWAP_SCOPE, &ctx.token, &true);
+    let preimage = Bytes::from_slice(&ctx.env, b"secret");
+    let (id, sender, recipient) = open_swap(&ctx, &preimage, 1_000);
+
+    ctx.client.claim_swap(&id, &preimage);
+    assert_eq!(balance(&ctx, &recipient), 200);
+    assert_eq!(balance(&ctx, &sender), 300);
+}
+
+#[test]
+fn test_bridge_allowlist_does_not_authorize_swaps() {
+    let ctx = setup();
+    // ctx.token is allowed for bridge_out to ETH, but not for swaps.
+    let preimage = Bytes::from_slice(&ctx.env, b"secret");
+    let sender = Address::generate(&ctx.env);
+    mint(&ctx, &sender, 500);
+    assert!(ctx
+        .client
+        .try_create_swap(
+            &sender,
+            &Address::generate(&ctx.env),
+            &ctx.token,
+            &200,
+            &swap_hashlock(&ctx, &preimage),
+            &1_000,
+        )
+        .is_err());
+    assert_eq!(balance(&ctx, &sender), 500);
+}
+
+#[test]
+fn test_swap_scope_cannot_be_registered_as_chain() {
+    let ctx = setup();
+    assert!(ctx
+        .client
+        .try_add_chain(&ctx.admin, &SWAP_SCOPE, &eth_config(&ctx.env))
+        .is_err());
 }

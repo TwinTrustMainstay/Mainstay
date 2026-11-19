@@ -87,6 +87,10 @@ pub enum ContractError {
 /// Maximum number of relayers in the set.
 const MAX_RELAYERS: u32 = 20;
 
+/// Allowlist scope used by atomic swaps. Swaps have no destination chain, so
+/// they use this reserved scope. Chain ID 0 cannot be registered.
+pub const SWAP_SCOPE: u32 = 0;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChainConfig {
@@ -393,6 +397,9 @@ impl Bridge {
     /// - [`ContractError::InvalidConfig`] if the config fails validation
     pub fn add_chain(env: Env, admin: Address, chain_id: u32, config: ChainConfig) {
         require_admin(&env, &admin);
+        if chain_id == SWAP_SCOPE {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
         validate_chain_config(&env, &config);
         let key = DataKey::Chain(chain_id);
         if env.storage().persistent().has(&key) {
@@ -661,6 +668,7 @@ impl Bridge {
     /// - [`ContractError::Paused`] if the bridge is paused
     /// - [`ContractError::AmountOutOfRange`] if `amount` is not positive
     /// - [`ContractError::SwapExpired`] if `expiry` is not in the future
+    /// - [`ContractError::TokenNotAllowed`] if `token` is not allowlisted for swaps
     pub fn create_swap(
         env: Env,
         sender: Address,
@@ -678,6 +686,7 @@ impl Bridge {
         if expiry <= env.ledger().timestamp() {
             panic_with_error!(&env, ContractError::SwapExpired);
         }
+        ensure_token_allowed(&env, SWAP_SCOPE, &token);
 
         token::Client::new(&env, &token).transfer(
             &sender,
