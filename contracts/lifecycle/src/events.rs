@@ -59,3 +59,6 @@ pub(crate) const EVENT_PROV_RM: Symbol = symbol_short!("PROV_RM");
 
 /// Emitted when an external score from a registered provider is recorded via `submit_external_score`.
 pub(crate) const EVENT_EXT_SCR: Symbol = symbol_short!("EXT_SCR");
+
+/// Emitted when a degradation curve is registered or updated for an asset category via `register_degradation_curve`.
+pub(crate) const EVENT_DEG_CRV: Symbol = symbol_short!("DEG_CRV");

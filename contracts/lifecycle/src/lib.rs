@@ -26,7 +26,7 @@ pub(crate) use events::{
     EVENT_ADMIN_SET, EVENT_DECAY, EVENT_INIT, EVENT_MAINT, EVENT_PROP_ADMIN, EVENT_PRUNED,
     EVENT_REG_AST, EVENT_REG_ENG, EVENT_RST_SCR, EVENT_XFER, EVENT_WEIGHT_PROP, EVENT_WEIGHT_EXEC,
     EVENT_RECONSTR, EVENT_TASK_DUE_SOON, EVENT_MNT_SIG, EVENT_PROV_REG, EVENT_PROV_RM,
-    EVENT_EXT_SCR,
+    EVENT_EXT_SCR, EVENT_DEG_CRV,
 };
 
 use crate::errors::ContractError;
@@ -8018,6 +8018,7 @@ impl Lifecycle {
         let curve_key = degradation_curve_key(&category);
         env.storage().persistent().set(&curve_key, &curve);
         shared::extend_persistent_ttl(&env, &curve_key);
+        env.events().publish((EVENT_DEG_CRV,), (category, version));
     }
 
     /// Get degradation curve for an asset category.
@@ -9117,6 +9118,7 @@ mod tests {
     mod maintenance_signature_event_tests;
     mod score_provider_event_tests;
     mod external_score_event_tests;
+    mod degradation_curve_event_tests;
 
     fn setup<'a>(
         env: &'a Env,
