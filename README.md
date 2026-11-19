@@ -168,6 +168,7 @@ stellar keys generate deployer --network testnet
 - [Asset Lifecycle](docs/asset-lifecycle.md)
 - [Engineer Credentialing](docs/credentialing.md)
 - [Engineer Operations](docs/engineer-operations.md)
+- [Marketplace Auctions Design](docs/marketplace-auctions.md)
 - [Collateral Scoring Model](docs/collateral-scoring.md)
 - [Threat Model & Security](docs/threat-model.md)
 - [Data Model](docs/data-model.md)
