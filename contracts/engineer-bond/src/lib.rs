@@ -27,6 +27,10 @@ pub const RECOVERY_STREAK: u32 = 3;
 /// Maximum history entries kept per engineer. Older entries are dropped first.
 pub const MAX_HISTORY: u32 = 50;
 
+/// Seconds an open dispute may block withdrawal (30 days). After this deadline the
+/// engineer may withdraw, which lapses the dispute, so an inactive admin cannot lock a bond.
+pub const DISPUTE_TIMEOUT_SECS: u64 = 30 * 24 * 60 * 60;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -73,6 +77,8 @@ pub struct Bond {
     pub slashed_total: i128,
     pub good_streak: u32,
     pub dispute_open: bool,
+    /// Ledger timestamp when the current dispute was opened; 0 when no dispute is open.
+    pub dispute_opened_at: u64,
 }
 
 #[contracttype]
@@ -128,6 +134,7 @@ fn load_bond(env: &Env, engineer: &Address) -> Bond {
             slashed_total: 0,
             good_streak: 0,
             dispute_open: false,
+            dispute_opened_at: 0,
         })
 }
 
@@ -212,6 +219,7 @@ impl EngineerBond {
             panic_with_error!(&env, ContractError::DisputeAlreadyOpen);
         }
         bond.dispute_open = true;
+        bond.dispute_opened_at = env.ledger().timestamp();
         save_bond(&env, &engineer, &bond);
         record(&env, &engineer, EventKind::DisputeOpened, 0);
     }
@@ -224,6 +232,7 @@ impl EngineerBond {
             panic_with_error!(&env, ContractError::NoOpenDispute);
         }
         bond.dispute_open = false;
+        bond.dispute_opened_at = 0;
         save_bond(&env, &engineer, &bond);
         record(&env, &engineer, EventKind::DisputeResolved, 0);
     }
@@ -263,8 +272,10 @@ impl EngineerBond {
 
     /// Withdraws `amount` of the engineer's bond.
     ///
-    /// Blocked while a dispute is open. After any slash, requires a good-job streak of at
-    /// least [`RECOVERY_STREAK`]. A non-zero remaining bond must stay at or above the minimum.
+    /// Blocked while a dispute is open, until [`DISPUTE_TIMEOUT_SECS`] has passed since it was
+    /// opened. After that deadline the dispute lapses and withdrawal is allowed. After any slash,
+    /// requires a good-job streak of at least [`RECOVERY_STREAK`]. A non-zero remaining bond must
+    /// stay at or above the minimum.
     pub fn withdraw_bond(env: Env, engineer: Address, amount: i128) {
         engineer.require_auth();
         if amount <= 0 {
@@ -272,7 +283,13 @@ impl EngineerBond {
         }
         let mut bond = load_bond(&env, &engineer);
         if bond.dispute_open {
-            panic_with_error!(&env, ContractError::DisputeOpen);
+            let deadline = bond.dispute_opened_at.saturating_add(DISPUTE_TIMEOUT_SECS);
+            if env.ledger().timestamp() < deadline {
+                panic_with_error!(&env, ContractError::DisputeOpen);
+            }
+            bond.dispute_open = false;
+            bond.dispute_opened_at = 0;
+            record(&env, &engineer, EventKind::DisputeResolved, 0);
         }
         if amount > bond.staked {
             panic_with_error!(&env, ContractError::InsufficientBond);

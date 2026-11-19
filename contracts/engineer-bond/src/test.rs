@@ -1,8 +1,8 @@
 #![cfg(test)]
 
-use crate::{EngineerBond, EngineerBondClient, EventKind, RECOVERY_STREAK};
+use crate::{EngineerBond, EngineerBondClient, EventKind, DISPUTE_TIMEOUT_SECS, RECOVERY_STREAK};
 use soroban_sdk::{
-    testutils::Address as _,
+    testutils::{Address as _, Ledger as _},
     token::{Client as TokenClient, StellarAssetClient},
     Address, Env,
 };
@@ -187,6 +187,38 @@ fn slash_succeeds_after_dispute_is_resolved() {
     ctx.client.slash(&ctx.admin, &eng, &100);
     assert_eq!(ctx.client.get_bond(&eng).staked, 400);
     assert_eq!(ctx.token.balance(&ctx.treasury), 100);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn withdrawal_blocked_just_before_dispute_deadline() {
+    let env = Env::default();
+    let ctx = setup(&env, 0);
+    let eng = funded_engineer(&ctx, 1_000);
+    ctx.client.post_bond(&eng, &500);
+    env.ledger().set_timestamp(1_000);
+    ctx.client.open_dispute(&ctx.admin, &eng);
+    env.ledger().set_timestamp(1_000 + DISPUTE_TIMEOUT_SECS - 1);
+    ctx.client.withdraw_bond(&eng, &100);
+}
+
+#[test]
+fn withdrawal_allowed_after_dispute_deadline() {
+    let env = Env::default();
+    let ctx = setup(&env, 0);
+    let eng = funded_engineer(&ctx, 1_000);
+    ctx.client.post_bond(&eng, &500);
+    env.ledger().set_timestamp(1_000);
+    ctx.client.open_dispute(&ctx.admin, &eng);
+    env.ledger().set_timestamp(1_000 + DISPUTE_TIMEOUT_SECS);
+
+    ctx.client.withdraw_bond(&eng, &500);
+
+    let bond = ctx.client.get_bond(&eng);
+    assert_eq!(bond.staked, 0);
+    assert!(!bond.dispute_open);
+    assert_eq!(bond.dispute_opened_at, 0);
+    assert_eq!(ctx.token.balance(&eng), 1_000);
 }
 
 #[test]
