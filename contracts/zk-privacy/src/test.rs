@@ -3,7 +3,7 @@ use crate::prover::{
 };
 use crate::{
     BitProof, ContractError, MembershipProof, RangeProof, ZkPrivacy, ZkPrivacyClient,
-    ATTESTATION_TTL_SECS, BITS_PER_TX, MAX_ROSTER,
+    ATTESTATION_TTL_SECS, BITS_PER_TX, MAX_ROSTER, SESSION_TTL_SECS,
 };
 use soroban_sdk::testutils::{Address as _, Ledger};
 use soroban_sdk::{Address, BytesN, Env, Vec};
@@ -386,4 +386,37 @@ fn collateral_chunk_cpu_cost_fits_transaction_budget() {
         cpu < 100_000_000,
         "collateral chunk uses {cpu} CPU instructions"
     );
+}
+
+#[test]
+fn open_collateral_session_cannot_be_overwritten_by_another_party() {
+    let (env, id, _admin) = setup();
+    let client = ZkPrivacyClient::new(&env, &id);
+    let owner = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let r = blinding_from_seed(&env, &seed(&env, 1), b"collateral");
+    let (c, proof) = prove_adequacy(&env, 7, 1500, &r, 1000, &seed(&env, 2)).unwrap();
+    client.begin_collateral_proof(&owner, &7, &c, &1000, &proof.bit_commitments);
+
+    // A third party cannot discard the owner's open session.
+    assert_eq!(
+        client.try_begin_collateral_proof(&attacker, &7, &c, &1000, &proof.bit_commitments),
+        Err(Ok(ContractError::SessionInProgress))
+    );
+    assert_eq!(client.get_collateral_session(&7).unwrap().owner, owner);
+
+    // The owner also cannot restart before the session expires.
+    assert_eq!(
+        client.try_begin_collateral_proof(&owner, &7, &c, &1000, &proof.bit_commitments),
+        Err(Ok(ContractError::SessionInProgress))
+    );
+
+    // After expiry, the same owner may restart the session.
+    env.ledger()
+        .with_mut(|l| l.timestamp += SESSION_TTL_SECS);
+    client
+        .try_begin_collateral_proof(&owner, &7, &c, &1000, &proof.bit_commitments)
+        .unwrap()
+        .unwrap();
+    assert_eq!(client.get_collateral_session(&7).unwrap().owner, owner);
 }

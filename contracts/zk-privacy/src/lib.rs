@@ -47,6 +47,9 @@ pub const MAX_ROSTER: u32 = 12;
 pub const BITS_PER_TX: u32 = 4;
 /// Collateral attestations are valid for 7 days after finalization.
 pub const ATTESTATION_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// How long an unfinished collateral proof session stays reserved for its owner.
+pub const SESSION_TTL_SECS: u64 = 24 * 60 * 60;
 /// Maximum maintenance record commitments kept per asset.
 pub const MAX_MAINTENANCE_RECORDS: u32 = 50;
 
@@ -69,6 +72,8 @@ pub enum ContractError {
     BitsOutOfOrder = 8,
     /// `finalize_collateral_proof` was called before all bits were verified.
     IncompleteProof = 9,
+    /// An open proof session for the asset belongs to someone else, or has not expired yet.
+    SessionInProgress = 10,
 }
 
 #[contracttype]
@@ -140,6 +145,8 @@ pub struct CollateralSession {
     pub bit_commitments: Vec<BytesN<96>>,
     /// Number of leading bits that have been verified.
     pub verified: u32,
+    /// Ledger timestamp when the session was opened.
+    pub started_at: u64,
 }
 
 #[contracttype]
@@ -449,8 +456,9 @@ impl ZkPrivacy {
     }
 
     /// Step 1 of a collateral proof. The asset owner opens a session with the
-    /// commitment and the bit commitments. Nothing is verified yet. Replaces any
-    /// earlier session for the asset.
+    /// commitment and the bit commitments. Nothing is verified yet. An open
+    /// session can only be replaced by its own owner after `SESSION_TTL_SECS`
+    /// has passed; any other caller gets `SessionInProgress`.
     pub fn begin_collateral_proof(
         env: Env,
         owner: Address,
@@ -463,16 +471,23 @@ impl ZkPrivacy {
         if bit_commitments.len() != RANGE_BITS {
             return Err(ContractError::InvalidProof);
         }
+        let key = DataKey::Session(asset_id);
+        let now = env.ledger().timestamp();
+        if let Some(existing) = env.storage().persistent().get::<_, CollateralSession>(&key) {
+            let expired = now >= existing.started_at + SESSION_TTL_SECS;
+            if existing.owner != owner || !expired {
+                return Err(ContractError::SessionInProgress);
+            }
+        }
         let session = CollateralSession {
             owner,
             commitment,
             threshold,
             bit_commitments,
             verified: 0,
+            started_at: now,
         };
-        env.storage()
-            .persistent()
-            .set(&DataKey::Session(asset_id), &session);
+        env.storage().persistent().set(&key, &session);
         Ok(())
     }
 
