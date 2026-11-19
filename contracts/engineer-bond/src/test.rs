@@ -283,3 +283,34 @@ fn history_records_bond_and_performance_events() {
     );
     assert_eq!(history.get(2).unwrap().amount, 50);
 }
+
+#[test]
+fn record_performance_rejects_engineer_without_bond() {
+    let env = Env::default();
+    let ctx = setup(&env, 0);
+    let eng = Address::generate(&env);
+    assert!(ctx
+        .client
+        .try_record_performance(&ctx.admin, &eng, &true)
+        .is_err());
+    let exists = env.as_contract(&ctx.contract_id, || {
+        env.storage()
+            .persistent()
+            .has(&crate::DataKey::Bond(eng.clone()))
+    });
+    assert!(!exists, "no bond record may be created");
+}
+
+#[test]
+fn open_dispute_rejects_engineer_without_bond() {
+    let env = Env::default();
+    let ctx = setup(&env, 0);
+    let eng = Address::generate(&env);
+    assert!(ctx.client.try_open_dispute(&ctx.admin, &eng).is_err());
+    let exists = env.as_contract(&ctx.contract_id, || {
+        env.storage()
+            .persistent()
+            .has(&crate::DataKey::Bond(eng.clone()))
+    });
+    assert!(!exists, "no bond record may be created");
+}

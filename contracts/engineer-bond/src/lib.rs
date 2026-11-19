@@ -55,6 +55,8 @@ pub enum ContractError {
     DisputeAlreadyOpen = 9,
     /// No dispute is open for this engineer.
     NoOpenDispute = 10,
+    /// No bond record exists for this engineer; they never staked.
+    BondNotFound = 11,
 }
 
 #[contracttype]
@@ -138,6 +140,19 @@ fn load_bond(env: &Env, engineer: &Address) -> Bond {
         })
 }
 
+/// Loads a bond that must already exist. Admin actions use this so they never create a
+/// bond record for an engineer who never staked.
+fn load_existing_bond(env: &Env, engineer: &Address) -> Bond {
+    if !env
+        .storage()
+        .persistent()
+        .has(&DataKey::Bond(engineer.clone()))
+    {
+        panic_with_error!(env, ContractError::BondNotFound);
+    }
+    load_bond(env, engineer)
+}
+
 fn save_bond(env: &Env, engineer: &Address, bond: &Bond) {
     let key = DataKey::Bond(engineer.clone());
     env.storage().persistent().set(&key, bond);
@@ -200,7 +215,7 @@ impl EngineerBond {
     /// Records the outcome of a job. A good job extends the streak, a poor one resets it.
     pub fn record_performance(env: Env, admin: Address, engineer: Address, good: bool) {
         require_stored_admin(&env, &admin);
-        let mut bond = load_bond(&env, &engineer);
+        let mut bond = load_existing_bond(&env, &engineer);
         if good {
             bond.good_streak = bond.good_streak.saturating_add(1);
             record(&env, &engineer, EventKind::GoodJob, 0);
@@ -214,7 +229,7 @@ impl EngineerBond {
     /// Opens a dispute against the engineer. Blocks withdrawal until resolved.
     pub fn open_dispute(env: Env, admin: Address, engineer: Address) {
         require_stored_admin(&env, &admin);
-        let mut bond = load_bond(&env, &engineer);
+        let mut bond = load_existing_bond(&env, &engineer);
         if bond.dispute_open {
             panic_with_error!(&env, ContractError::DisputeAlreadyOpen);
         }
