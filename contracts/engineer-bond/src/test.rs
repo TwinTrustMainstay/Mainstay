@@ -163,7 +163,8 @@ fn resolving_dispute_restores_bonded_status() {
     let eng = funded_engineer(&ctx, 1_000);
     ctx.client.post_bond(&eng, &500);
     ctx.client.open_dispute(&ctx.admin, &eng);
-    ctx.client.resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Dismissed);
+    ctx.client
+        .resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Dismissed);
     assert!(ctx.client.is_bonded(&eng));
 }
 
@@ -174,7 +175,8 @@ fn resolve_without_dispute_is_rejected() {
     let ctx = setup(&env, 0);
     let eng = funded_engineer(&ctx, 1_000);
     ctx.client.post_bond(&eng, &500);
-    ctx.client.resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Dismissed);
+    ctx.client
+        .resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Dismissed);
 }
 
 #[test]
@@ -245,7 +247,8 @@ fn upheld_dispute_records_outcome_and_links_slash() {
 
     ctx.client.slash(&ctx.admin, &eng, &120, &Some(id));
     ctx.client.slash(&ctx.admin, &eng, &30, &None);
-    ctx.client.resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Upheld);
+    ctx.client
+        .resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Upheld);
 
     let resolved = ctx.client.get_dispute(&eng, &id);
     assert_eq!(resolved.outcome, DisputeOutcome::Upheld);
@@ -263,7 +266,8 @@ fn dismissed_dispute_records_outcome_without_slash() {
     ctx.client.post_bond(&eng, &500);
 
     let id = ctx.client.open_dispute(&ctx.admin, &eng);
-    ctx.client.resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Dismissed);
+    ctx.client
+        .resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Dismissed);
 
     let dispute = ctx.client.get_dispute(&eng, &id);
     assert_eq!(dispute.outcome, DisputeOutcome::Dismissed);
@@ -280,9 +284,11 @@ fn each_dispute_gets_its_own_identifier_and_slash_link() {
     ctx.client.post_bond(&eng, &500);
 
     let first = ctx.client.open_dispute(&ctx.admin, &eng);
-    ctx.client.resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Dismissed);
+    ctx.client
+        .resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Dismissed);
     let second = ctx.client.open_dispute(&ctx.admin, &eng);
-    ctx.client.resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Upheld);
+    ctx.client
+        .resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Upheld);
     assert_eq!((first, second), (1, 2));
 
     ctx.client.slash(&ctx.admin, &eng, &50, &Some(second));
@@ -321,7 +327,10 @@ fn history_truncation_is_counted_and_keeps_newest_entries() {
     assert_eq!(history.len(), MAX_HISTORY);
     assert_eq!(ctx.client.get_history_dropped(&eng), extra + 1);
     // The oldest surviving entry is the one that was (extra + 1) positions from the start.
-    assert_eq!(history.get(MAX_HISTORY - 1).unwrap().kind, EventKind::PoorJob);
+    assert_eq!(
+        history.get(MAX_HISTORY - 1).unwrap().kind,
+        EventKind::PoorJob
+    );
     assert_eq!(history.get(0).unwrap().kind, EventKind::GoodJob);
 }
 
@@ -334,4 +343,134 @@ fn history_below_limit_drops_nothing() {
     ctx.client.record_performance(&ctx.admin, &eng, &true);
     assert_eq!(ctx.client.get_history(&eng).len(), 2);
     assert_eq!(ctx.client.get_history_dropped(&eng), 0);
+}
+
+/// Small deterministic xorshift generator. Each run is reproducible from its seed.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+const ENGINEERS: usize = 3;
+const ENGINEER_FUNDS: i128 = 10_000;
+
+/// Property: for every engineer, deposits equal staked + slashed + withdrawn, and the
+/// contract, treasury and engineer balances together conserve the minted supply.
+/// Random sequences of stake, withdraw, slash, performance and dispute calls are run
+/// under several seeds, and the invariants are checked after every step.
+#[test]
+fn accounting_invariants_hold_under_random_operation_sequences() {
+    for seed in 1..=6u64 {
+        run_random_sequence(seed, 200);
+    }
+}
+
+fn run_random_sequence(seed: u64, steps: u32) {
+    let env = Env::default();
+    let ctx = setup(&env, 50);
+    let engineers: [Address; ENGINEERS] =
+        core::array::from_fn(|_| funded_engineer(&ctx, ENGINEER_FUNDS));
+    let minted = ENGINEER_FUNDS * ENGINEERS as i128;
+    let mut deposited = [0i128; ENGINEERS];
+    let mut withdrawn = [0i128; ENGINEERS];
+    let mut rng = Rng(seed);
+
+    for step in 0..steps {
+        let i = rng.below(ENGINEERS as u64) as usize;
+        let eng = &engineers[i];
+        match rng.below(6) {
+            0 => {
+                let amount = 1 + rng.below(300) as i128;
+                if ctx.client.try_post_bond(eng, &amount).is_ok() {
+                    deposited[i] += amount;
+                }
+            }
+            1 => {
+                let amount = 1 + rng.below(300) as i128;
+                if ctx.client.try_withdraw_bond(eng, &amount).is_ok() {
+                    withdrawn[i] += amount;
+                }
+            }
+            2 => {
+                let amount = 1 + rng.below(200) as i128;
+                let _ = ctx.client.try_slash(&ctx.admin, eng, &amount, &None);
+            }
+            3 => {
+                let good = rng.below(2) == 0;
+                let _ = ctx.client.try_record_performance(&ctx.admin, eng, &good);
+            }
+            4 => {
+                let _ = ctx.client.try_open_dispute(&ctx.admin, eng);
+            }
+            _ => {
+                let outcome = if rng.below(2) == 0 {
+                    DisputeOutcome::Upheld
+                } else {
+                    DisputeOutcome::Dismissed
+                };
+                let _ = ctx.client.try_resolve_dispute(&ctx.admin, eng, &outcome);
+            }
+        }
+        assert_accounting(&ctx, &engineers, &deposited, &withdrawn, minted, seed, step);
+    }
+}
+
+fn assert_accounting(
+    ctx: &Ctx,
+    engineers: &[Address; ENGINEERS],
+    deposited: &[i128; ENGINEERS],
+    withdrawn: &[i128; ENGINEERS],
+    minted: i128,
+    seed: u64,
+    step: u32,
+) {
+    let mut total_staked = 0i128;
+    let mut total_slashed = 0i128;
+    let mut total_held_by_engineers = 0i128;
+
+    for i in 0..ENGINEERS {
+        let bond = ctx.client.get_bond(&engineers[i]);
+        assert!(
+            bond.staked >= 0,
+            "negative stake (seed {seed}, step {step})"
+        );
+        assert!(
+            bond.slashed_total >= 0,
+            "negative slash total (seed {seed}, step {step})"
+        );
+        assert_eq!(
+            deposited[i],
+            bond.staked + bond.slashed_total + withdrawn[i],
+            "per-engineer accounting (seed {seed}, step {step})"
+        );
+        total_staked += bond.staked;
+        total_slashed += bond.slashed_total;
+        total_held_by_engineers += ctx.token.balance(&engineers[i]);
+    }
+
+    assert_eq!(
+        ctx.token.balance(&ctx.contract_id),
+        total_staked,
+        "contract holds exactly the total stake (seed {seed}, step {step})"
+    );
+    assert_eq!(
+        ctx.token.balance(&ctx.treasury),
+        total_slashed,
+        "treasury holds exactly the total slashed (seed {seed}, step {step})"
+    );
+    assert_eq!(
+        total_held_by_engineers + total_staked + total_slashed,
+        minted,
+        "supply is conserved (seed {seed}, step {step})"
+    );
 }

@@ -200,8 +200,10 @@ fn record(env: &Env, engineer: &Address, kind: EventKind, amount: i128) {
         env.storage().persistent().set(&dropped_key, &(total + 1));
         extend_persistent_ttl(env, dropped_key);
 
-        env.events()
-            .publish((symbol_short!("bond_trnc"),), (engineer.clone(), dropped.kind));
+        env.events().publish(
+            (symbol_short!("bond_trnc"),),
+            (engineer.clone(), dropped.kind),
+        );
     }
     history.push_back(BondEvent {
         kind,
@@ -299,8 +301,10 @@ impl EngineerBond {
         save_bond(&env, &engineer, &bond);
         record(&env, &engineer, EventKind::DisputeResolved, 0);
 
-        env.events()
-            .publish((symbol_short!("bond_disp"),), (engineer, dispute.id, outcome));
+        env.events().publish(
+            (symbol_short!("bond_disp"),),
+            (engineer, dispute.id, outcome),
+        );
     }
 
     /// Returns the dispute with identifier `id` for the engineer.
