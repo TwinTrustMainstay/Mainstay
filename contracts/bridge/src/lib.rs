@@ -76,10 +76,18 @@ pub enum ContractError {
     RelayerAlreadyExists = 23,
     /// Relayer list contains duplicates or is empty.
     InvalidRelayerSet = 24,
+    /// Destination address length or encoding does not match the destination chain.
+    InvalidDestinationAddress = 25,
+    /// The swap's expiry is further in the future than the configured maximum duration.
+    SwapDurationTooLong = 26,
 }
 
 /// Maximum number of relayers in the set.
 const MAX_RELAYERS: u32 = 20;
+
+/// Default cap on how far in the future a swap expiry may be (30 days).
+/// Used until the admin sets `max_swap_duration_secs`.
+const DEFAULT_MAX_SWAP_DURATION_SECS: u64 = 30 * 24 * 60 * 60;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -101,6 +109,9 @@ pub struct ChainConfig {
     /// Window outflow level at which a `BR_ALERT` event is emitted.
     /// Must be > 0 and ≤ `window_cap`.
     pub alert_threshold: i128,
+    /// Exact length in bytes of a valid destination address on this chain.
+    /// Must be > 0. Addresses must also be ASCII alphanumeric.
+    pub address_len: u32,
 }
 
 #[contracttype]
@@ -170,6 +181,7 @@ pub enum DataKey {
     Pending(u32, u64),
     Window(u32),
     Swap(u64),
+    MaxSwapDuration,
 }
 
 fn validate_chain_config(env: &Env, cfg: &ChainConfig) {
@@ -179,8 +191,25 @@ fn validate_chain_config(env: &Env, cfg: &ChainConfig) {
         || cfg.window_cap <= 0
         || cfg.alert_threshold <= 0
         || cfg.alert_threshold > cfg.window_cap
+        || cfg.address_len == 0
     {
         panic_with_error!(env, ContractError::InvalidConfig);
+    }
+}
+
+/// Reject destination addresses that are empty, have the wrong length for the
+/// destination chain, or contain non-alphanumeric bytes.
+fn validate_dest_address(env: &Env, cfg: &ChainConfig, dest_address: &Bytes) {
+    if dest_address.is_empty() {
+        panic_with_error!(env, ContractError::InvalidDestination);
+    }
+    if dest_address.len() != cfg.address_len {
+        panic_with_error!(env, ContractError::InvalidDestinationAddress);
+    }
+    for byte in dest_address.iter() {
+        if !byte.is_ascii_alphanumeric() {
+            panic_with_error!(env, ContractError::InvalidDestinationAddress);
+        }
     }
 }
 
@@ -357,6 +386,28 @@ impl Bridge {
         bump(&env, &key);
     }
 
+    /// Set the maximum number of seconds a swap's expiry may lie beyond the current ledger time.
+    ///
+    /// # Panics
+    /// - [`ContractError::InvalidConfig`] if `max_swap_duration_secs` is 0
+    pub fn set_max_swap_duration(env: Env, admin: Address, max_swap_duration_secs: u64) {
+        require_admin(&env, &admin);
+        if max_swap_duration_secs == 0 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxSwapDuration, &max_swap_duration_secs);
+    }
+
+    /// Maximum allowed swap timelock in seconds (`max_swap_duration_secs`).
+    pub fn get_max_swap_duration(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxSwapDuration)
+            .unwrap_or(DEFAULT_MAX_SWAP_DURATION_SECS)
+    }
+
     /// Enable or disable a chain without changing its other constraints.
     pub fn set_chain_enabled(env: Env, admin: Address, chain_id: u32, enabled: bool) {
         require_admin(&env, &admin);
@@ -384,6 +435,7 @@ impl Bridge {
     /// - [`ContractError::ChainNotFound`] / [`ContractError::ChainDisabled`] for an unusable destination
     /// - [`ContractError::AmountOutOfRange`] if `amount` is outside the chain's limits
     /// - [`ContractError::InvalidDestination`] if `dest_address` is empty
+    /// - [`ContractError::InvalidDestinationAddress`] if `dest_address` has the wrong length or encoding for `dest_chain`
     pub fn bridge_out(
         env: Env,
         sender: Address,
@@ -399,9 +451,7 @@ impl Bridge {
             panic_with_error!(&env, ContractError::ChainDisabled);
         }
         ensure_amount_in_range(&env, &cfg, amount);
-        if dest_address.is_empty() {
-            panic_with_error!(&env, ContractError::InvalidDestination);
-        }
+        validate_dest_address(&env, &cfg, &dest_address);
 
         token::Client::new(&env, &token).transfer(
             &sender,
@@ -438,6 +488,8 @@ impl Bridge {
     /// - [`ContractError::AttestationMismatch`] if parameters differ from earlier attestations
     /// - [`ContractError::AlreadyAttested`] if this relayer already attested
     /// - [`ContractError::WindowCapExceeded`] if the release would breach the outflow cap
+    ///
+    /// On execution, emits `BR_REL` with the approving relayers in attestation order.
     pub fn attest_release(
         env: Env,
         relayer: Address,
@@ -522,6 +574,7 @@ impl Bridge {
                     recipient.clone(),
                     token.clone(),
                     amount,
+                    pending.approvals.clone(),
                 ),
             );
         }
@@ -564,6 +617,7 @@ impl Bridge {
     /// - [`ContractError::Paused`] if the bridge is paused
     /// - [`ContractError::AmountOutOfRange`] if `amount` is not positive
     /// - [`ContractError::SwapExpired`] if `expiry` is not in the future
+    /// - [`ContractError::SwapDurationTooLong`] if `expiry` is more than `max_swap_duration_secs` ahead
     pub fn create_swap(
         env: Env,
         sender: Address,
@@ -578,8 +632,13 @@ impl Bridge {
         if amount <= 0 {
             panic_with_error!(&env, ContractError::AmountOutOfRange);
         }
-        if expiry <= env.ledger().timestamp() {
+        let now = env.ledger().timestamp();
+        if expiry <= now {
             panic_with_error!(&env, ContractError::SwapExpired);
+        }
+        let max_duration = Self::get_max_swap_duration(env.clone());
+        if expiry - now > max_duration {
+            panic_with_error!(&env, ContractError::SwapDurationTooLong);
         }
 
         token::Client::new(&env, &token).transfer(
