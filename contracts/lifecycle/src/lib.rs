@@ -25,7 +25,7 @@ pub(crate) use storage::{
 pub(crate) use events::{
     EVENT_ADMIN_SET, EVENT_DECAY, EVENT_INIT, EVENT_MAINT, EVENT_PROP_ADMIN, EVENT_PRUNED,
     EVENT_REG_AST, EVENT_REG_ENG, EVENT_RST_SCR, EVENT_XFER, EVENT_WEIGHT_PROP, EVENT_WEIGHT_EXEC,
-    EVENT_RECONSTR, EVENT_TASK_DUE_SOON,
+    EVENT_RECONSTR, EVENT_TASK_DUE_SOON, EVENT_MNT_SIG,
 };
 
 use crate::errors::ContractError;
@@ -1277,12 +1277,16 @@ impl Lifecycle {
             signatures.push_back(MaintenanceSignature {
                 asset_id,
                 record_timestamp,
-                signer,
+                signer: signer.clone(),
                 public_key,
                 signature,
             });
             env.storage().persistent().set(&key, &signatures);
             extend_persistent_ttl(&env, &key);
+            env.events().publish(
+                (EVENT_MNT_SIG,),
+                (asset_id, record_timestamp, signer),
+            );
         }
 
         /// Returns whether a valid stored signature exists for a record.
@@ -9100,6 +9104,7 @@ mod tests {
     mod lifecycle_score_tests;
     mod maintenance_fuzz_tests;
     mod maintenance_ttl_tests;
+    mod maintenance_signature_event_tests;
 
     fn setup<'a>(
         env: &'a Env,

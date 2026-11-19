@@ -47,3 +47,6 @@ pub(crate) const EVENT_RECONSTR: Symbol = symbol_short!("RECONSTR");
 
 /// Emitted when a recurring task is approaching its due date.
 pub(crate) const EVENT_TASK_DUE_SOON: Symbol = symbol_short!("TASK_SOON");
+
+/// Emitted when an engineer's Ed25519 signature over a maintenance record is stored via `sign_maintenance_record`.
+pub(crate) const EVENT_MNT_SIG: Symbol = symbol_short!("MNT_SIG");
