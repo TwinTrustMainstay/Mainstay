@@ -76,6 +76,12 @@ pub enum ContractError {
     RelayerAlreadyExists = 23,
     /// Relayer list contains duplicates or is empty.
     InvalidRelayerSet = 24,
+    /// The attestation window for this release has closed (#1921).
+    ReleaseExpired = 25,
+    /// No pending release exists for this `(source_chain, nonce)` (#1921).
+    ReleaseNotFound = 26,
+    /// The release's attestation window has not closed yet, so it cannot be expired (#1921).
+    ReleaseNotExpired = 27,
 }
 
 /// Maximum number of relayers in the set.
@@ -101,6 +107,10 @@ pub struct ChainConfig {
     /// Window outflow level at which a `BR_ALERT` event is emitted.
     /// Must be > 0 and ≤ `window_cap`.
     pub alert_threshold: i128,
+    /// Seconds after a release is first attested within which the remaining
+    /// attestations are accepted. Must be > 0. Releases still short of the
+    /// threshold after this window can no longer be attested and may be expired (#1921).
+    pub attestation_window_secs: u64,
 }
 
 #[contracttype]
@@ -133,6 +143,8 @@ pub struct PendingRelease {
     pub approvals: Vec<Address>,
     /// `true` once the release has been paid out. Doubles as the replay guard.
     pub executed: bool,
+    /// Ledger timestamp of the first attestation. Starts the attestation window (#1921).
+    pub created_at: u64,
 }
 
 #[contracttype]
@@ -179,12 +191,19 @@ fn validate_chain_config(env: &Env, cfg: &ChainConfig) {
         || cfg.window_cap <= 0
         || cfg.alert_threshold <= 0
         || cfg.alert_threshold > cfg.window_cap
+        || cfg.attestation_window_secs == 0
     {
         panic_with_error!(env, ContractError::InvalidConfig);
     }
 }
 
 /// Extend the TTL of a persistent entry so active bridge state is not archived.
+/// `true` once `now` is past `created_at + window_secs`. A release is still
+/// attestable at exactly that deadline (#1921).
+fn attestation_window_closed(now: u64, created_at: u64, window_secs: u64) -> bool {
+    now > created_at.saturating_add(window_secs)
+}
+
 fn bump(env: &Env, key: &DataKey) {
     env.storage()
         .persistent()
@@ -435,6 +454,7 @@ impl Bridge {
     /// - [`ContractError::InsufficientConfirmations`] if `confirmations` is below the chain requirement
     /// - [`ContractError::AmountOutOfRange`] if `amount` is outside the chain's limits
     /// - [`ContractError::AlreadyProcessed`] if this release already executed
+    /// - [`ContractError::ReleaseExpired`] if the attestation window has closed (#1921)
     /// - [`ContractError::AttestationMismatch`] if parameters differ from earlier attestations
     /// - [`ContractError::AlreadyAttested`] if this relayer already attested
     /// - [`ContractError::WindowCapExceeded`] if the release would breach the outflow cap
@@ -479,6 +499,14 @@ impl Bridge {
                     if existing.executed {
                         panic_with_error!(&env, ContractError::AlreadyProcessed);
                     }
+                    // #1921: a partially attested release cannot be completed after its window.
+                    if attestation_window_closed(
+                        env.ledger().timestamp(),
+                        existing.created_at,
+                        cfg.attestation_window_secs,
+                    ) {
+                        panic_with_error!(&env, ContractError::ReleaseExpired);
+                    }
                     if existing.token != token
                         || existing.recipient != recipient
                         || existing.amount != amount
@@ -493,6 +521,7 @@ impl Bridge {
                     amount,
                     approvals: Vec::new(&env),
                     executed: false,
+                    created_at: env.ledger().timestamp(),
                 },
             };
 
@@ -546,6 +575,36 @@ impl Bridge {
         env.storage()
             .persistent()
             .get(&DataKey::Pending(source_chain, nonce))
+    }
+
+    /// Remove a pending release whose attestation window has closed (#1921).
+    ///
+    /// Callable by anyone. Executed releases are never removed, because their
+    /// record is the replay guard.
+    ///
+    /// # Panics
+    /// - [`ContractError::ReleaseNotFound`] if no pending release exists
+    /// - [`ContractError::AlreadyProcessed`] if the release already executed
+    /// - [`ContractError::ReleaseNotExpired`] if the window is still open
+    pub fn expire_release(env: Env, source_chain: u32, nonce: u64) {
+        let key = DataKey::Pending(source_chain, nonce);
+        let pending: PendingRelease = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ReleaseNotFound));
+        if pending.executed {
+            panic_with_error!(&env, ContractError::AlreadyProcessed);
+        }
+        let cfg = load_chain(&env, source_chain);
+        if !attestation_window_closed(
+            env.ledger().timestamp(),
+            pending.created_at,
+            cfg.attestation_window_secs,
+        ) {
+            panic_with_error!(&env, ContractError::ReleaseNotExpired);
+        }
+        env.storage().persistent().remove(&key);
     }
 
     /// Current rolling outflow window for a source chain. Returns zeroed state if none.
