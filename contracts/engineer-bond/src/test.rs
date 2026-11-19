@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use crate::{EngineerBond, EngineerBondClient, EventKind, RECOVERY_STREAK};
+use crate::{DisputeOutcome, EngineerBond, EngineerBondClient, EventKind, RECOVERY_STREAK};
 use soroban_sdk::{
     testutils::Address as _,
     token::{Client as TokenClient, StellarAssetClient},
@@ -81,7 +81,7 @@ fn slash_moves_funds_to_treasury_and_resets_streak() {
     ctx.client.record_performance(&ctx.admin, &eng, &true);
     ctx.client.record_performance(&ctx.admin, &eng, &true);
 
-    ctx.client.slash(&ctx.admin, &eng, &300);
+    ctx.client.slash(&ctx.admin, &eng, &300, &None);
 
     let bond = ctx.client.get_bond(&eng);
     assert_eq!(bond.staked, 500);
@@ -97,7 +97,7 @@ fn slash_cannot_exceed_bond() {
     let ctx = setup(&env, 0);
     let eng = funded_engineer(&ctx, 1_000);
     ctx.client.post_bond(&eng, &200);
-    ctx.client.slash(&ctx.admin, &eng, &201);
+    ctx.client.slash(&ctx.admin, &eng, &201, &None);
 }
 
 #[test]
@@ -107,7 +107,7 @@ fn withdraw_after_slash_requires_recovery_streak() {
     let ctx = setup(&env, 0);
     let eng = funded_engineer(&ctx, 1_000);
     ctx.client.post_bond(&eng, &500);
-    ctx.client.slash(&ctx.admin, &eng, &100);
+    ctx.client.slash(&ctx.admin, &eng, &100, &None);
     for _ in 0..(RECOVERY_STREAK - 1) {
         ctx.client.record_performance(&ctx.admin, &eng, &true);
     }
@@ -120,7 +120,7 @@ fn withdraw_after_recovery_streak_succeeds() {
     let ctx = setup(&env, 0);
     let eng = funded_engineer(&ctx, 1_000);
     ctx.client.post_bond(&eng, &500);
-    ctx.client.slash(&ctx.admin, &eng, &100);
+    ctx.client.slash(&ctx.admin, &eng, &100, &None);
     for _ in 0..RECOVERY_STREAK {
         ctx.client.record_performance(&ctx.admin, &eng, &true);
     }
@@ -161,7 +161,7 @@ fn resolving_dispute_restores_bonded_status() {
     let eng = funded_engineer(&ctx, 1_000);
     ctx.client.post_bond(&eng, &500);
     ctx.client.open_dispute(&ctx.admin, &eng);
-    ctx.client.resolve_dispute(&ctx.admin, &eng);
+    ctx.client.resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Dismissed);
     assert!(ctx.client.is_bonded(&eng));
 }
 
@@ -172,7 +172,7 @@ fn resolve_without_dispute_is_rejected() {
     let ctx = setup(&env, 0);
     let eng = funded_engineer(&ctx, 1_000);
     ctx.client.post_bond(&eng, &500);
-    ctx.client.resolve_dispute(&ctx.admin, &eng);
+    ctx.client.resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Dismissed);
 }
 
 #[test]
@@ -203,7 +203,7 @@ fn non_admin_cannot_slash() {
     let eng = funded_engineer(&ctx, 1_000);
     ctx.client.post_bond(&eng, &500);
     let intruder = Address::generate(&env);
-    ctx.client.slash(&intruder, &eng, &100);
+    ctx.client.slash(&intruder, &eng, &100, &None);
 }
 
 #[test]
@@ -213,7 +213,7 @@ fn history_records_bond_and_performance_events() {
     let eng = funded_engineer(&ctx, 1_000);
     ctx.client.post_bond(&eng, &500);
     ctx.client.record_performance(&ctx.admin, &eng, &false);
-    ctx.client.slash(&ctx.admin, &eng, &50);
+    ctx.client.slash(&ctx.admin, &eng, &50, &None);
 
     let history = ctx.client.get_history(&eng);
     let kinds: [EventKind; 3] = [
@@ -226,4 +226,78 @@ fn history_records_bond_and_performance_events() {
         [EventKind::Posted, EventKind::PoorJob, EventKind::Slashed]
     );
     assert_eq!(history.get(2).unwrap().amount, 50);
+}
+
+#[test]
+fn upheld_dispute_records_outcome_and_links_slash() {
+    let env = Env::default();
+    let ctx = setup(&env, 0);
+    let eng = funded_engineer(&ctx, 1_000);
+    ctx.client.post_bond(&eng, &500);
+
+    let id = ctx.client.open_dispute(&ctx.admin, &eng);
+    assert_eq!(id, 1);
+    let open = ctx.client.get_dispute(&eng, &id);
+    assert_eq!(open.outcome, DisputeOutcome::Pending);
+    assert_eq!(open.slashed_total, 0);
+
+    ctx.client.slash(&ctx.admin, &eng, &120, &Some(id));
+    ctx.client.slash(&ctx.admin, &eng, &30, &None);
+    ctx.client.resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Upheld);
+
+    let resolved = ctx.client.get_dispute(&eng, &id);
+    assert_eq!(resolved.outcome, DisputeOutcome::Upheld);
+    // Only the slash linked to the dispute is counted against it.
+    assert_eq!(resolved.slashed_total, 120);
+    assert_eq!(ctx.client.get_bond(&eng).slashed_total, 150);
+    assert!(!ctx.client.get_bond(&eng).dispute_open);
+}
+
+#[test]
+fn dismissed_dispute_records_outcome_without_slash() {
+    let env = Env::default();
+    let ctx = setup(&env, 0);
+    let eng = funded_engineer(&ctx, 1_000);
+    ctx.client.post_bond(&eng, &500);
+
+    let id = ctx.client.open_dispute(&ctx.admin, &eng);
+    ctx.client.resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Dismissed);
+
+    let dispute = ctx.client.get_dispute(&eng, &id);
+    assert_eq!(dispute.outcome, DisputeOutcome::Dismissed);
+    assert_eq!(dispute.slashed_total, 0);
+    assert_eq!(ctx.client.get_bond(&eng).slashed_total, 0);
+    assert!(ctx.client.is_bonded(&eng));
+}
+
+#[test]
+fn each_dispute_gets_its_own_identifier_and_slash_link() {
+    let env = Env::default();
+    let ctx = setup(&env, 0);
+    let eng = funded_engineer(&ctx, 1_000);
+    ctx.client.post_bond(&eng, &500);
+
+    let first = ctx.client.open_dispute(&ctx.admin, &eng);
+    ctx.client.resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Dismissed);
+    let second = ctx.client.open_dispute(&ctx.admin, &eng);
+    ctx.client.resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Upheld);
+    assert_eq!((first, second), (1, 2));
+
+    ctx.client.slash(&ctx.admin, &eng, &50, &Some(second));
+    assert_eq!(ctx.client.get_dispute(&eng, &first).slashed_total, 0);
+    assert_eq!(ctx.client.get_dispute(&eng, &second).slashed_total, 50);
+    assert_eq!(
+        ctx.client.get_dispute(&eng, &first).outcome,
+        DisputeOutcome::Dismissed
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn slash_linked_to_unknown_dispute_is_rejected() {
+    let env = Env::default();
+    let ctx = setup(&env, 0);
+    let eng = funded_engineer(&ctx, 1_000);
+    ctx.client.post_bond(&eng, &500);
+    ctx.client.slash(&ctx.admin, &eng, &10, &Some(1));
 }
