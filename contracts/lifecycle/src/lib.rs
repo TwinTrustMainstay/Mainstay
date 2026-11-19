@@ -6888,19 +6888,27 @@ impl Lifecycle {
 
     /// Capture a point-in-time health snapshot for an asset.
     ///
-    /// Anyone may call this. The snapshot persists independently of maintenance
-    /// history so lenders can verify condition even after TTL-driven pruning.
+    /// Only the asset owner may call this. The snapshot persists independently of
+    /// maintenance history so lenders can verify condition even after TTL-driven pruning.
     ///
     /// # Arguments
+    /// * `caller` - Must authenticate and be the current owner of the asset
     /// * `asset_id` - The asset to snapshot
     ///
     /// # Panics
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::AssetNotFound`] if the asset does not exist
+    /// - [`ContractError::UnauthorizedOwner`] if `caller` is not the asset owner
     /// - [`ContractError::AssetDecommissioned`] if the asset has been decommissioned
-    pub fn take_health_snapshot(env: Env, asset_id: u64) -> HealthSnapshot {
+    pub fn take_health_snapshot(env: Env, caller: Address, asset_id: u64) -> HealthSnapshot {
+        caller.require_auth();
         let asset_registry = get_asset_registry_addr(&env);
         verify_asset_exists(&env, &asset_registry, &asset_id);
+        let owner_check = asset_registry::AssetRegistryClient::new(&env, &asset_registry)
+            .get_asset(&asset_id);
+        if owner_check.owner != caller {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
 
         // Reject snapshots for decommissioned assets: a decommissioned asset's
         // health data is no longer current and must not appear as a valid health
@@ -9122,6 +9130,7 @@ mod tests {
     mod maintenance_fuzz_tests;
     mod maintenance_ttl_tests;
     mod dispute_auth_tests;
+    mod snapshot_auth_tests;
 
     fn setup<'a>(
         env: &'a Env,
@@ -11205,14 +11214,14 @@ mod tests {
                 &None,
             );
         }
-        let score_before = client.take_health_snapshot(&asset_id).score;
+        let score_before = client.take_health_snapshot(&asset_owner, &asset_id).score;
         assert_eq!(score_before, 50);
 
         // Shrink max_history and prune — most of the scoring history is dropped.
         client.update_max_history(&admin, &2);
         client.prune_asset_history(&admin, &asset_id);
 
-        let score_after = client.take_health_snapshot(&asset_id).score;
+        let score_after = client.take_health_snapshot(&asset_owner, &asset_id).score;
         assert!(
             score_after < score_before,
             "collateral score must be recalculated immediately after pruning, got {} (was {})",
@@ -17635,9 +17644,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, _, _) = setup(&env, 0);
-        let (asset_id, _) = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
 
-        let snapshot = client.take_health_snapshot(&asset_id);
+        let snapshot = client.take_health_snapshot(&asset_owner, &asset_id);
 
         assert_eq!(snapshot.score, 0);
         assert_eq!(snapshot.maintenance_count, 0);
@@ -17685,7 +17694,7 @@ mod tests {
             &engineer,
             &None,
         );
-        client.take_health_snapshot(&asset_id);
+        client.take_health_snapshot(&asset_owner, &asset_id);
 
         env.ledger().with_mut(|li| li.timestamp += 1000);
 
@@ -17697,7 +17706,7 @@ mod tests {
             &engineer,
             &None,
         );
-        client.take_health_snapshot(&asset_id);
+        client.take_health_snapshot(&asset_owner, &asset_id);
 
         let snapshots = client.get_health_snapshots(&asset_id);
         assert_eq!(snapshots.len(), 2, "should have one snapshot per take_health_snapshot call");
@@ -17719,7 +17728,7 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, _, admin) = setup(&env, 0);
-        let (asset_id, _) = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
 
         // Tighten the cap to 3 so the test doesn't need 500+ iterations.
         client.update_max_snapshots(&admin, &3);
@@ -17727,7 +17736,7 @@ mod tests {
         // Take 5 snapshots at distinct timestamps.
         let mut timestamps = Vec::new(&env);
         for _ in 0..5u32 {
-            let snap = client.take_health_snapshot(&asset_id);
+            let snap = client.take_health_snapshot(&asset_owner, &asset_id);
             timestamps.push_back(snap.snapshot_timestamp);
             env.ledger().with_mut(|li| li.timestamp += 10);
         }
@@ -17780,7 +17789,7 @@ mod tests {
         let engineer = register_engineer(&env, &engineer_registry_client);
         client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
-        client.take_health_snapshot(&asset_id);
+        client.take_health_snapshot(&asset_owner, &asset_id);
 
         env.ledger().with_mut(|li| li.timestamp += 1000);
         client.submit_maintenance(
@@ -17791,7 +17800,7 @@ mod tests {
             &engineer,
             &None,
         );
-        client.take_health_snapshot(&asset_id);
+        client.take_health_snapshot(&asset_owner, &asset_id);
 
         let snapshots = client.get_health_snapshots(&asset_id);
         assert!(snapshots.len() >= 1);
@@ -17924,7 +17933,7 @@ mod tests {
             &engineer,
             &None,
         );
-        client.take_health_snapshot(&asset_id);
+        client.take_health_snapshot(&asset_owner, &asset_id);
 
         env.ledger().with_mut(|li| li.timestamp += 1000);
 
@@ -17936,7 +17945,7 @@ mod tests {
             &engineer,
             &None,
         );
-        client.take_health_snapshot(&asset_id);
+        client.take_health_snapshot(&asset_owner, &asset_id);
 
         let snapshots = client.get_health_snapshots(&asset_id);
         assert!(snapshots.len() >= 2, "should accumulate snapshots");
@@ -17966,7 +17975,7 @@ mod tests {
 
         let (client, _, _, _) = setup(&env, 0);
 
-        let result = client.try_take_health_snapshot(&999u64);
+        let result = client.try_take_health_snapshot(&Address::generate(&env), &999u64);
         assert!(result.is_err(), "should error for unknown asset");
     }
 
@@ -19231,7 +19240,7 @@ mod tests {
         );
 
         // Take a health snapshot
-        let snapshot = lifecycle.take_health_snapshot(&asset_id);
+        let snapshot = lifecycle.take_health_snapshot(&owner, &asset_id);
         assert!(!snapshot.reconstructed);
 
         // Anchor the snapshot
@@ -19284,7 +19293,7 @@ mod tests {
             &engineer,
             &None,
         );
-        lifecycle.take_health_snapshot(&asset_id);
+        lifecycle.take_health_snapshot(&owner, &asset_id);
 
         // Index 1 doesn't exist (only index 0)
         lifecycle.anchor_history_to_snapshot(&admin, &asset_id, &1);
