@@ -1,8 +1,8 @@
 #![cfg(test)]
 
-use crate::{AssetNft, AssetNftClient, TradeKind};
+use crate::{AssetNft, AssetNftClient, Trade, TradeKind, MAX_HISTORY};
 use soroban_sdk::{
-    testutils::Address as _,
+    symbol_short, testutils::Address as _, testutils::Events, IntoVal, TryFromVal,
     token::{Client as TokenClient, StellarAssetClient},
     Address, Env, String,
 };
@@ -206,4 +206,51 @@ fn zero_price_listing_is_rejected() {
     let alice = Address::generate(&env);
     let token_id = ctx.client.mint(&ctx.admin, &7, &alice, &uri(&env));
     ctx.client.list_for_sale(&alice, &token_id, &0);
+}
+
+#[test]
+fn history_truncation_emits_dropped_trade() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let token_id = ctx.client.mint(&ctx.admin, &7, &alice, &uri(&env));
+
+    // The mint plus MAX_HISTORY transfers overflows the history by one entry.
+    let (mut from, mut to) = (alice.clone(), bob.clone());
+    for _ in 0..MAX_HISTORY {
+        ctx.client.transfer(&from, &to, &token_id);
+        core::mem::swap(&mut from, &mut to);
+    }
+
+    // Read events before any other contract call, which would replace the event list.
+    let trunc_topic = soroban_sdk::vec![&env, symbol_short!("nft_trunc").into_val(&env)];
+    let events = env.events().all();
+    let trunc = events
+        .iter()
+        .find(|e| e.1 == trunc_topic)
+        .expect("truncation event emitted");
+    assert_eq!(trunc.0, ctx.client.address);
+    let (dropped_id, dropped) = <(u64, Trade)>::try_from_val(&env, &trunc.2).unwrap();
+    assert_eq!(dropped_id, token_id);
+    assert_eq!(dropped.kind, TradeKind::Mint);
+    assert_eq!(dropped.to, alice);
+
+    let history = ctx.client.get_history(&token_id);
+    assert_eq!(history.len(), MAX_HISTORY);
+    assert_eq!(history.get(0).unwrap().kind, TradeKind::Transfer);
+}
+
+#[test]
+fn history_below_limit_emits_no_truncation_event() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let token_id = ctx.client.mint(&ctx.admin, &7, &alice, &uri(&env));
+    ctx.client.transfer(&alice, &bob, &token_id);
+
+    let trunc_topic = soroban_sdk::vec![&env, symbol_short!("nft_trunc").into_val(&env)];
+    let events = env.events().all();
+    assert!(!events.iter().any(|e| e.1 == trunc_topic));
 }

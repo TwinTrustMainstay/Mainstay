@@ -15,7 +15,9 @@ Tracking issue: #1736. Contract: `contracts/asset-nft`.
 - **Sales.** `buy` pays the seller and transfers the NFT in one call. Owners cannot buy their own
   listing.
 - **Trading history.** Mints, transfers and sales are recorded per NFT (`get_history`), capped at
-  100 entries with the oldest dropped first.
+  100 entries (`MAX_HISTORY`) with the oldest dropped first. Each dropped entry is announced with
+  an `nft_trunc` event carrying `(token_id, trade)`, so older provenance remains recoverable from
+  the event log (issue #1971).
 
 ## Operational notes
 

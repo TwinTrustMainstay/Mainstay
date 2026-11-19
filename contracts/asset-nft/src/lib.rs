@@ -17,6 +17,8 @@ use soroban_sdk::{
 };
 
 /// Maximum trading history entries kept per NFT. Oldest entries are dropped first.
+/// Each dropped entry is announced with an `nft_trunc` event carrying `(token_id, trade)`,
+/// so provenance beyond this limit is still recoverable from the event log (issue #1971).
 pub const MAX_HISTORY: u32 = 100;
 
 #[contracterror]
@@ -136,7 +138,11 @@ fn record_trade(env: &Env, token_id: u64, trade: Trade) {
         .get(&key)
         .unwrap_or_else(|| Vec::new(env));
     if history.len() >= MAX_HISTORY {
+        // Emit the dropped entry so off-chain indexers keep full provenance (issue #1971).
+        let dropped = history.get(0).unwrap();
         history.remove(0);
+        env.events()
+            .publish((symbol_short!("nft_trunc"),), (token_id, dropped));
     }
     history.push_back(trade);
     env.storage().persistent().set(&key, &history);
