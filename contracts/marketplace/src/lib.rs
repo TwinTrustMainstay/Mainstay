@@ -216,18 +216,23 @@ fn store_bids(env: &Env, auction_id: u64, bids: &Vec<Bid>) {
         .extend_ttl(&key, shared::TTL_THRESHOLD, shared::TTL_TARGET);
 }
 
-/// Panics unless `engineer` holds a valid or grace-period credential.
-fn ensure_credentialed(env: &Env, engineer: &Address) {
+/// Whether `engineer` currently holds a valid or grace-period credential.
+fn is_credentialed(env: &Env, engineer: &Address) -> bool {
     let registry: Address = env
         .storage()
         .instance()
         .get(&DataKey::Registry)
         .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized));
     let status = EngineerRegistryClient::new(env, &registry).verify_engineer(engineer, &None);
-    if !matches!(
+    matches!(
         status,
         CredentialStatus::Valid | CredentialStatus::GracePeriod
-    ) {
+    )
+}
+
+/// Panics unless `engineer` holds a valid or grace-period credential.
+fn ensure_credentialed(env: &Env, engineer: &Address) {
+    if !is_credentialed(env, engineer) {
         panic_with_error!(env, ContractError::NotCredentialed);
     }
 }
@@ -607,11 +612,19 @@ impl Marketplace {
             panic_with_error!(&env, ContractError::AuctionStillOpen);
         }
 
+        // Only bids whose engineer still holds a valid credential at finalization
+        // are eligible. A lapsed winner falls through to the next valid bidder.
         let bids = load_bids(&env, auction_id);
+        let mut eligible: Vec<Bid> = Vec::new(&env);
+        for bid in bids.iter() {
+            if is_credentialed(&env, &bid.engineer) {
+                eligible.push_back(bid);
+            }
+        }
         auction.finalized_at = now;
-        match select_winner(&bids, auction.criterion) {
+        match select_winner(&eligible, auction.criterion) {
             Some(idx) => {
-                let bid = bids.get(idx).unwrap();
+                let bid = eligible.get(idx).unwrap();
                 auction.status = AuctionStatus::Awarded;
                 auction.winner = Some(bid.engineer.clone());
                 auction.winning_price = bid.price;

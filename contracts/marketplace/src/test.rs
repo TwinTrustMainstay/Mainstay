@@ -563,3 +563,50 @@ fn only_admin_can_create_auctions() {
         Err(Ok(contract_err(ContractError::UnauthorizedAdmin)))
     );
 }
+
+// ---------- Credential recheck at finalization (#1938) ----------
+
+#[test]
+fn lapsed_winner_falls_back_to_next_valid_bidder() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &open_params(&ctx, WinnerCriterion::LowestPrice));
+    let lapsed = engineer(&ctx, CredentialStatus::Valid, 0);
+    let backup = engineer(&ctx, CredentialStatus::Valid, 0);
+    ctx.client.place_bid(&lapsed, &id, &1_000);
+    ctx.client.place_bid(&backup, &id, &2_000);
+
+    // The lowest bidder's credential lapses between bidding and finalization.
+    ctx.registry
+        .set_engineer(&lapsed, &CredentialStatus::Expired, &0);
+
+    at(&env, BID_END + 1);
+    ctx.client.finalize_auction(&id);
+
+    let auction = ctx.client.get_auction(&id);
+    assert_eq!(auction.status, AuctionStatus::Awarded);
+    assert_eq!(auction.winner, Some(backup));
+    assert_eq!(auction.winning_price, 2_000);
+}
+
+#[test]
+fn auction_is_unawarded_when_every_bidder_has_lapsed() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &open_params(&ctx, WinnerCriterion::LowestPrice));
+    let a = engineer(&ctx, CredentialStatus::Valid, 0);
+    ctx.client.place_bid(&a, &id, &1_000);
+    ctx.registry
+        .set_engineer(&a, &CredentialStatus::Revoked, &0);
+
+    at(&env, BID_END + 1);
+    ctx.client.finalize_auction(&id);
+
+    let auction = ctx.client.get_auction(&id);
+    assert_eq!(auction.status, AuctionStatus::Unawarded);
+    assert_eq!(auction.winner, None);
+}
