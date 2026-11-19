@@ -344,12 +344,17 @@ impl MobileApi {
         let negotiated = api_version.min(CURRENT_API_VERSION);
         let key = DataKey::Client(client.clone());
         let info = ClientInfo {
-            address: client,
+            address: client.clone(),
             api_version: negotiated,
             registered_at: env.ledger().timestamp(),
         };
         env.storage().persistent().set(&key, &info);
         extend_persistent_ttl(&env, key);
+        // Audit trail: lets operators see when each client was onboarded.
+        env.events().publish(
+            (soroban_sdk::symbol_short!("CLI_REG"), client),
+            negotiated,
+        );
         Ok(negotiated)
     }
 

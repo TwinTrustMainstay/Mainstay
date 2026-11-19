@@ -238,3 +238,31 @@ fn subscription_rejects_empty_and_oversized_topic_lists() {
         Err(Ok(ContractError::InvalidTopics))
     );
 }
+
+#[test]
+fn register_client_emits_registration_event() {
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::TryFromVal;
+
+    let (env, id, _admin) = setup();
+    let client = MobileApiClient::new(&env, &id);
+    let app = Address::generate(&env);
+
+    let negotiated = client.register_client(&app, &CURRENT_API_VERSION);
+
+    let target = Symbol::new(&env, "CLI_REG");
+    let found = env.events().all().iter().find(|(addr, topics, _)| {
+        *addr == id
+            && topics
+                .get(0)
+                .and_then(|v| Symbol::try_from_val(&env, &v).ok())
+                .map(|s| s == target)
+                .unwrap_or(false)
+    });
+    let (_, topics, data) = found.expect("register_client must emit a CLI_REG event");
+    assert_eq!(topics.len(), 2);
+    let emitted_client = Address::try_from_val(&env, &topics.get(1).unwrap()).unwrap();
+    assert_eq!(emitted_client, app);
+    let emitted_version: u32 = u32::try_from_val(&env, &data).unwrap();
+    assert_eq!(emitted_version, negotiated);
+}
