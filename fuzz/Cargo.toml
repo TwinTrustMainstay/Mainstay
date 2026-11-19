@@ -23,6 +23,12 @@ path = "../contracts/engineer-registry"
 [dependencies.zk-privacy]
 path = "../contracts/zk-privacy"
 
+[dependencies.timestamping]
+path = "../contracts/timestamping"
+
+[dependencies.ed25519-dalek]
+version = "2.2.0"
+
 [dependencies.soroban-sdk]
 version = "22.0.0"
 features = ["testutils"]
@@ -30,6 +36,13 @@ features = ["testutils"]
 [[bin]]
 name = "zk_verifier_fuzz"
 path = "fuzz_targets/zk_verifier_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "attestation_message_fuzz"
+path = "fuzz_targets/attestation_message_fuzz.rs"
 test = false
 doc = false
 bench = false
