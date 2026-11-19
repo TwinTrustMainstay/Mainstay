@@ -15,7 +15,7 @@ here. It needs its own toolchain and audit, so it should be a separate change.
 |---|---|---|
 | Chain registry and constraints | `add_chain`, `update_chain`, `set_chain_enabled`, `get_chain` | Per-chain enablement, min/max amount, required confirmations, rolling outflow window, window cap, alert threshold |
 | Outbound transfers | `bridge_out` | Locks tokens and emits `BR_OUT` with a per-destination nonce for relayers |
-| Inbound releases | `set_relayers`, `attest_release`, `get_release` | M-of-N relayer attestations. Each `(source_chain, nonce)` executes once. Mismatched parameters are rejected |
+| Inbound releases | `set_relayers`, `attest_release`, `get_release` | M-of-N relayer attestations. Each `(source_chain, nonce)` executes once. Mismatched parameters are rejected. Each relayer's observed confirmations are stored with its approval, and release requires the lowest stored value to meet `required_confirmations` |
 | Monitoring | `get_window`, `BR_ALERT` event | Emits an alert when outflow crosses `alert_threshold`. Rejects releases that would exceed `window_cap` |
 | Atomic swaps (HTLC) | `create_swap`, `claim_swap`, `refund_swap`, `get_swap` | Claim needs the SHA-256 preimage before expiry. Refund is possible after expiry |
 | Emergency control | `pause`, `unpause` | Blocks new transfers. Claims and refunds stay available so users can reclaim funds |
