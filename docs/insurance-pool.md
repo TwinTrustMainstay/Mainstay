@@ -29,6 +29,10 @@ asset, pays a premium into the pool, and can claim against the policy if the col
 - **Claims** can't exceed a policy's remaining coverage. Approved payouts are capped at pool
   assets, so a claim can't push the pool negative. Each payout reduces the policy's remaining
   coverage.
+- **Filing** a claim also requires the amount to fit in free capital (`total_assets - reserved`).
+  Otherwise the claim fails with `InsufficientFreeFunds`. Because every reservation is backed by
+  assets, an approved claim is normally paid in full. The partial-payout path described below is
+  a defensive guard.
 - **Partial payouts** are reported as `PartiallyPaid`, not `Paid`. The unpaid remainder is
   stored in the claim's `shortfall` field, and an `ins_shrt` event is emitted with the claim id
   and shortfall. Full payouts record a shortfall of `0`.

@@ -338,6 +338,8 @@ impl InsurancePool {
     }
 
     /// Files a claim against a policy. Only the policy holder can file, and only before expiry.
+    /// The claim amount must fit within the pool's free capital (`total_assets - reserved`),
+    /// so reservations never exceed the assets that back them.
     pub fn file_claim(env: Env, lender: Address, policy_id: u64, amount: i128) -> u64 {
         lender.require_auth();
         if amount <= 0 {
@@ -352,6 +354,10 @@ impl InsurancePool {
         }
         if amount > policy.remaining_coverage {
             panic_with_error!(&env, ContractError::ExceedsCoverage);
+        }
+        let mut stats = load_stats(&env);
+        if amount > stats.total_assets - stats.reserved {
+            panic_with_error!(&env, ContractError::InsufficientFreeFunds);
         }
 
         let id = next_id(&env, DataKey::NextClaimId);
@@ -369,7 +375,6 @@ impl InsurancePool {
             },
         );
 
-        let mut stats = load_stats(&env);
         stats.reserved += amount;
         stats.claims_filed += 1;
         save_stats(&env, &stats);

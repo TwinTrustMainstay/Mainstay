@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use crate::{ClaimStatus, InsurancePool, InsurancePoolClient};
+use crate::{ClaimStatus, DataKey, InsurancePool, InsurancePoolClient, PoolStats};
 use soroban_sdk::{
     symbol_short,
     testutils::{Address as _, Events, Ledger},
@@ -40,6 +40,16 @@ fn setup<'a>(env: &'a Env) -> Ctx<'a> {
         admin,
         contract_id,
     }
+}
+
+/// Overwrites the pool's `total_assets` in contract storage. Test-only: simulates an
+/// insufficient-asset state that the public API cannot reach.
+fn force_total_assets(env: &Env, ctx: &Ctx, total_assets: i128) {
+    env.as_contract(&ctx.contract_id, || {
+        let mut stats: PoolStats = env.storage().instance().get(&DataKey::Stats).unwrap();
+        stats.total_assets = total_assets;
+        env.storage().instance().set(&DataKey::Stats, &stats);
+    });
 }
 
 fn funded(env: &Env, ctx: &Ctx, amount: i128) -> Address {
@@ -131,12 +141,16 @@ fn payout_is_capped_by_pool_assets() {
     let env = Env::default();
     let ctx = setup(&env);
     let provider = funded(&env, &ctx, 10_000);
-    ctx.client.provide_capital(&provider, &100);
+    ctx.client.provide_capital(&provider, &1_000);
     let lender = funded(&env, &ctx, 10_000);
-    // Coverage 1_000 at 5% premium = 50 added to pool, so 150 total.
+    // Coverage 1_000 at 5% premium = 50 added to pool, so 1_050 total, all of it free.
     let policy_id = ctx.client.buy_policy(&lender, &7, &1_000);
-
     let claim_id = ctx.client.file_claim(&lender, &policy_id, &1_000);
+
+    // Reservations are always backed by assets, so the pool cannot fall below a pending
+    // claim through the public API. Force the assets down to exercise the defensive cap.
+    force_total_assets(&env, &ctx, 150);
+
     let paid = ctx.client.settle_claim(&ctx.admin, &claim_id, &true);
     assert_eq!(paid, 150);
     assert_eq!(ctx.client.get_stats().total_assets, 0);
@@ -169,10 +183,11 @@ fn partial_payout_emits_shortfall_event() {
     let env = Env::default();
     let ctx = setup(&env);
     let provider = funded(&env, &ctx, 10_000);
-    ctx.client.provide_capital(&provider, &100);
+    ctx.client.provide_capital(&provider, &1_000);
     let lender = funded(&env, &ctx, 10_000);
     let policy_id = ctx.client.buy_policy(&lender, &7, &1_000);
     let claim_id = ctx.client.file_claim(&lender, &policy_id, &1_000);
+    force_total_assets(&env, &ctx, 150); // defensive path, see payout_is_capped_by_pool_assets
     ctx.client.settle_claim(&ctx.admin, &claim_id, &true);
 
     let shortfall_topic: Val = symbol_short!("ins_shrt").into_val(&env);
@@ -230,6 +245,41 @@ fn withdrawal_of_free_funds_returns_pro_rata_value() {
     assert_eq!(paid, 1_050);
     assert_eq!(ctx.client.get_shares(&provider), 0);
     assert_eq!(ctx.client.get_stats().total_shares, 0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn claim_beyond_free_capital_is_rejected() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let provider = funded(&env, &ctx, 10_000);
+    ctx.client.provide_capital(&provider, &1_000);
+    let lender = funded(&env, &ctx, 10_000);
+    // Pool holds 1_050. The first claim reserves 1_000, leaving 50 free.
+    let first = ctx.client.buy_policy(&lender, &7, &1_000);
+    ctx.client.file_claim(&lender, &first, &1_000);
+    // The second premium brings the pool to 1_100. Only 100 is unreserved, so 101 is rejected.
+    let second = ctx.client.buy_policy(&lender, &8, &1_000);
+    ctx.client.file_claim(&lender, &second, &101);
+}
+
+#[test]
+fn claim_within_free_capital_reserves_funds() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let provider = funded(&env, &ctx, 10_000);
+    ctx.client.provide_capital(&provider, &1_000);
+    let lender = funded(&env, &ctx, 10_000);
+    let first = ctx.client.buy_policy(&lender, &7, &1_000);
+    ctx.client.file_claim(&lender, &first, &1_000);
+    let second = ctx.client.buy_policy(&lender, &8, &1_000);
+    // 100 is unreserved after the second premium, so exactly 100 fits.
+    ctx.client.file_claim(&lender, &second, &100);
+
+    // Reservations may use every free token, so reserved can equal total assets exactly.
+    let stats = ctx.client.get_stats();
+    assert_eq!(stats.reserved, 1_100);
+    assert_eq!(stats.total_assets, 1_100);
 }
 
 #[test]
@@ -294,6 +344,8 @@ fn claim_cannot_be_settled_twice() {
 fn non_admin_cannot_settle_claim() {
     let env = Env::default();
     let ctx = setup(&env);
+    let provider = funded(&env, &ctx, 10_000);
+    ctx.client.provide_capital(&provider, &1_000);
     let lender = funded(&env, &ctx, 10_000);
     let policy_id = ctx.client.buy_policy(&lender, &7, &1_000);
     let claim_id = ctx.client.file_claim(&lender, &policy_id, &100);
