@@ -347,7 +347,9 @@ fn voucher_history_key(voucher: &Address) -> (soroban_sdk::Symbol, Address) {
 }
 
 /// Storage keys for new features
-const MARKET_ORACLE_KEY: soroban_sdk::Symbol = symbol_short!("ORACLE");
+const MARKET_ORACLE_KEY: soroban_sdk::Symbol = symbol_short!("ORA_ADDR");
+/// Latest `MarketCondition` snapshot. Kept separate from the oracle address (#1866).
+const MARKET_CONDITION_KEY: soroban_sdk::Symbol = symbol_short!("MKT_COND");
 const LTV_HISTORY_KEY: soroban_sdk::Symbol = symbol_short!("LTV_HST");
 const RESTRUCTURE_KEY: soroban_sdk::Symbol = symbol_short!("REST");
 const SYNDICATE_KEY: soroban_sdk::Symbol = symbol_short!("SYND");
@@ -357,7 +359,7 @@ const INSURANCE_PAYOUT_KEY: soroban_sdk::Symbol = symbol_short!("INS_PAY");
 const RESTRUCTURE_COUNT_KEY: soroban_sdk::Symbol = symbol_short!("REST_CNT");
 
 fn market_condition_key() -> soroban_sdk::Symbol {
-    MARKET_ORACLE_KEY
+    MARKET_CONDITION_KEY
 }
 
 fn ltv_history_key(loan_id: u64) -> (soroban_sdk::Symbol, u64) {
@@ -1375,7 +1377,7 @@ impl LendingContract {
     /// Reduces LTV when volatility is elevated to manage risk.
     pub fn adjust_ltv_for_conditions(env: Env, admin: Address) -> u32 {
         require_admin(&env, &admin);
-        let market: Option<MarketCondition> = env.storage().persistent().get(&MARKET_ORACLE_KEY);
+        let market: Option<MarketCondition> = env.storage().persistent().get(&MARKET_CONDITION_KEY);
 
         let volatility = if let Some(m) = market {
             m.volatility
@@ -1449,8 +1451,8 @@ impl LendingContract {
             price_change_bps,
         };
 
-        env.storage().persistent().set(&MARKET_ORACLE_KEY, &market);
-        extend_persistent_ttl(&env, &MARKET_ORACLE_KEY);
+        env.storage().persistent().set(&MARKET_CONDITION_KEY, &market);
+        extend_persistent_ttl(&env, &MARKET_CONDITION_KEY);
     }
 
     // ── Issue #1646: Loan Syndication Support ──
