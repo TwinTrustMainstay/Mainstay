@@ -564,3 +564,38 @@ fn test_set_relayers_validates_threshold_and_duplicates() {
         .try_set_relayers(&ctx.admin, &vec![&ctx.env, a.clone(), a.clone()], &1)
         .is_err());
 }
+
+// ── Issue #1920: approvals from removed relayers must not count ──
+
+#[test]
+fn test_removed_relayer_approval_does_not_count_toward_release() {
+    let ctx = setup();
+    let recipient = Address::generate(&ctx.env);
+    mint(&ctx, &ctx.client.address, 1_000);
+
+    // relayers[0] attests, then is removed from the set mid-release.
+    attest(&ctx, &ctx.relayers[0], 5, &recipient, 300);
+    let new_relayer = Address::generate(&ctx.env);
+    ctx.client.set_relayers(
+        &ctx.admin,
+        &vec![
+            &ctx.env,
+            ctx.relayers[1].clone(),
+            ctx.relayers[2].clone(),
+            new_relayer.clone(),
+        ],
+        &2,
+    );
+
+    // Only relayers[2] counts now: 1 approval, below threshold 2.
+    attest(&ctx, &ctx.relayers[2], 5, &recipient, 300);
+    let pending = ctx.client.get_release(&ETH, &5).unwrap();
+    assert!(!pending.executed);
+    assert_eq!(pending.approvals.len(), 1);
+    assert_eq!(balance(&ctx, &recipient), 0);
+
+    // A second current relayer reaches the threshold and the release executes.
+    attest(&ctx, &new_relayer, 5, &recipient, 300);
+    assert!(ctx.client.get_release(&ETH, &5).unwrap().executed);
+    assert_eq!(balance(&ctx, &recipient), 300);
+}

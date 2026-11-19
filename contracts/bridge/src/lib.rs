@@ -496,6 +496,16 @@ impl Bridge {
                 },
             };
 
+        // #1920: approvals from relayers removed by `set_relayers` no longer count.
+        // Recount against the current relayer set before checking the threshold.
+        let mut current_approvals: Vec<Address> = Vec::new(&env);
+        for approver in pending.approvals.iter() {
+            if relayers.contains(&approver) {
+                current_approvals.push_back(approver);
+            }
+        }
+        pending.approvals = current_approvals;
+
         if pending.approvals.contains(&relayer) {
             panic_with_error!(&env, ContractError::AlreadyAttested);
         }
