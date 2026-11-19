@@ -124,6 +124,41 @@ fn fund_treasury_emits_funder_and_amount_event() {
 }
 
 #[test]
+fn active_proposals_per_address_are_capped() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let proposer = holder(&ctx, 50);
+    let other = holder(&ctx, 50);
+
+    let mut ids = Vec::new(&env);
+    for _ in 0..MAX_ACTIVE_PROPOSALS_PER_ADDRESS {
+        ids.push_back(
+            ctx.client
+                .create_proposal(&proposer, &title(&env), &param_kind(1)),
+        );
+    }
+    assert_eq!(
+        ctx.client
+            .try_create_proposal(&proposer, &title(&env), &param_kind(1)),
+        Err(Ok(contract_err(ContractError::ProposalLimitReached)))
+    );
+    // The cap is per address: another holder is unaffected.
+    ctx.client
+        .create_proposal(&other, &title(&env), &param_kind(1));
+
+    // Finalizing one of the proposer's proposals frees a slot.
+    at(&env, T0 + PERIOD);
+    ctx.client.finalize_proposal(&ids.get(0).unwrap());
+    ctx.client
+        .create_proposal(&proposer, &title(&env), &param_kind(1));
+    assert_eq!(
+        ctx.client
+            .try_create_proposal(&proposer, &title(&env), &param_kind(1)),
+        Err(Ok(contract_err(ContractError::ProposalLimitReached)))
+    );
+}
+
+#[test]
 fn invalid_config_is_rejected() {
     let env = Env::default();
     env.mock_all_auths();

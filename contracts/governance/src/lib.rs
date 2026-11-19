@@ -27,6 +27,9 @@ use soroban_sdk::{
 pub const MAX_VOTES_PER_PROPOSAL: u32 = 500;
 /// Maximum proposal title length in bytes.
 pub const MAX_TITLE_LEN: u32 = 128;
+/// Maximum proposals an address may have open for voting at once. A slot frees
+/// when the proposal is finalized. Bounds spam in persistent storage (issue #1952).
+pub const MAX_ACTIVE_PROPOSALS_PER_ADDRESS: u32 = 5;
 const BPS: u64 = 10_000;
 
 #[contracterror]
@@ -63,6 +66,8 @@ pub enum ContractError {
     InsufficientBudget = 16,
     /// Proposal has reached `MAX_VOTES_PER_PROPOSAL`.
     TooManyVotes = 17,
+    /// Proposer already has `MAX_ACTIVE_PROPOSALS_PER_ADDRESS` open proposals.
+    ProposalLimitReached = 18,
 }
 
 #[contracttype]
@@ -138,6 +143,8 @@ enum DataKey {
     Treasury,
     NextProposalId,
     Proposal(u64),
+    /// Number of the holder's proposals that have not yet been finalized.
+    ActiveProposals(Address),
     Votes(u64),
     Voted(u64, Address),
     Param(Symbol),
@@ -326,6 +333,8 @@ impl Governance {
     /// - [`ContractError::InsufficientShares`] if the proposer is below the minimum (or holds none)
     /// - [`ContractError::InvalidProposal`] if the title is empty or longer than [`MAX_TITLE_LEN`],
     ///   or a funding amount is zero
+    /// - [`ContractError::ProposalLimitReached`] if the proposer already has
+    ///   [`MAX_ACTIVE_PROPOSALS_PER_ADDRESS`] unfinalized proposals
     pub fn create_proposal(env: Env, proposer: Address, title: String, kind: ProposalKind) -> u64 {
         proposer.require_auth();
         let config = load_config(&env);
@@ -339,6 +348,17 @@ impl Governance {
         if let ProposalKind::Funding(_, 0) = kind {
             panic_with_error!(&env, ContractError::InvalidProposal);
         }
+        let active_key = DataKey::ActiveProposals(proposer.clone());
+        let active: u32 = env.storage().persistent().get(&active_key).unwrap_or(0);
+        if active >= MAX_ACTIVE_PROPOSALS_PER_ADDRESS {
+            panic_with_error!(&env, ContractError::ProposalLimitReached);
+        }
+        env.storage().persistent().set(&active_key, &(active + 1));
+        env.storage().persistent().extend_ttl(
+            &active_key,
+            shared::TTL_THRESHOLD,
+            shared::TTL_TARGET,
+        );
 
         let id: u64 = env
             .storage()
@@ -465,6 +485,11 @@ impl Governance {
             config.approval_threshold_bps,
         );
         store_proposal(&env, &proposal);
+        let active_key = DataKey::ActiveProposals(proposal.proposer.clone());
+        let active: u32 = env.storage().persistent().get(&active_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&active_key, &active.saturating_sub(1));
         env.events()
             .publish((FINALIZE_TOPIC, proposal_id), (proposal.status,));
         proposal.status
