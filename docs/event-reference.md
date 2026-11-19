@@ -291,6 +291,10 @@ The bridge contract (`contracts/bridge`) publishes its full event set in
 | Topic | Payload | Description |
 |---|---|---|
 | `BR_SWP_R` | `(swap_id, sender, token, amount)` | An expired, unclaimed swap was refunded to `sender` |
+| `BR_PAUSE` / `BR_RESUME` | `(admin)` | Bridge paused or resumed by `admin` |
+| `BR_RELAYS` | `(admin, threshold, relayers)` | Relayer set and threshold replaced |
+| `BR_CH_ADD` / `BR_CH_UPD` | `(admin, chain_id, config)` | Chain registered or its constraints replaced |
+| `BR_CH_ENB` | `(admin, chain_id, enabled)` | Chain enabled or disabled |
 
 ---
 

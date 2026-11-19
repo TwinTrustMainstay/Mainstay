@@ -293,15 +293,19 @@ impl Bridge {
 
     /// Pause new transfers (`bridge_out`, `attest_release`, `create_swap`).
     /// Claims and refunds stay available so users can always reclaim funds.
+    /// Emits `BR_PAUSE` with `(admin)`.
     pub fn pause(env: Env, admin: Address) {
         require_admin(&env, &admin);
         env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish((symbol_short!("BR_PAUSE"),), (admin,));
     }
 
     /// Resume transfers after a pause.
+    /// Emits `BR_RESUME` with `(admin)`.
     pub fn unpause(env: Env, admin: Address) {
         require_admin(&env, &admin);
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish((symbol_short!("BR_RESUME"),), (admin,));
     }
 
     /// Replace the relayer set and the number of attestations required per release.
@@ -309,6 +313,8 @@ impl Bridge {
     /// # Panics
     /// - [`ContractError::InvalidRelayerSet`] if the list is empty, too large, or has duplicates
     /// - [`ContractError::InvalidThreshold`] if `threshold` is 0 or exceeds the relayer count
+    ///
+    /// Emits `BR_RELAYS` with `(admin, threshold, relayers)`.
     pub fn set_relayers(env: Env, admin: Address, relayers: Vec<Address>, threshold: u32) {
         require_admin(&env, &admin);
         let count = relayers.len();
@@ -329,6 +335,10 @@ impl Bridge {
         env.storage()
             .instance()
             .set(&DataKey::Threshold, &threshold);
+        env.events().publish(
+            (symbol_short!("BR_RELAYS"),),
+            (admin, threshold, relayers),
+        );
     }
 
     /// Register a supported chain.
@@ -345,6 +355,8 @@ impl Bridge {
         }
         env.storage().persistent().set(&key, &config);
         bump(&env, &key);
+        env.events()
+            .publish((symbol_short!("BR_CH_ADD"),), (admin, chain_id, config));
     }
 
     /// Replace the constraints of a registered chain.
@@ -359,6 +371,8 @@ impl Bridge {
         let key = DataKey::Chain(chain_id);
         env.storage().persistent().set(&key, &config);
         bump(&env, &key);
+        env.events()
+            .publish((symbol_short!("BR_CH_UPD"),), (admin, chain_id, config));
     }
 
     /// Enable or disable a chain without changing its other constraints.
@@ -369,6 +383,10 @@ impl Bridge {
         let key = DataKey::Chain(chain_id);
         env.storage().persistent().set(&key, &cfg);
         bump(&env, &key);
+        env.events().publish(
+            (symbol_short!("BR_CH_ENB"),),
+            (admin, chain_id, enabled),
+        );
     }
 
     /// Get a chain's current configuration.

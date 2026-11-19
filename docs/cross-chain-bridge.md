@@ -30,6 +30,12 @@ here. It needs its own toolchain and audit, so it should be a separate change.
 | `BR_SWP_N` | `(swap_id, sender, hashlock, expiry, amount)` |
 | `BR_SWP_C` | `(swap_id, preimage)` |
 | `BR_SWP_R` | `(swap_id, sender, token, amount)` |
+| `BR_PAUSE` | `(admin)` |
+| `BR_RESUME` | `(admin)` |
+| `BR_RELAYS` | `(admin, threshold, relayers)` |
+| `BR_CH_ADD` | `(admin, chain_id, config)` |
+| `BR_CH_UPD` | `(admin, chain_id, config)` |
+| `BR_CH_ENB` | `(admin, chain_id, enabled)` |
 
 ## Errors
 

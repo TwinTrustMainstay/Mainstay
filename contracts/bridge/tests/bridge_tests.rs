@@ -4,7 +4,7 @@ use bridge::{Bridge, BridgeClient, ChainConfig, ReleaseParams, SwapStatus};
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    symbol_short, vec, Address, Bytes, BytesN, Env, IntoVal, Symbol,
+    symbol_short, vec, Address, Bytes, BytesN, Env, IntoVal, Symbol, Val, Vec,
 };
 
 const ETH: u32 = 1;
@@ -594,4 +594,71 @@ fn test_initialize_requires_admin_authorization() {
     // No auth is mocked, so the admin never signed the initialize call.
     let admin = Address::generate(&env);
     assert!(client.try_initialize(&admin).is_err());
+}
+
+// ── Admin and configuration events ───────────────────────────
+
+/// Topic and payload of the most recent event emitted by the bridge.
+fn last_event(ctx: &Ctx) -> (Vec<Val>, Val) {
+    let (_, topics, data) = ctx.env.events().all().last().unwrap();
+    (topics, data)
+}
+
+#[test]
+fn test_pause_and_unpause_emit_admin_events() {
+    let ctx = setup();
+
+    ctx.client.pause(&ctx.admin);
+    let (topics, data) = last_event(&ctx);
+    assert_eq!(topics, vec![&ctx.env, symbol_short!("BR_PAUSE").into_val(&ctx.env)]);
+    let (who,): (Address,) = data.into_val(&ctx.env);
+    assert_eq!(who, ctx.admin);
+
+    ctx.client.unpause(&ctx.admin);
+    let (topics, data) = last_event(&ctx);
+    assert_eq!(topics, vec![&ctx.env, symbol_short!("BR_RESUME").into_val(&ctx.env)]);
+    let (who,): (Address,) = data.into_val(&ctx.env);
+    assert_eq!(who, ctx.admin);
+}
+
+#[test]
+fn test_set_relayers_emits_threshold_and_relayer_set() {
+    let ctx = setup();
+    let fresh = [Address::generate(&ctx.env), Address::generate(&ctx.env)];
+    let new_set = vec![&ctx.env, fresh[0].clone(), fresh[1].clone()];
+
+    ctx.client.set_relayers(&ctx.admin, &new_set, &1);
+
+    let (topics, data) = last_event(&ctx);
+    assert_eq!(topics, vec![&ctx.env, symbol_short!("BR_RELAYS").into_val(&ctx.env)]);
+    let emitted: (Address, u32, Vec<Address>) = data.into_val(&ctx.env);
+    assert_eq!(emitted, (ctx.admin.clone(), 1, new_set));
+}
+
+#[test]
+fn test_add_update_and_enable_chain_emit_events() {
+    let ctx = setup();
+    let base_cfg = eth_config(&ctx.env);
+
+    let mut new_cfg = eth_config(&ctx.env);
+    new_cfg.name = Symbol::new(&ctx.env, "POLY");
+    ctx.client.add_chain(&ctx.admin, &2, &new_cfg);
+    let (topics, data) = last_event(&ctx);
+    assert_eq!(topics, vec![&ctx.env, symbol_short!("BR_CH_ADD").into_val(&ctx.env)]);
+    let emitted: (Address, u32, ChainConfig) = data.into_val(&ctx.env);
+    assert_eq!(emitted, (ctx.admin.clone(), 2, new_cfg.clone()));
+
+    let mut updated = base_cfg.clone();
+    updated.max_amount = 2_000;
+    ctx.client.update_chain(&ctx.admin, &ETH, &updated);
+    let (topics, data) = last_event(&ctx);
+    assert_eq!(topics, vec![&ctx.env, symbol_short!("BR_CH_UPD").into_val(&ctx.env)]);
+    let emitted: (Address, u32, ChainConfig) = data.into_val(&ctx.env);
+    assert_eq!(emitted, (ctx.admin.clone(), ETH, updated));
+
+    ctx.client.set_chain_enabled(&ctx.admin, &ETH, &false);
+    let (topics, data) = last_event(&ctx);
+    assert_eq!(topics, vec![&ctx.env, symbol_short!("BR_CH_ENB").into_val(&ctx.env)]);
+    let emitted: (Address, u32, bool) = data.into_val(&ctx.env);
+    assert_eq!(emitted, (ctx.admin.clone(), ETH, false));
 }
