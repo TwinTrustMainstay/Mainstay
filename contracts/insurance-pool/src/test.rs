@@ -2,9 +2,10 @@
 
 use crate::{ClaimStatus, InsurancePool, InsurancePoolClient};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    symbol_short,
+    testutils::{Address as _, Events, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env,
+    Address, Env, IntoVal, Val,
 };
 
 const PREMIUM_BPS: u32 = 500; // 5%
@@ -139,6 +140,46 @@ fn payout_is_capped_by_pool_assets() {
     let paid = ctx.client.settle_claim(&ctx.admin, &claim_id, &true);
     assert_eq!(paid, 150);
     assert_eq!(ctx.client.get_stats().total_assets, 0);
+
+    let claim = ctx.client.get_claim(&claim_id);
+    assert_eq!(claim.status, ClaimStatus::PartiallyPaid);
+    assert_eq!(claim.paid, 150);
+    assert_eq!(claim.shortfall, 850);
+    assert_eq!(ctx.client.get_stats().claims_paid, 1);
+}
+
+#[test]
+fn full_payout_records_no_shortfall() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let provider = funded(&env, &ctx, 10_000);
+    ctx.client.provide_capital(&provider, &5_000);
+    let lender = funded(&env, &ctx, 10_000);
+    let policy_id = ctx.client.buy_policy(&lender, &7, &1_000);
+    let claim_id = ctx.client.file_claim(&lender, &policy_id, &400);
+    ctx.client.settle_claim(&ctx.admin, &claim_id, &true);
+
+    let claim = ctx.client.get_claim(&claim_id);
+    assert_eq!(claim.status, ClaimStatus::Paid);
+    assert_eq!(claim.shortfall, 0);
+}
+
+#[test]
+fn partial_payout_emits_shortfall_event() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let provider = funded(&env, &ctx, 10_000);
+    ctx.client.provide_capital(&provider, &100);
+    let lender = funded(&env, &ctx, 10_000);
+    let policy_id = ctx.client.buy_policy(&lender, &7, &1_000);
+    let claim_id = ctx.client.file_claim(&lender, &policy_id, &1_000);
+    ctx.client.settle_claim(&ctx.admin, &claim_id, &true);
+
+    let shortfall_topic: Val = symbol_short!("ins_shrt").into_val(&env);
+    let emitted = env.events().all().iter().any(|(_, topics, _)| {
+        topics.len() == 1 && topics.get(0).unwrap().shallow_eq(&shortfall_topic)
+    });
+    assert!(emitted, "expected an ins_shrt event for the unpaid remainder");
 }
 
 #[test]

@@ -62,8 +62,12 @@ pub enum ContractError {
 #[repr(u32)]
 pub enum ClaimStatus {
     Pending = 0,
+    /// Approved and paid in full.
     Paid = 1,
     Rejected = 2,
+    /// Approved, but the pool had too few assets to pay the full amount. The unpaid
+    /// remainder is recorded in `Claim::shortfall`.
+    PartiallyPaid = 3,
 }
 
 #[contracttype]
@@ -87,6 +91,8 @@ pub struct Claim {
     pub amount: i128,
     /// Amount actually paid. `0` until paid.
     pub paid: i128,
+    /// Approved amount that the pool could not pay: `amount - paid` once settled, `0` otherwise.
+    pub shortfall: i128,
     pub status: ClaimStatus,
     pub filed_at: u64,
 }
@@ -357,6 +363,7 @@ impl InsurancePool {
                 claimant: lender.clone(),
                 amount,
                 paid: 0,
+                shortfall: 0,
                 status: ClaimStatus::Pending,
                 filed_at: env.ledger().timestamp(),
             },
@@ -376,6 +383,10 @@ impl InsurancePool {
     ///
     /// Approval pays `min(claim amount, pool assets)`. The payout comes off the policy's
     /// remaining coverage, and the claim's reservation is released.
+    ///
+    /// If the payout is less than the claim amount, the claim is marked `PartiallyPaid`, the
+    /// unpaid remainder is stored in `Claim::shortfall`, and a shortfall event is emitted.
+    /// Approved claims, full or partial, count toward `PoolStats::claims_paid`.
     pub fn settle_claim(env: Env, admin: Address, claim_id: u64, approve: bool) -> i128 {
         require_stored_admin(&env, &admin);
         let mut claim = load_claim(&env, claim_id);
@@ -396,6 +407,7 @@ impl InsurancePool {
         }
 
         let payout = claim.amount.min(stats.total_assets);
+        let shortfall = claim.amount - payout;
         stats.total_assets -= payout;
         stats.total_payouts += payout;
         stats.claims_paid += 1;
@@ -405,8 +417,13 @@ impl InsurancePool {
         policy.remaining_coverage -= payout;
         save_policy(&env, &policy);
 
-        claim.status = ClaimStatus::Paid;
+        claim.status = if shortfall > 0 {
+            ClaimStatus::PartiallyPaid
+        } else {
+            ClaimStatus::Paid
+        };
         claim.paid = payout;
+        claim.shortfall = shortfall;
         save_claim(&env, &claim);
 
         if payout > 0 {
@@ -414,6 +431,10 @@ impl InsurancePool {
         }
         env.events()
             .publish((symbol_short!("ins_pay"),), (claim_id, payout));
+        if shortfall > 0 {
+            env.events()
+                .publish((symbol_short!("ins_shrt"),), (claim_id, shortfall));
+        }
         payout
     }
 
