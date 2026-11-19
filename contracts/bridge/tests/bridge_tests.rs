@@ -1,6 +1,6 @@
 //! Tests for the cross-chain bridge contract (#1743, #1744).
 
-use bridge::{Bridge, BridgeClient, ChainConfig, ReleaseParams, SwapStatus};
+use bridge::{Bridge, BridgeClient, ChainConfig, ReleaseParams, SwapStatus, SWAP_SCOPE};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
@@ -61,6 +61,7 @@ fn setup<'a>() -> Ctx<'a> {
         &2,
     );
     client.add_chain(&admin, &ETH, &eth_config(&env));
+    client.set_token_allowed(&admin, &ETH, &token, &true);
 
     Ctx {
         env,
@@ -383,6 +384,8 @@ fn test_window_resets_after_window_elapses() {
 // ── Atomic swaps (hashed timelock) ───────────────────────────
 
 fn open_swap(ctx: &Ctx, preimage: &Bytes, expiry: u64) -> (u64, Address, Address) {
+    ctx.client
+        .set_token_allowed(&ctx.admin, &SWAP_SCOPE, &ctx.token, &true);
     let sender = Address::generate(&ctx.env);
     let recipient = Address::generate(&ctx.env);
     mint(ctx, &sender, 500);
@@ -563,4 +566,264 @@ fn test_set_relayers_validates_threshold_and_duplicates() {
         .client
         .try_set_relayers(&ctx.admin, &vec![&ctx.env, a.clone(), a.clone()], &1)
         .is_err());
+}
+
+// ── Permissionless release execution (#1922) ─────────────────
+
+#[test]
+fn test_lowered_threshold_lets_anyone_execute_qualifying_release() {
+    let ctx = setup();
+    let recipient = Address::generate(&ctx.env);
+    mint(&ctx, &ctx.client.address, 1_000);
+
+    // One approval is below the threshold of 2, so nothing is paid yet.
+    attest(&ctx, &ctx.relayers[0], 3, &recipient, 250);
+    assert_eq!(balance(&ctx, &recipient), 0);
+
+    // Admin lowers the threshold to 1. The pending release now qualifies.
+    ctx.client.set_relayers(
+        &ctx.admin,
+        &vec![
+            &ctx.env,
+            ctx.relayers[0].clone(),
+            ctx.relayers[1].clone(),
+            ctx.relayers[2].clone(),
+        ],
+        &1,
+    );
+    assert_eq!(balance(&ctx, &recipient), 0);
+
+    // Any account can execute it without another relayer attestation.
+    ctx.client.execute_release(&ETH, &3);
+
+    assert_eq!(balance(&ctx, &recipient), 250);
+    assert!(ctx.client.get_release(&ETH, &3).unwrap().executed);
+}
+
+#[test]
+fn test_execute_release_rejects_below_threshold() {
+    let ctx = setup();
+    let recipient = Address::generate(&ctx.env);
+    mint(&ctx, &ctx.client.address, 1_000);
+
+    attest(&ctx, &ctx.relayers[0], 4, &recipient, 250);
+    assert!(ctx.client.try_execute_release(&ETH, &4).is_err());
+    assert_eq!(balance(&ctx, &recipient), 0);
+    assert!(!ctx.client.get_release(&ETH, &4).unwrap().executed);
+}
+
+#[test]
+fn test_execute_release_cannot_replay_executed_release() {
+    let ctx = setup();
+    let recipient = Address::generate(&ctx.env);
+    mint(&ctx, &ctx.client.address, 1_000);
+
+    release(&ctx, 5, &recipient, 200);
+    assert_eq!(balance(&ctx, &recipient), 200);
+    assert!(ctx.client.try_execute_release(&ETH, &5).is_err());
+    assert_eq!(balance(&ctx, &recipient), 200);
+}
+
+#[test]
+fn test_execute_release_unknown_release_rejected() {
+    let ctx = setup();
+    assert!(ctx.client.try_execute_release(&ETH, &99).is_err());
+}
+
+// ── Token allowlist (#1923) ──────────────────────────────────
+
+#[test]
+fn test_bridge_out_rejects_unlisted_token() {
+    let ctx = setup();
+    let user = Address::generate(&ctx.env);
+    let other_token = ctx
+        .env
+        .register_stellar_asset_contract_v2(Address::generate(&ctx.env))
+        .address();
+    StellarAssetClient::new(&ctx.env, &other_token).mint(&user, &500);
+
+    assert!(!ctx.client.is_token_allowed(&ETH, &other_token));
+    assert!(ctx
+        .client
+        .try_bridge_out(&user, &other_token, &100, &ETH, &dest(&ctx))
+        .is_err());
+    assert_eq!(TokenClient::new(&ctx.env, &other_token).balance(&user), 500);
+    assert_eq!(ctx.client.get_outbound_nonce(&ETH), 0);
+}
+
+#[test]
+fn test_bridge_out_accepts_listed_token_and_respects_revocation() {
+    let ctx = setup();
+    let user = Address::generate(&ctx.env);
+    mint(&ctx, &user, 500);
+
+    assert!(ctx.client.is_token_allowed(&ETH, &ctx.token));
+    assert_eq!(
+        ctx.client
+            .bridge_out(&user, &ctx.token, &100, &ETH, &dest(&ctx)),
+        1
+    );
+
+    ctx.client
+        .set_token_allowed(&ctx.admin, &ETH, &ctx.token, &false);
+    assert!(ctx
+        .client
+        .try_bridge_out(&user, &ctx.token, &100, &ETH, &dest(&ctx))
+        .is_err());
+}
+
+#[test]
+fn test_allowlist_is_scoped_per_chain() {
+    let ctx = setup();
+    let user = Address::generate(&ctx.env);
+    mint(&ctx, &user, 500);
+    ctx.client.add_chain(&ctx.admin, &2, &eth_config(&ctx.env));
+
+    // Allowed for ETH (1) but not for chain 2.
+    assert!(!ctx.client.is_token_allowed(&2, &ctx.token));
+    assert!(ctx
+        .client
+        .try_bridge_out(&user, &ctx.token, &100, &2, &dest(&ctx))
+        .is_err());
+}
+
+#[test]
+fn test_only_admin_can_set_token_allowlist() {
+    let ctx = setup();
+    let stranger = Address::generate(&ctx.env);
+    let other_token = Address::generate(&ctx.env);
+    assert!(ctx
+        .client
+        .try_set_token_allowed(&stranger, &ETH, &other_token, &true)
+        .is_err());
+    assert!(!ctx.client.is_token_allowed(&ETH, &other_token));
+}
+
+// ── Swap token allowlist (#1924) ─────────────────────────────
+
+fn swap_hashlock(ctx: &Ctx, preimage: &Bytes) -> BytesN<32> {
+    ctx.env.crypto().sha256(preimage).into()
+}
+
+#[test]
+fn test_create_swap_rejects_unlisted_token() {
+    let ctx = setup();
+    let sender = Address::generate(&ctx.env);
+    let other_token = ctx
+        .env
+        .register_stellar_asset_contract_v2(Address::generate(&ctx.env))
+        .address();
+    StellarAssetClient::new(&ctx.env, &other_token).mint(&sender, &500);
+    let hashlock = swap_hashlock(&ctx, &Bytes::from_slice(&ctx.env, b"secret"));
+
+    assert!(ctx
+        .client
+        .try_create_swap(
+            &sender,
+            &Address::generate(&ctx.env),
+            &other_token,
+            &200,
+            &hashlock,
+            &1_000,
+        )
+        .is_err());
+    assert_eq!(
+        TokenClient::new(&ctx.env, &other_token).balance(&sender),
+        500
+    );
+}
+
+#[test]
+fn test_create_swap_accepts_listed_token() {
+    let ctx = setup();
+    ctx.client
+        .set_token_allowed(&ctx.admin, &SWAP_SCOPE, &ctx.token, &true);
+    let preimage = Bytes::from_slice(&ctx.env, b"secret");
+    let (id, sender, recipient) = open_swap(&ctx, &preimage, 1_000);
+
+    ctx.client.claim_swap(&id, &preimage);
+    assert_eq!(balance(&ctx, &recipient), 200);
+    assert_eq!(balance(&ctx, &sender), 300);
+}
+
+#[test]
+fn test_bridge_allowlist_does_not_authorize_swaps() {
+    let ctx = setup();
+    // ctx.token is allowed for bridge_out to ETH, but not for swaps.
+    let preimage = Bytes::from_slice(&ctx.env, b"secret");
+    let sender = Address::generate(&ctx.env);
+    mint(&ctx, &sender, 500);
+    assert!(ctx
+        .client
+        .try_create_swap(
+            &sender,
+            &Address::generate(&ctx.env),
+            &ctx.token,
+            &200,
+            &swap_hashlock(&ctx, &preimage),
+            &1_000,
+        )
+        .is_err());
+    assert_eq!(balance(&ctx, &sender), 500);
+}
+
+#[test]
+fn test_swap_scope_cannot_be_registered_as_chain() {
+    let ctx = setup();
+    assert!(ctx
+        .client
+        .try_add_chain(&ctx.admin, &SWAP_SCOPE, &eth_config(&ctx.env))
+        .is_err());
+}
+
+// ── Swap liveness across idle periods (#1925) ────────────────
+
+const DAY_SECS: u64 = 86_400;
+const DAY_LEDGERS: u32 = 17_280;
+
+/// Advance the ledger sequence and timestamp together, as real time passing would.
+fn advance_days(ctx: &Ctx, days: u32) {
+    ctx.env.ledger().with_mut(|li| {
+        li.sequence_number += days * DAY_LEDGERS;
+        li.timestamp += days as u64 * DAY_SECS;
+    });
+}
+
+#[test]
+fn test_open_swap_record_survives_idle_past_old_ttl() {
+    let ctx = setup();
+    let preimage = Bytes::from_slice(&ctx.env, b"secret");
+    // Expiry is 60 days out. The old fixed 30-day TTL would archive the record
+    // at day 30, long before expiry.
+    let (id, _, _) = open_swap(&ctx, &preimage, 60 * DAY_SECS);
+
+    advance_days(&ctx, 45);
+    let swap = ctx.client.get_swap(&id);
+    assert_eq!(swap.status, SwapStatus::Open);
+    assert_eq!(swap.expiry, 60 * DAY_SECS);
+}
+
+#[test]
+fn test_bump_swap_keeps_open_swap_alive_until_expiry() {
+    let ctx = setup();
+    let preimage = Bytes::from_slice(&ctx.env, b"secret");
+    let (id, _, _) = open_swap(&ctx, &preimage, 60 * DAY_SECS);
+
+    advance_days(&ctx, 30);
+    // Permissionless: a stranger with no auth can bump the swap.
+    ctx.client.bump_swap(&id);
+
+    advance_days(&ctx, 25);
+    assert_eq!(ctx.client.get_swap(&id).status, SwapStatus::Open);
+}
+
+#[test]
+fn test_bump_swap_rejects_unknown_and_closed_swaps() {
+    let ctx = setup();
+    assert!(ctx.client.try_bump_swap(&42).is_err());
+
+    let preimage = Bytes::from_slice(&ctx.env, b"secret");
+    let (id, _, _) = open_swap(&ctx, &preimage, 1_000);
+    ctx.client.claim_swap(&id, &preimage);
+    assert!(ctx.client.try_bump_swap(&id).is_err());
 }
