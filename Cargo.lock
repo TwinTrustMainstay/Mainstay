@@ -922,6 +922,7 @@ dependencies = [
 name = "governance"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "shared",
  "soroban-sdk",
 ]
