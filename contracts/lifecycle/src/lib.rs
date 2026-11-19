@@ -3185,18 +3185,29 @@ impl Lifecycle {
     }
 
     /// Issue #1319: Dispute a maintenance record for an asset.
-    /// The asset owner can challenge the authenticity of a maintenance record signed by an engineer.
+    /// The asset owner or an authorized attestor can challenge the authenticity of a
+    /// maintenance record signed by an engineer. Unregistered callers are rejected.
     ///
     /// # Arguments
+    /// * `caller` - The party filing the dispute; must authenticate and be the asset
+    ///   owner or an attestor authorized for this asset
     /// * `asset_id` - The unique identifier of the asset
     /// * `maintenance_timestamp` - Timestamp of the disputed record
     /// * `reason` - Dispute reason (e.g., "No service was actually performed")
     ///
     /// # Panics
     /// - [`ContractError::AssetNotFound`] if asset doesn't exist
+    /// - [`ContractError::UnauthorizedAttestor`] if `caller` is neither the owner nor an authorized attestor
     /// - [`ContractError::MaintenanceRecordNotFound`] if record doesn't exist
-    pub fn dispute_record(env: Env, asset_id: u64, maintenance_timestamp: u64, reason: String) {
+    pub fn dispute_record(
+        env: Env,
+        caller: Address,
+        asset_id: u64,
+        maintenance_timestamp: u64,
+        reason: String,
+    ) {
         ensure_not_paused(&env);
+        caller.require_auth();
 
         // Verify asset exists (get current owner)
         let asset_registry: Address = env
@@ -3205,7 +3216,17 @@ impl Lifecycle {
             .get(&registry_key())
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
         let asset_registry_client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
-        let _asset = asset_registry_client.get_asset(&asset_id);
+        let asset = asset_registry_client.get_asset(&asset_id);
+
+        // Only registered parties (owner or authorized attestor) may dispute.
+        let is_attestor = env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&attestor_auth_key(asset_id, &caller))
+            .unwrap_or(false);
+        if asset.owner != caller && !is_attestor {
+            panic_with_error!(&env, ContractError::UnauthorizedAttestor);
+        }
 
         // Verify the maintenance record exists
         let history: Vec<MaintenanceRecord> = env
@@ -9100,6 +9121,7 @@ mod tests {
     mod lifecycle_score_tests;
     mod maintenance_fuzz_tests;
     mod maintenance_ttl_tests;
+    mod dispute_auth_tests;
 
     fn setup<'a>(
         env: &'a Env,
