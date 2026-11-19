@@ -282,6 +282,19 @@ Emitted when a defaulted loan is slashed by admin after missing deadline.
 
 ---
 
+## Bridge Contract Events
+
+Emitted by `contracts/bridge`. Topic is the first element; payload is the tuple below.
+
+| Topic | Payload | Emitted when |
+|---|---|---|
+| `BR_OUT` | `(dest_chain, nonce, sender, token, amount, dest_address)` | `bridge_out` locks tokens |
+| `BR_REL` | `(source_chain, nonce, recipient, token, amount, approvers)` | A release reaches the attestation threshold and pays out. `approvers` is the `Vec<Address>` of relayers that attested, in attestation order |
+| `BR_ALERT` | `(source_chain, window_outflow, window_cap)` | Window outflow crosses `alert_threshold` |
+| `BR_SWP_N` | `(swap_id, sender, hashlock, expiry, amount)` | `create_swap` opens a swap |
+| `BR_SWP_C` | `(swap_id, preimage)` | `claim_swap` succeeds |
+| `BR_SWP_R` | `(swap_id)` | `refund_swap` succeeds |
+
 ## Parsing Event Data
 
 ### TypeScript Parsing Example

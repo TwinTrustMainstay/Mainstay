@@ -25,7 +25,7 @@ here. It needs its own toolchain and audit, so it should be a separate change.
 | Topic | Payload |
 |---|---|
 | `BR_OUT` | `(dest_chain, nonce, sender, token, amount, dest_address)` |
-| `BR_REL` | `(source_chain, nonce, recipient, token, amount)` |
+| `BR_REL` | `(source_chain, nonce, recipient, token, amount, approvers)` — `approvers` lists the relayers that attested, in attestation order |
 | `BR_ALERT` | `(source_chain, window_outflow, window_cap)` |
 | `BR_SWP_N` | `(swap_id, sender, hashlock, expiry, amount)` |
 | `BR_SWP_C` | `(swap_id, preimage)` |
@@ -33,7 +33,7 @@ here. It needs its own toolchain and audit, so it should be a separate change.
 
 ## Errors
 
-Discriminants are defined in `contracts/bridge/src/lib.rs` (`ContractError`, 1–24).
+Discriminants are defined in `contracts/bridge/src/lib.rs` (`ContractError`, 1–26).
 
 ## Trust model
 

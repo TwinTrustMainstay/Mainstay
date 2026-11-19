@@ -2,7 +2,7 @@
 
 use bridge::{Bridge, BridgeClient, ChainConfig, ContractError, ReleaseParams, SwapStatus};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils::{Address as _, Events as _, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
     vec, Address, Bytes, BytesN, Env, Error, Symbol,
 };
@@ -293,6 +293,39 @@ fn test_release_executes_only_at_threshold() {
     let pending = ctx.client.get_release(&ETH, &1).unwrap();
     assert!(pending.executed);
     assert_eq!(balance(&ctx, &recipient), 300);
+}
+
+#[test]
+fn test_release_event_lists_approving_relayers() {
+    use soroban_sdk::{IntoVal, TryFromVal};
+
+    let ctx = setup();
+    let recipient = Address::generate(&ctx.env);
+    mint(&ctx, &ctx.client.address, 1_000);
+    release(&ctx, 7, &recipient, 300);
+
+    let br_rel = Symbol::new(&ctx.env, "BR_REL");
+    let events = ctx.env.events().all();
+    let (_, _, data) = events
+        .iter()
+        .find(|(_, topics, _)| {
+            topics
+                .get(0)
+                .and_then(|t| Symbol::try_from_val(&ctx.env, &t).ok())
+                == Some(br_rel.clone())
+        })
+        .expect("BR_REL event emitted on execution");
+
+    let payload: (u32, u64, Address, Address, i128, soroban_sdk::Vec<Address>) =
+        data.into_val(&ctx.env);
+    assert_eq!(payload.0, ETH);
+    assert_eq!(payload.1, 7);
+    assert_eq!(payload.2, recipient);
+    assert_eq!(payload.4, 300);
+    assert_eq!(
+        payload.5,
+        vec![&ctx.env, ctx.relayers[0].clone(), ctx.relayers[1].clone()]
+    );
 }
 
 #[test]

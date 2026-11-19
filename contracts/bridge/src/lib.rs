@@ -488,6 +488,8 @@ impl Bridge {
     /// - [`ContractError::AttestationMismatch`] if parameters differ from earlier attestations
     /// - [`ContractError::AlreadyAttested`] if this relayer already attested
     /// - [`ContractError::WindowCapExceeded`] if the release would breach the outflow cap
+    ///
+    /// On execution, emits `BR_REL` with the approving relayers in attestation order.
     pub fn attest_release(
         env: Env,
         relayer: Address,
@@ -572,6 +574,7 @@ impl Bridge {
                     recipient.clone(),
                     token.clone(),
                     amount,
+                    pending.approvals.clone(),
                 ),
             );
         }
