@@ -61,6 +61,7 @@ fn setup<'a>() -> Ctx<'a> {
         &2,
     );
     client.add_chain(&admin, &ETH, &eth_config(&env));
+    client.set_token_allowed(&admin, &ETH, &token, &true);
 
     Ctx {
         env,
@@ -625,4 +626,73 @@ fn test_execute_release_cannot_replay_executed_release() {
 fn test_execute_release_unknown_release_rejected() {
     let ctx = setup();
     assert!(ctx.client.try_execute_release(&ETH, &99).is_err());
+}
+
+// ── Token allowlist (#1923) ──────────────────────────────────
+
+#[test]
+fn test_bridge_out_rejects_unlisted_token() {
+    let ctx = setup();
+    let user = Address::generate(&ctx.env);
+    let other_token = ctx
+        .env
+        .register_stellar_asset_contract_v2(Address::generate(&ctx.env))
+        .address();
+    StellarAssetClient::new(&ctx.env, &other_token).mint(&user, &500);
+
+    assert!(!ctx.client.is_token_allowed(&ETH, &other_token));
+    assert!(ctx
+        .client
+        .try_bridge_out(&user, &other_token, &100, &ETH, &dest(&ctx))
+        .is_err());
+    assert_eq!(TokenClient::new(&ctx.env, &other_token).balance(&user), 500);
+    assert_eq!(ctx.client.get_outbound_nonce(&ETH), 0);
+}
+
+#[test]
+fn test_bridge_out_accepts_listed_token_and_respects_revocation() {
+    let ctx = setup();
+    let user = Address::generate(&ctx.env);
+    mint(&ctx, &user, 500);
+
+    assert!(ctx.client.is_token_allowed(&ETH, &ctx.token));
+    assert_eq!(
+        ctx.client
+            .bridge_out(&user, &ctx.token, &100, &ETH, &dest(&ctx)),
+        1
+    );
+
+    ctx.client
+        .set_token_allowed(&ctx.admin, &ETH, &ctx.token, &false);
+    assert!(ctx
+        .client
+        .try_bridge_out(&user, &ctx.token, &100, &ETH, &dest(&ctx))
+        .is_err());
+}
+
+#[test]
+fn test_allowlist_is_scoped_per_chain() {
+    let ctx = setup();
+    let user = Address::generate(&ctx.env);
+    mint(&ctx, &user, 500);
+    ctx.client.add_chain(&ctx.admin, &2, &eth_config(&ctx.env));
+
+    // Allowed for ETH (1) but not for chain 2.
+    assert!(!ctx.client.is_token_allowed(&2, &ctx.token));
+    assert!(ctx
+        .client
+        .try_bridge_out(&user, &ctx.token, &100, &2, &dest(&ctx))
+        .is_err());
+}
+
+#[test]
+fn test_only_admin_can_set_token_allowlist() {
+    let ctx = setup();
+    let stranger = Address::generate(&ctx.env);
+    let other_token = Address::generate(&ctx.env);
+    assert!(ctx
+        .client
+        .try_set_token_allowed(&stranger, &ETH, &other_token, &true)
+        .is_err());
+    assert!(!ctx.client.is_token_allowed(&ETH, &other_token));
 }

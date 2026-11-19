@@ -80,6 +80,8 @@ pub enum ContractError {
     ReleaseNotFound = 25,
     /// The release has fewer approvals than the current threshold.
     InsufficientApprovals = 26,
+    /// The token is not on the allowlist for this chain.
+    TokenNotAllowed = 27,
 }
 
 /// Maximum number of relayers in the set.
@@ -170,6 +172,9 @@ pub enum DataKey {
     Relayers,
     Threshold,
     Chain(u32),
+    /// `(scope, token)` is allowed. A scope is a destination chain ID for
+    /// `bridge_out`.
+    AllowedToken(u32, Address),
     OutNonce(u32),
     Pending(u32, u64),
     Window(u32),
@@ -266,6 +271,21 @@ fn execute_release(
             pending.amount,
         ),
     );
+}
+
+fn ensure_token_allowed(env: &Env, scope: u32, token: &Address) {
+    if !is_token_allowed_in(env, scope, token) {
+        panic_with_error!(env, ContractError::TokenNotAllowed);
+    }
+}
+
+fn is_token_allowed_in(env: &Env, scope: u32, token: &Address) -> bool {
+    let key = DataKey::AllowedToken(scope, token.clone());
+    let allowed: bool = env.storage().persistent().get(&key).unwrap_or(false);
+    if env.storage().persistent().has(&key) {
+        bump(env, &key);
+    }
+    allowed
 }
 
 fn ensure_amount_in_range(env: &Env, cfg: &ChainConfig, amount: i128) {
@@ -406,6 +426,28 @@ impl Bridge {
         bump(&env, &key);
     }
 
+    /// Allow or disallow a token for `bridge_out` to `chain_id`.
+    ///
+    /// The allowlist is independent of chain registration, so a token can be
+    /// listed before its chain is added.
+    pub fn set_token_allowed(
+        env: Env,
+        admin: Address,
+        chain_id: u32,
+        token: Address,
+        allowed: bool,
+    ) {
+        require_admin(&env, &admin);
+        let key = DataKey::AllowedToken(chain_id, token);
+        env.storage().persistent().set(&key, &allowed);
+        bump(&env, &key);
+    }
+
+    /// Whether `token` may be bridged to `chain_id`.
+    pub fn is_token_allowed(env: Env, chain_id: u32, token: Address) -> bool {
+        is_token_allowed_in(&env, chain_id, &token)
+    }
+
     /// Get a chain's current configuration.
     ///
     /// # Panics
@@ -423,6 +465,7 @@ impl Bridge {
     /// - [`ContractError::ChainNotFound`] / [`ContractError::ChainDisabled`] for an unusable destination
     /// - [`ContractError::AmountOutOfRange`] if `amount` is outside the chain's limits
     /// - [`ContractError::InvalidDestination`] if `dest_address` is empty
+    /// - [`ContractError::TokenNotAllowed`] if `token` is not allowlisted for `dest_chain`
     pub fn bridge_out(
         env: Env,
         sender: Address,
@@ -441,6 +484,7 @@ impl Bridge {
         if dest_address.is_empty() {
             panic_with_error!(&env, ContractError::InvalidDestination);
         }
+        ensure_token_allowed(&env, dest_chain, &token);
 
         token::Client::new(&env, &token).transfer(
             &sender,
