@@ -294,3 +294,43 @@ fn set_rate_limit_emits_old_and_new_limits() {
     );
     assert_eq!((new_max, new_window), (25, 30));
 }
+
+#[test]
+fn subscribe_and_unsubscribe_emit_events() {
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::{TryFromVal, Vec};
+
+    let (env, id, _admin) = setup();
+    let client = MobileApiClient::new(&env, &id);
+    let app = Address::generate(&env);
+    client.register_client(&app, &CURRENT_API_VERSION);
+
+    let topics = vec![&env, Symbol::new(&env, "asset_update")];
+    client.subscribe(&app, &topics);
+
+    let find = |name: &str| {
+        let target = Symbol::new(&env, name);
+        env.events().all().iter().find(|(addr, t, _)| {
+            *addr == id
+                && t.get(0)
+                    .and_then(|v| Symbol::try_from_val(&env, &v).ok())
+                    .map(|s| s == target)
+                    .unwrap_or(false)
+        })
+    };
+
+    let (_, sub_topics, sub_data) = find("SUB").expect("subscribe must emit a SUB event");
+    assert_eq!(
+        Address::try_from_val(&env, &sub_topics.get(1).unwrap()).unwrap(),
+        app
+    );
+    let emitted: Vec<Symbol> = Vec::try_from_val(&env, &sub_data).unwrap();
+    assert_eq!(emitted, topics);
+
+    client.unsubscribe(&app);
+    let (_, unsub_topics, _) = find("UNSUB").expect("unsubscribe must emit an UNSUB event");
+    assert_eq!(
+        Address::try_from_val(&env, &unsub_topics.get(1).unwrap()).unwrap(),
+        app
+    );
+}

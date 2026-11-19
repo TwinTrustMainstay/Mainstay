@@ -481,9 +481,13 @@ impl MobileApi {
         if topics.is_empty() || topics.len() > MAX_SUBSCRIPTION_TOPICS {
             return Err(ContractError::InvalidTopics);
         }
-        let key = DataKey::Subscription(client);
+        let key = DataKey::Subscription(client.clone());
         env.storage().persistent().set(&key, &topics);
         extend_persistent_ttl(&env, key);
+        env.events().publish(
+            (soroban_sdk::symbol_short!("SUB"), client),
+            topics,
+        );
         Ok(())
     }
 
@@ -492,7 +496,9 @@ impl MobileApi {
         require_registered(&env, &client)?;
         env.storage()
             .persistent()
-            .remove(&DataKey::Subscription(client));
+            .remove(&DataKey::Subscription(client.clone()));
+        env.events()
+            .publish((soroban_sdk::symbol_short!("UNSUB"), client), ());
         Ok(())
     }
 
