@@ -83,6 +83,8 @@ pub enum ContractError {
     InsuranceAlreadyRegistered = 33,
     /// Insurance coverage must be greater than zero.
     ZeroInsuranceCoverage = 34,
+    /// Suspension period is invalid.
+    InvalidSuspensionPeriod = 35,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -95,6 +97,7 @@ impl From<SharedContractError> for ContractError {
             SharedContractError::TimelockNotExpired => ContractError::TimelockNotExpired,
             SharedContractError::ProposalNotFound => ContractError::ProposalNotFound,
             SharedContractError::PendingAdminAlreadyExists => ContractError::AlreadyInitialized,
+            SharedContractError::InvalidSuspensionPeriod => ContractError::InvalidSuspensionPeriod,
         }
     }
 }
@@ -245,8 +248,6 @@ pub enum DataKey {
     Liens(u64),
 }
 
-use shared::{TTL_THRESHOLD, TTL_TARGET};
-
 /// Default yield rate numerator: 2% = 200 / 10_000.
 const DEFAULT_YIELD_NUMERATOR: u64 = 200;
 const YIELD_DENOMINATOR: u64 = 10_000;
@@ -312,7 +313,7 @@ fn loan_status_key(loan_id: u64) -> (soroban_sdk::Symbol, u64) {
 fn set_loan_status(env: &Env, loan_id: u64, status: LoanStatus) {
     let key = loan_status_key(loan_id);
     env.storage().persistent().set(&key, &status);
-    extend_persistent_ttl(env, &key);
+    extend_persistent_ttl(env, key.clone());
 }
 
 fn get_loan_status(env: &Env, loan_id: u64) -> Option<LoanStatus> {
@@ -419,22 +420,6 @@ fn require_restructure_caller(env: &Env, caller: &Address, loan_id: u64) {
     panic_with_error!(env, ContractError::UnauthorizedLender);
 }
 
-/// A lien record representing a claim against an asset by a lender.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LienRecord {
-    pub lender: Address,
-    pub loan_id: u64,
-    pub amount: u64,
-}
-
-/// Storage key variants for indexed lookups.
-#[contracttype]
-pub enum DataKey {
-    /// Maps an asset_id to its list of lien records.
-    Liens(u64),
-}
-
 fn liens_key(asset_id: u64) -> DataKey {
     DataKey::Liens(asset_id)
 }
@@ -473,7 +458,7 @@ fn release_lien_internal(env: &Env, asset_id: u64, loan_id: u64) {
             env.storage().persistent().remove(&key);
         } else {
             env.storage().persistent().set(&key, &liens);
-            extend_persistent_ttl(env, &key);
+            extend_persistent_ttl(env, key.clone());
         }
     }
 
@@ -732,7 +717,7 @@ impl LendingContract {
             id: new_loan_id,
         };
         env.storage().persistent().set(&key, &loan);
-        extend_persistent_ttl(&env, &key);
+        extend_persistent_ttl(&env, key.clone());
         set_loan_status(&env, new_loan_id, LoanStatus::Active);
 
         // Transfer the loan amount to the borrower
@@ -813,7 +798,7 @@ impl LendingContract {
 
         loan.status = LoanStatus::Repaid;
         env.storage().persistent().set(&key, &loan);
-        extend_persistent_ttl(&env, &key);
+        extend_persistent_ttl(&env, key.clone());
         set_loan_status(&env, loan.id, LoanStatus::Repaid);
 
         // Track successful repayments in the borrower record for credit scoring.
@@ -923,7 +908,7 @@ impl LendingContract {
             stake,
         });
         env.storage().persistent().set(&key, &vouches);
-        extend_persistent_ttl(&env, &key);
+        extend_persistent_ttl(&env, key.clone());
 
         let hist_key = voucher_history_key(&voucher);
         let mut history: Vec<Address> = env
@@ -960,7 +945,7 @@ impl LendingContract {
 
         loan.status = LoanStatus::Defaulted;
         env.storage().persistent().set(&key, &loan);
-        extend_persistent_ttl(&env, &key);
+        extend_persistent_ttl(&env, key.clone());
         set_loan_status(&env, loan.id, LoanStatus::Defaulted);
 
         let default_time = env.ledger().timestamp();
@@ -1092,7 +1077,7 @@ impl LendingContract {
 
             vouches.remove(idx);
             env.storage().persistent().set(&key, &vouches);
-            extend_persistent_ttl(&env, &key);
+            extend_persistent_ttl(&env, key.clone());
 
             let token_addr = get_token(&env);
             let tok = token::Client::new(&env, &token_addr);
@@ -1292,7 +1277,7 @@ impl LendingContract {
             amount,
         });
         env.storage().persistent().set(&key, &liens);
-        extend_persistent_ttl(&env, &key);
+        extend_persistent_ttl(&env, key.clone());
 
         // #995: Write loan→asset_id mapping so slash can release the lien.
         let la_key = loan_asset_key(loan_id);
@@ -1344,7 +1329,7 @@ impl LendingContract {
                     env.storage().persistent().remove(&key);
                 } else {
                     env.storage().persistent().set(&key, &liens);
-                    extend_persistent_ttl(&env, &key);
+                    extend_persistent_ttl(&env, key.clone());
                 }
                 if env
                     .storage()
@@ -1481,7 +1466,7 @@ impl LendingContract {
         // Calculate total shares
         let mut total_shares: u64 = 0;
         for share in shares.iter() {
-            total_shares = total_shares.checked_add(*share)
+            total_shares = total_shares.checked_add(share)
                 .unwrap_or_else(|| panic_with_error!(&env, ContractError::StakeSummationOverflow));
         }
 
@@ -1512,7 +1497,7 @@ impl LendingContract {
 
         let mut found = false;
         for l in syndicate.lenders.iter() {
-            if l == &lender {
+            if l == lender {
                 found = true;
                 break;
             }
@@ -1663,7 +1648,7 @@ impl LendingContract {
         };
 
         env.storage().persistent().set(&key, &insurance);
-        extend_persistent_ttl(&env, &key);
+        extend_persistent_ttl(&env, key.clone());
         let lender_key = insurance_lender_key(asset_id);
         env.storage().persistent().set(&lender_key, &lender);
         extend_persistent_ttl(&env, &lender_key);
