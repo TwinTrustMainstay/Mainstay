@@ -54,6 +54,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Storage keys (`lifecycle/src/storage.rs`) added since 1.0.0: `SCHIST` (score history), `LUPD` (last score update timestamp), `FROZEN` / `FRZ_SCR` (decommission freeze flag and frozen score), `HLTH_SNP` (health snapshots), `XFER_HIST` (ownership transfer history), `ENG_HIST` / `ENG_AUTH` (per-engineer history and per-asset authorization), `SUB_WIN` (rolling-hour submission rate window), `RVK_TL` / `TL_PROP` (timelocked engineer-revocation and generic admin proposals), `MSTD` / `SCR_WGT` (per-asset-type maintenance standards and scoring weights)
 
 ### Fixed
+- Engineer bonds (#1962, #1963, #1964): `slash` is refused while a dispute is
+  open. Disputes lapse after a 30-day deadline so a bond cannot be locked
+  forever. `open_dispute` and `record_performance` reject engineers with no
+  bond (`BondNotFound`) instead of creating phantom records.
+- Engineer bonds (#1965): `open_dispute` takes a reason and an evidence hash.
+  They are stored in an audit record (`get_dispute`) and emitted in an event.
 - Metrics exporter: the exporter no longer crashes on its first collection, and its HTTP endpoint now returns metrics (the response was never sent before).
 - Backup checksums use paths relative to the backup directory, so backups verify after being copied to another location.
 - `update_reputation` in `engineer-registry`: decay is now applied to the stored score before the delta is added. Previously an inactive engineer's decayed reputation was overwritten by the undecayed stored value on the next update (closes [#1741](https://github.com/TwinTrustMainstay/Mainstay/issues/1741))
