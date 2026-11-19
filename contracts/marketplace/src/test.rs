@@ -1,8 +1,13 @@
 use super::*;
 use soroban_sdk::{
-    contracttype, symbol_short, testutils::Address as _, testutils::Ledger, Address, BytesN, Env,
-    String,
+    contracttype, symbol_short,
+    testutils::{Address as _, Ledger},
+    token::{Client as TokenClient, StellarAssetClient},
+    Address, BytesN, Env, String,
 };
+
+/// Deposit locked by each sealed commitment in tests.
+const DEPOSIT: i128 = 100;
 
 /// Stand-in for the engineer registry: per-address credential status and reputation.
 #[contracttype]
@@ -65,6 +70,7 @@ struct Ctx<'a> {
     client: MarketplaceClient<'a>,
     registry: MockRegistryClient<'a>,
     admin: Address,
+    token: Address,
 }
 
 fn setup(env: &Env) -> Ctx<'_> {
@@ -76,17 +82,24 @@ fn setup(env: &Env) -> Ctx<'_> {
     let id = env.register(Marketplace, ());
     let client = MarketplaceClient::new(env, &id);
     client.initialize(&admin, &registry_id, &pricing());
+    let token_admin = Address::generate(env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    client.set_bid_deposit(&admin, &token, &DEPOSIT);
     Ctx {
         env,
         client,
         registry,
         admin,
+        token,
     }
 }
 
 fn engineer(ctx: &Ctx, status: CredentialStatus, reputation: u32) -> Address {
     let addr = Address::generate(ctx.env);
     ctx.registry.set_engineer(&addr, &status, &reputation);
+    StellarAssetClient::new(ctx.env, &ctx.token).mint(&addr, &DEPOSIT);
     addr
 }
 
@@ -562,4 +575,182 @@ fn only_admin_can_create_auctions() {
             .try_create_auction(&other, &open_params(&ctx, WinnerCriterion::LowestPrice)),
         Err(Ok(contract_err(ContractError::UnauthorizedAdmin)))
     );
+}
+
+// ---------- Commitment cap per auction (#1934) ----------
+
+#[test]
+fn commit_bid_rejects_commitments_beyond_the_cap() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
+    let salt = BytesN::from_array(&env, &[3u8; 32]);
+    let filler = commitment(&env, id, &ctx.admin, 1_000, &salt);
+    for _ in 0..MAX_BIDS_PER_AUCTION {
+        let e = engineer(&ctx, CredentialStatus::Valid, 0);
+        ctx.client.commit_bid(&e, &id, &filler);
+    }
+
+    let overflow = engineer(&ctx, CredentialStatus::Valid, 0);
+    assert_eq!(
+        ctx.client.try_commit_bid(&overflow, &id, &filler),
+        Err(Ok(contract_err(ContractError::BidLimitReached)))
+    );
+}
+
+// ---------- Refundable commitment deposit (#1935) ----------
+
+#[test]
+fn commit_locks_deposit_and_reveal_refunds_it() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let token = TokenClient::new(&env, &ctx.token);
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
+    let a = engineer(&ctx, CredentialStatus::Valid, 0);
+    let salt = BytesN::from_array(&env, &[4u8; 32]);
+
+    ctx.client
+        .commit_bid(&a, &id, &commitment(&env, id, &a, 2_000, &salt));
+    assert_eq!(token.balance(&a), 0);
+    assert_eq!(token.balance(&ctx.client.address), DEPOSIT);
+
+    at(&env, BID_END + 1);
+    ctx.client.reveal_bid(&a, &id, &2_000, &salt);
+    assert_eq!(token.balance(&a), DEPOSIT);
+    assert_eq!(token.balance(&ctx.client.address), 0);
+}
+
+#[test]
+fn unrevealed_deposit_is_forfeited_and_only_claimable_after_reveal_window() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let token = TokenClient::new(&env, &ctx.token);
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
+    let a = engineer(&ctx, CredentialStatus::Valid, 0);
+    let b = engineer(&ctx, CredentialStatus::Valid, 0);
+    let salt = BytesN::from_array(&env, &[6u8; 32]);
+    ctx.client
+        .commit_bid(&a, &id, &commitment(&env, id, &a, 2_000, &salt));
+    ctx.client
+        .commit_bid(&b, &id, &commitment(&env, id, &b, 1_500, &salt));
+
+    at(&env, BID_END + 1);
+    ctx.client.reveal_bid(&a, &id, &2_000, &salt);
+    // b never reveals.
+    let treasury = Address::generate(&env);
+    assert_eq!(
+        ctx.client
+            .try_claim_forfeited_deposits(&ctx.admin, &id, &treasury),
+        Err(Ok(contract_err(ContractError::ForfeitWindowOpen)))
+    );
+
+    at(&env, REVEAL_END + 1);
+    let forfeited = ctx
+        .client
+        .claim_forfeited_deposits(&ctx.admin, &id, &treasury);
+    assert_eq!(forfeited, DEPOSIT);
+    assert_eq!(token.balance(&treasury), DEPOSIT);
+    assert_eq!(token.balance(&b), 0);
+    assert_eq!(token.balance(&a), DEPOSIT);
+    assert_eq!(token.balance(&ctx.client.address), 0);
+}
+
+#[test]
+fn commit_requires_a_configured_deposit() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
+    let a = engineer(&ctx, CredentialStatus::Valid, 0);
+    let salt = BytesN::from_array(&env, &[7u8; 32]);
+    let c = commitment(&env, id, &a, 2_000, &salt);
+
+    // A marketplace that never set a deposit must reject commitments.
+    let fresh = env.register(Marketplace, ());
+    let fresh_client = MarketplaceClient::new(&env, &fresh);
+    fresh_client.initialize(&ctx.admin, &ctx.registry.address, &pricing());
+    let fresh_id =
+        fresh_client.create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
+    assert_eq!(
+        fresh_client.try_commit_bid(&a, &fresh_id, &c),
+        Err(Ok(contract_err(ContractError::DepositNotConfigured)))
+    );
+    assert_eq!(
+        ctx.client.try_set_bid_deposit(&ctx.admin, &ctx.token, &0),
+        Err(Ok(contract_err(ContractError::InvalidDepositConfig)))
+    );
+}
+
+// ---------- Reveal at the bid cap (#1936) ----------
+
+#[test]
+fn reveal_at_bid_cap_is_rejected_with_event_and_settled() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let token = TokenClient::new(&env, &ctx.token);
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
+    let a = engineer(&ctx, CredentialStatus::Valid, 0);
+    let salt = BytesN::from_array(&env, &[8u8; 32]);
+    ctx.client
+        .commit_bid(&a, &id, &commitment(&env, id, &a, 2_000, &salt));
+
+    // Fill the stored bid list to the cap without going through reveals.
+    let filler = Address::generate(&env);
+    let mut full: Vec<Bid> = Vec::new(&env);
+    for _ in 0..MAX_BIDS_PER_AUCTION {
+        full.push_back(Bid {
+            engineer: filler.clone(),
+            price: 4_000,
+            reputation: 0,
+            placed_at: T0,
+        });
+    }
+    env.as_contract(&ctx.client.address, || {
+        env.storage().persistent().set(&DataKey::Bids(id), &full);
+    });
+
+    at(&env, BID_END + 1);
+    ctx.client.reveal_bid(&a, &id, &2_000, &salt);
+
+    // Not recorded, but no revert: the bid list is unchanged and the deposit is returned.
+    assert_eq!(ctx.client.get_bids(&id).len(), MAX_BIDS_PER_AUCTION);
+    assert_eq!(token.balance(&a), DEPOSIT);
+    assert_eq!(
+        ctx.client.try_reveal_bid(&a, &id, &2_000, &salt),
+        Err(Ok(contract_err(ContractError::NoCommitment)))
+    );
+}
+
+// ---------- Credential recheck on reveal (#1937) ----------
+
+#[test]
+fn revoked_engineer_cannot_reveal_after_committing() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
+    let a = engineer(&ctx, CredentialStatus::Valid, 0);
+    let salt = BytesN::from_array(&env, &[10u8; 32]);
+    ctx.client
+        .commit_bid(&a, &id, &commitment(&env, id, &a, 1_000, &salt));
+
+    // Credential is revoked between commit and reveal.
+    ctx.registry
+        .set_engineer(&a, &CredentialStatus::Revoked, &0);
+    at(&env, BID_END + 1);
+    assert_eq!(
+        ctx.client.try_reveal_bid(&a, &id, &1_000, &salt),
+        Err(Ok(contract_err(ContractError::NotCredentialed)))
+    );
+    assert!(ctx.client.get_bids(&id).is_empty());
 }
