@@ -344,3 +344,79 @@ fn claim_filed_one_second_after_expiry_cannot_be_filed() {
     env.ledger().with_mut(|l| l.timestamp = expires_at + 1);
     ctx.client.file_claim(&lender, &policy_id, &100);
 }
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn pause_blocks_capital_deposits() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let provider = funded(&env, &ctx, 10_000);
+    ctx.client.pause(&ctx.admin);
+    ctx.client.provide_capital(&provider, &1_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn pause_blocks_withdrawals() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let provider = funded(&env, &ctx, 10_000);
+    ctx.client.provide_capital(&provider, &1_000);
+    ctx.client.pause(&ctx.admin);
+    ctx.client.withdraw_capital(&provider, &100);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn pause_blocks_policy_purchases() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let lender = funded(&env, &ctx, 10_000);
+    ctx.client.pause(&ctx.admin);
+    ctx.client.buy_policy(&lender, &7, &1_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn pause_blocks_claim_filing() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let lender = funded(&env, &ctx, 10_000);
+    let policy_id = ctx.client.buy_policy(&lender, &7, &1_000);
+    ctx.client.pause(&ctx.admin);
+    ctx.client.file_claim(&lender, &policy_id, &100);
+}
+
+#[test]
+fn settlement_stays_open_while_paused() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let provider = funded(&env, &ctx, 10_000);
+    ctx.client.provide_capital(&provider, &5_000);
+    let lender = funded(&env, &ctx, 10_000);
+    let policy_id = ctx.client.buy_policy(&lender, &7, &1_000);
+    let claim_id = ctx.client.file_claim(&lender, &policy_id, &400);
+    ctx.client.pause(&ctx.admin);
+    assert_eq!(ctx.client.settle_claim(&ctx.admin, &claim_id, &true), 400);
+}
+
+#[test]
+fn unpause_restores_operations() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let provider = funded(&env, &ctx, 10_000);
+    ctx.client.pause(&ctx.admin);
+    assert!(ctx.client.is_paused());
+    ctx.client.unpause(&ctx.admin);
+    assert!(!ctx.client.is_paused());
+    assert_eq!(ctx.client.provide_capital(&provider, &1_000), 1_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn non_admin_cannot_pause() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let intruder = Address::generate(&env);
+    ctx.client.pause(&intruder);
+}

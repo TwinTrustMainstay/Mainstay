@@ -49,6 +49,13 @@ asset, pays a premium into the pool, and can claim against the policy if the col
 - **Stats.** `get_stats` reports total assets and shares, reserved amount, premiums collected,
   total payouts, and claim counts (filed, paid, rejected).
 
+## Emergency pause
+
+- `pause` and `unpause` are admin-only. `is_paused` reports the state.
+- While paused, `provide_capital`, `withdraw_capital`, `buy_policy` and `file_claim` fail with
+  `Paused`.
+- `settle_claim` stays open, so the admin can resolve pending claims during an incident.
+
 ## Operating guidance
 
 - Settle claims promptly. Reserved funds are locked until settlement.

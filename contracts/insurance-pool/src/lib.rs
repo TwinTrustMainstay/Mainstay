@@ -55,6 +55,8 @@ pub enum ContractError {
     ClaimNotPending = 13,
     /// Arithmetic overflowed.
     MathOverflow = 14,
+    /// The pool is paused. Filing, purchases and withdrawals are blocked.
+    Paused = 15,
 }
 
 #[contracttype]
@@ -113,6 +115,7 @@ pub enum DataKey {
     Token,
     PremiumBps,
     TermSecs,
+    Paused,
     Stats,
     NextPolicyId,
     NextClaimId,
@@ -146,6 +149,19 @@ fn token_client(env: &Env) -> token::Client<'_> {
         .get(&DataKey::Token)
         .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized));
     token::Client::new(env, &addr)
+}
+
+fn is_paused(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false)
+}
+
+fn ensure_not_paused(env: &Env) {
+    if is_paused(env) {
+        panic_with_error!(env, ContractError::Paused);
+    }
 }
 
 fn load_stats(env: &Env) -> PoolStats {
@@ -240,6 +256,7 @@ impl InsurancePool {
 
     /// Deposits `amount` tokens and returns the shares minted for the provider.
     pub fn provide_capital(env: Env, provider: Address, amount: i128) -> i128 {
+        ensure_not_paused(&env);
         provider.require_auth();
         if amount <= 0 {
             panic_with_error!(&env, ContractError::InvalidAmount);
@@ -273,6 +290,7 @@ impl InsurancePool {
     /// Burns `shares` and pays the provider their pro-rata value from unreserved assets.
     /// Returns the amount paid out.
     pub fn withdraw_capital(env: Env, provider: Address, shares: i128) -> i128 {
+        ensure_not_paused(&env);
         provider.require_auth();
         if shares <= 0 {
             panic_with_error!(&env, ContractError::InvalidAmount);
@@ -305,6 +323,7 @@ impl InsurancePool {
     /// Buys coverage for `asset_id` up to `coverage`. The premium is paid to the pool.
     /// Returns the policy id.
     pub fn buy_policy(env: Env, lender: Address, asset_id: u64, coverage: i128) -> u64 {
+        ensure_not_paused(&env);
         lender.require_auth();
         if coverage <= 0 {
             panic_with_error!(&env, ContractError::InvalidAmount);
@@ -348,6 +367,7 @@ impl InsurancePool {
 
     /// Files a claim against a policy. Only the policy holder can file, and only before expiry.
     pub fn file_claim(env: Env, lender: Address, policy_id: u64, amount: i128) -> u64 {
+        ensure_not_paused(&env);
         lender.require_auth();
         if amount <= 0 {
             panic_with_error!(&env, ContractError::InvalidAmount);
@@ -449,6 +469,28 @@ impl InsurancePool {
         env.events()
             .publish((symbol_short!("ins_pay"),), (claim_id, payout));
         payout
+    }
+
+    /// Halts filing, policy purchases and withdrawals. Settlement stays open so the admin can
+    /// still resolve pending claims during an incident. Admin only.
+    pub fn pause(env: Env, admin: Address) {
+        require_stored_admin(&env, &admin);
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events()
+            .publish((symbol_short!("ins_pau"),), (admin, env.ledger().timestamp()));
+    }
+
+    /// Resumes filing, policy purchases and withdrawals. Admin only.
+    pub fn unpause(env: Env, admin: Address) {
+        require_stored_admin(&env, &admin);
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events()
+            .publish((symbol_short!("ins_unp"),), (admin, env.ledger().timestamp()));
+    }
+
+    /// Returns whether the pool is paused.
+    pub fn is_paused(env: Env) -> bool {
+        is_paused(&env)
     }
 
     /// Returns a provider's share balance.
