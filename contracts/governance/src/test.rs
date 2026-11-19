@@ -13,6 +13,7 @@ fn config() -> GovernanceConfig {
         quorum_bps: 2_000,
         approval_threshold_bps: 5_000,
         min_proposal_shares: 10,
+        execution_delay_secs: 0,
     }
 }
 
@@ -445,6 +446,54 @@ fn funding_execution_debits_treasury_ledger_and_emits_recipient() {
     assert_eq!(
         ctx.client.get_proposal(&id).status,
         ProposalStatus::Executed
+    );
+}
+
+#[test]
+fn execution_waits_for_delay_after_finalization() {
+    const DELAY: u64 = 500;
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = T0);
+    let admin = Address::generate(&env);
+    let id_contract = env.register(Governance, ());
+    let client = GovernanceClient::new(&env, &id_contract);
+    let mut cfg = config();
+    cfg.execution_delay_secs = DELAY;
+    client.initialize(&admin, &cfg);
+    let ctx = Ctx {
+        env: &env,
+        client,
+        admin,
+    };
+
+    let a = holder(&ctx, 100);
+    let id = ctx
+        .client
+        .create_proposal(&a, &title(&env), &param_kind(25));
+    ctx.client.vote(&a, &id, &true);
+    at(&env, T0 + PERIOD);
+    assert_eq!(ctx.client.finalize_proposal(&id), ProposalStatus::Passed);
+    assert_eq!(ctx.client.get_proposal(&id).finalized_at, T0 + PERIOD);
+
+    // Early execution is rejected and leaves the parameter untouched.
+    assert_eq!(
+        ctx.client.try_execute_proposal(&id),
+        Err(Ok(contract_err(ContractError::ExecutionDelayActive)))
+    );
+    at(&env, T0 + PERIOD + DELAY - 1);
+    assert_eq!(
+        ctx.client.try_execute_proposal(&id),
+        Err(Ok(contract_err(ContractError::ExecutionDelayActive)))
+    );
+    assert_eq!(ctx.client.get_parameter(&symbol_short!("FEE_BPS")), None);
+
+    // Once the delay has elapsed, execution succeeds.
+    at(&env, T0 + PERIOD + DELAY);
+    ctx.client.execute_proposal(&id);
+    assert_eq!(
+        ctx.client.get_parameter(&symbol_short!("FEE_BPS")),
+        Some(25)
     );
 }
 

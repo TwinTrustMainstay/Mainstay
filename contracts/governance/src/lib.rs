@@ -11,7 +11,8 @@
 //!   and voted again.
 //! * **Outcome**: a proposal passes when turnout meets `quorum_bps` of the share
 //!   supply at creation and `approval_threshold_bps` of votes cast are in favour.
-//! * **Execution**: a passed proposal can be executed once. Parameter changes are
+//! * **Execution**: a passed proposal can be executed once, and only after
+//!   `execution_delay_secs` has elapsed since it was finalized. Parameter changes are
 //!   written to the on-chain parameter store. Funding grants are debited from the
 //!   treasury budget ledger and emit a `GOV_FUND` event carrying the recipient and
 //!   amount.
@@ -99,6 +100,8 @@ pub enum ContractError {
     UnknownParameter = 18,
     /// Parameter value is outside the bounds defined in the schema.
     ParameterOutOfRange = 19,
+    /// The execution delay after finalization has not elapsed.
+    ExecutionDelayActive = 20,
 }
 
 #[contracttype]
@@ -112,6 +115,9 @@ pub struct GovernanceConfig {
     pub approval_threshold_bps: u32,
     /// Minimum shares a holder must own to create a proposal.
     pub min_proposal_shares: u64,
+    /// Seconds between a proposal being finalized as `Passed` and when it may be
+    /// executed. `0` disables the delay. Gives holders a window to react.
+    pub execution_delay_secs: u64,
 }
 
 #[contracttype]
@@ -153,6 +159,8 @@ pub struct Proposal {
     pub status: ProposalStatus,
     /// Timestamp at which the proposal was executed. `0` if not yet executed.
     pub executed_at: u64,
+    /// Timestamp at which the outcome was recorded by `finalize_proposal`. `0` until finalized.
+    pub finalized_at: u64,
 }
 
 #[contracttype]
@@ -404,6 +412,7 @@ impl Governance {
             votes_against: 0,
             status: ProposalStatus::Active,
             executed_at: 0,
+            finalized_at: 0,
         };
         store_proposal(&env, &proposal);
         env.events()
@@ -506,6 +515,7 @@ impl Governance {
             config.quorum_bps,
             config.approval_threshold_bps,
         );
+        proposal.finalized_at = env.ledger().timestamp();
         store_proposal(&env, &proposal);
         env.events()
             .publish((FINALIZE_TOPIC, proposal_id), (proposal.status,));
@@ -518,6 +528,7 @@ impl Governance {
     /// - [`ContractError::ProposalNotFound`] if the proposal does not exist
     /// - [`ContractError::AlreadyExecuted`] if already executed
     /// - [`ContractError::ProposalNotPassed`] if the proposal has not passed
+    /// - [`ContractError::ExecutionDelayActive`] if `execution_delay_secs` has not elapsed since finalization
     /// - [`ContractError::InsufficientBudget`] if a funding grant exceeds the treasury balance
     /// - [`ContractError::UnknownParameter`] / [`ContractError::ParameterOutOfRange`] if a
     ///   parameter change fails schema validation (re-checked at execution)
@@ -531,6 +542,13 @@ impl Governance {
         }
         if proposal.status != ProposalStatus::Passed {
             panic_with_error!(&env, ContractError::ProposalNotPassed);
+        }
+        let config = load_config(&env);
+        let earliest = proposal
+            .finalized_at
+            .saturating_add(config.execution_delay_secs);
+        if env.ledger().timestamp() < earliest {
+            panic_with_error!(&env, ContractError::ExecutionDelayActive);
         }
         match proposal.kind.clone() {
             ProposalKind::Parameter(name, value) => {
