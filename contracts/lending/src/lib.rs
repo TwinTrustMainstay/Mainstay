@@ -83,6 +83,16 @@ pub enum ContractError {
     InsuranceAlreadyRegistered = 33,
     /// Insurance coverage must be greater than zero.
     ZeroInsuranceCoverage = 34,
+    /// A syndicate already exists for this loan (#1865).
+    SyndicateAlreadyExists = 35,
+    /// The lenders and shares lists have different lengths (#1865).
+    SyndicateLengthMismatch = 36,
+    /// Quorum must be between 1 and the number of lenders (#1865).
+    InvalidQuorum = 37,
+    /// Every syndicate share must be non-zero (#1865).
+    ZeroSyndicateShare = 38,
+    /// Suspension period is invalid (shared error mapping).
+    InvalidSuspensionPeriod = 39,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -95,6 +105,7 @@ impl From<SharedContractError> for ContractError {
             SharedContractError::TimelockNotExpired => ContractError::TimelockNotExpired,
             SharedContractError::ProposalNotFound => ContractError::ProposalNotFound,
             SharedContractError::PendingAdminAlreadyExists => ContractError::AlreadyInitialized,
+            SharedContractError::InvalidSuspensionPeriod => ContractError::InvalidSuspensionPeriod,
         }
     }
 }
@@ -244,8 +255,6 @@ pub enum DataKey {
     /// Lien records indexed by asset_id.
     Liens(u64),
 }
-
-use shared::{TTL_THRESHOLD, TTL_TARGET};
 
 /// Default yield rate numerator: 2% = 200 / 10_000.
 const DEFAULT_YIELD_NUMERATOR: u64 = 200;
@@ -419,22 +428,6 @@ fn require_restructure_caller(env: &Env, caller: &Address, loan_id: u64) {
     panic_with_error!(env, ContractError::UnauthorizedLender);
 }
 
-/// A lien record representing a claim against an asset by a lender.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LienRecord {
-    pub lender: Address,
-    pub loan_id: u64,
-    pub amount: u64,
-}
-
-/// Storage key variants for indexed lookups.
-#[contracttype]
-pub enum DataKey {
-    /// Maps an asset_id to its list of lien records.
-    Liens(u64),
-}
-
 fn liens_key(asset_id: u64) -> DataKey {
     DataKey::Liens(asset_id)
 }
@@ -473,7 +466,7 @@ fn release_lien_internal(env: &Env, asset_id: u64, loan_id: u64) {
             env.storage().persistent().remove(&key);
         } else {
             env.storage().persistent().set(&key, &liens);
-            extend_persistent_ttl(env, &key);
+            extend_persistent_ttl(env, key.clone());
         }
     }
 
@@ -1292,7 +1285,7 @@ impl LendingContract {
             amount,
         });
         env.storage().persistent().set(&key, &liens);
-        extend_persistent_ttl(&env, &key);
+        extend_persistent_ttl(&env, key.clone());
 
         // #995: Write loan→asset_id mapping so slash can release the lien.
         let la_key = loan_asset_key(loan_id);
@@ -1344,7 +1337,7 @@ impl LendingContract {
                     env.storage().persistent().remove(&key);
                 } else {
                     env.storage().persistent().set(&key, &liens);
-                    extend_persistent_ttl(&env, &key);
+                    extend_persistent_ttl(&env, key.clone());
                 }
                 if env
                     .storage()
@@ -1473,16 +1466,28 @@ impl LendingContract {
     ) {
         require_admin(&env, &admin);
 
+        // #1865: never overwrite a live syndicate.
+        if env.storage().persistent().has(&syndicate_key(loan_id)) {
+            panic_with_error!(&env, ContractError::SyndicateAlreadyExists);
+        }
+
         // Validate lenders and shares match
         if lenders.len() != shares.len() {
-            panic_with_error!(&env, ContractError::InvalidAdminAddress);
+            panic_with_error!(&env, ContractError::SyndicateLengthMismatch);
         }
 
         // Calculate total shares
         let mut total_shares: u64 = 0;
         for share in shares.iter() {
-            total_shares = total_shares.checked_add(*share)
+            if share == 0 {
+                panic_with_error!(&env, ContractError::ZeroSyndicateShare);
+            }
+            total_shares = total_shares.checked_add(share)
                 .unwrap_or_else(|| panic_with_error!(&env, ContractError::StakeSummationOverflow));
+        }
+
+        if quorum_required == 0 || quorum_required > lenders.len() {
+            panic_with_error!(&env, ContractError::InvalidQuorum);
         }
 
         let syndicate = Syndicate {
@@ -1512,7 +1517,7 @@ impl LendingContract {
 
         let mut found = false;
         for l in syndicate.lenders.iter() {
-            if l == &lender {
+            if l == lender {
                 found = true;
                 break;
             }
