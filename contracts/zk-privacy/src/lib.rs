@@ -629,11 +629,21 @@ impl ZkPrivacy {
             .get(&DataKey::Collateral(asset_id))
     }
 
-    /// True if a live attestation shows `value >= min_threshold` for the asset.
-    /// The caller must also check `owner` against the asset registry.
-    pub fn is_collateral_adequate(env: Env, asset_id: u64, min_threshold: u64) -> bool {
+    /// True if a live attestation shows `value >= min_threshold` for the asset
+    /// and was made by `owner`. Pass the owner recorded in the asset registry:
+    /// an attestation from any other account is rejected.
+    pub fn is_collateral_adequate(
+        env: Env,
+        asset_id: u64,
+        owner: Address,
+        min_threshold: u64,
+    ) -> bool {
         match Self::get_collateral_attestation(env.clone(), asset_id) {
-            Some(a) => a.threshold >= min_threshold && env.ledger().timestamp() < a.expires_at,
+            Some(a) => {
+                a.owner == owner
+                    && a.threshold >= min_threshold
+                    && env.ledger().timestamp() < a.expires_at
+            }
             None => false,
         }
     }

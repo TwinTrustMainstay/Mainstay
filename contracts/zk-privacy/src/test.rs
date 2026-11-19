@@ -248,10 +248,25 @@ fn collateral_proof_verifies_in_chunks_and_records_owner() {
     assert_eq!(att.owner, owner);
     assert_eq!(att.threshold, 1000);
     assert!(client.get_collateral_session(&7).is_none());
-    assert!(client.is_collateral_adequate(&7, &1000));
-    assert!(client.is_collateral_adequate(&7, &900));
-    assert!(!client.is_collateral_adequate(&7, &1001));
-    assert!(!client.is_collateral_adequate(&8, &1000));
+    assert!(client.is_collateral_adequate(&7, &owner, &1000));
+    assert!(client.is_collateral_adequate(&7, &owner, &900));
+    assert!(!client.is_collateral_adequate(&7, &owner, &1001));
+    assert!(!client.is_collateral_adequate(&8, &owner, &1000));
+}
+
+#[test]
+fn collateral_attestation_rejects_non_owner() {
+    let (env, id, _admin) = setup();
+    let client = ZkPrivacyClient::new(&env, &id);
+    let owner = Address::generate(&env);
+    let other = Address::generate(&env);
+    let r = blinding_from_seed(&env, &seed(&env, 1), b"collateral");
+    let (c, proof) = prove_adequacy(&env, 7, 1500, &r, 1000, &seed(&env, 2)).unwrap();
+    submit_collateral(&env, &client, &other, 7, &c, 1000, &proof).unwrap();
+
+    // The attestation is valid and adequate, but was made by `other`, not the registry owner.
+    assert!(client.is_collateral_adequate(&7, &other, &1000));
+    assert!(!client.is_collateral_adequate(&7, &owner, &1000));
 }
 
 #[test]
@@ -357,7 +372,7 @@ fn collateral_attestation_expires() {
 
     env.ledger()
         .with_mut(|l| l.timestamp += ATTESTATION_TTL_SECS + 1);
-    assert!(!client.is_collateral_adequate(&7, &1000));
+    assert!(!client.is_collateral_adequate(&7, &owner, &1000));
 }
 
 #[test]
