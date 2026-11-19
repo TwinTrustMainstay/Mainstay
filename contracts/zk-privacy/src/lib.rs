@@ -47,6 +47,9 @@ pub const MAX_ROSTER: u32 = 12;
 pub const BITS_PER_TX: u32 = 4;
 /// Collateral attestations are valid for 7 days after finalization.
 pub const ATTESTATION_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// How long an unfinished collateral proof session stays reserved for its owner.
+pub const SESSION_TTL_SECS: u64 = 24 * 60 * 60;
 /// Maximum maintenance record commitments kept per asset.
 pub const MAX_MAINTENANCE_RECORDS: u32 = 50;
 
@@ -69,6 +72,10 @@ pub enum ContractError {
     BitsOutOfOrder = 8,
     /// `finalize_collateral_proof` was called before all bits were verified.
     IncompleteProof = 9,
+    /// An open proof session for the asset belongs to someone else, or has not expired yet.
+    SessionInProgress = 10,
+    /// The caller is not an authorised maintenance submitter.
+    UnauthorizedSubmitter = 11,
 }
 
 #[contracttype]
@@ -140,6 +147,8 @@ pub struct CollateralSession {
     pub bit_commitments: Vec<BytesN<96>>,
     /// Number of leading bits that have been verified.
     pub verified: u32,
+    /// Ledger timestamp when the session was opened.
+    pub started_at: u64,
 }
 
 #[contracttype]
@@ -154,6 +163,8 @@ enum DataKey {
     Maintenance(u64),
     Session(u64),
     Collateral(u64),
+    /// Accounts allowed to submit maintenance proofs, keyed by address.
+    MaintenanceSubmitter(Address),
 }
 
 /// Stored form of the commitment bases, so each call skips hash-to-curve.
@@ -403,16 +414,46 @@ impl ZkPrivacy {
         verify_membership_proof(&env, &bases, asset_id, &record, &neg_roster, &proof)
     }
 
-    /// Stores a verified maintenance record commitment for an asset. Anyone can
-    /// submit: the proof shows the record came from an authorised engineer, but
-    /// not that the asset itself was serviced. Gate calls on the lifecycle
-    /// contract's own checks. Resubmitting a stored record is a no-op.
+    /// Grants or revokes the right to submit maintenance proofs. Admin only.
+    pub fn set_maintenance_submitter(
+        env: Env,
+        admin: Address,
+        submitter: Address,
+        allowed: bool,
+    ) -> Result<(), ContractError> {
+        require_admin(&env, &admin)?;
+        let key = DataKey::MaintenanceSubmitter(submitter);
+        if allowed {
+            env.storage().persistent().set(&key, &true);
+        } else {
+            env.storage().persistent().remove(&key);
+        }
+        Ok(())
+    }
+
+    pub fn is_maintenance_submitter(env: Env, submitter: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MaintenanceSubmitter(submitter))
+            .unwrap_or(false)
+    }
+
+    /// Stores a verified maintenance record commitment for an asset. The
+    /// submitter must be authorised by the admin and must sign the call. The
+    /// proof shows the record came from a registered engineer, but not that the
+    /// asset itself was serviced. Gate calls on the lifecycle contract's own
+    /// checks. Resubmitting a stored record is a no-op.
     pub fn submit_maintenance_proof(
         env: Env,
+        submitter: Address,
         asset_id: u64,
         record: BytesN<96>,
         proof: MembershipProof,
     ) -> Result<(), ContractError> {
+        submitter.require_auth();
+        if !Self::is_maintenance_submitter(env.clone(), submitter) {
+            return Err(ContractError::UnauthorizedSubmitter);
+        }
         let neg_roster = load_roster(&env, DataKey::NegRoster);
         if neg_roster.is_empty() {
             return Err(ContractError::EmptyRoster);
@@ -449,8 +490,9 @@ impl ZkPrivacy {
     }
 
     /// Step 1 of a collateral proof. The asset owner opens a session with the
-    /// commitment and the bit commitments. Nothing is verified yet. Replaces any
-    /// earlier session for the asset.
+    /// commitment and the bit commitments. Nothing is verified yet. An open
+    /// session can only be replaced by its own owner after `SESSION_TTL_SECS`
+    /// has passed; any other caller gets `SessionInProgress`.
     pub fn begin_collateral_proof(
         env: Env,
         owner: Address,
@@ -463,16 +505,26 @@ impl ZkPrivacy {
         if bit_commitments.len() != RANGE_BITS {
             return Err(ContractError::InvalidProof);
         }
+        let key = DataKey::Session(asset_id);
+        let now = env.ledger().timestamp();
+        if let Some(existing) = env.storage().persistent().get::<_, CollateralSession>(&key) {
+            let expired = now >= existing.started_at + SESSION_TTL_SECS;
+            if existing.owner != owner || !expired {
+                return Err(ContractError::SessionInProgress);
+            }
+        }
+        let event_owner = owner.clone();
         let session = CollateralSession {
             owner,
             commitment,
             threshold,
             bit_commitments,
             verified: 0,
+            started_at: now,
         };
-        env.storage()
-            .persistent()
-            .set(&DataKey::Session(asset_id), &session);
+        env.storage().persistent().set(&key, &session);
+        env.events()
+            .publish((symbol_short!("COLL_BEG"), asset_id), event_owner);
         Ok(())
     }
 
@@ -577,11 +629,21 @@ impl ZkPrivacy {
             .get(&DataKey::Collateral(asset_id))
     }
 
-    /// True if a live attestation shows `value >= min_threshold` for the asset.
-    /// The caller must also check `owner` against the asset registry.
-    pub fn is_collateral_adequate(env: Env, asset_id: u64, min_threshold: u64) -> bool {
+    /// True if a live attestation shows `value >= min_threshold` for the asset
+    /// and was made by `owner`. Pass the owner recorded in the asset registry:
+    /// an attestation from any other account is rejected.
+    pub fn is_collateral_adequate(
+        env: Env,
+        asset_id: u64,
+        owner: Address,
+        min_threshold: u64,
+    ) -> bool {
         match Self::get_collateral_attestation(env.clone(), asset_id) {
-            Some(a) => a.threshold >= min_threshold && env.ledger().timestamp() < a.expires_at,
+            Some(a) => {
+                a.owner == owner
+                    && a.threshold >= min_threshold
+                    && env.ledger().timestamp() < a.expires_at
+            }
             None => false,
         }
     }
