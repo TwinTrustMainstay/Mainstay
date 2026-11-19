@@ -433,3 +433,80 @@ fn execute_requires_finalized_pass() {
         Err(Ok(contract_err(ContractError::ProposalNotPassed)))
     );
 }
+
+mod outcome_properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    const MAX_COUNT: u64 = u32::MAX as u64;
+
+    fn bps() -> impl Strategy<Value = u32> {
+        1u32..=10_000
+    }
+
+    proptest! {
+        /// Additional yes votes never turn a Passed proposal into Rejected (or NoQuorum).
+        #[test]
+        fn extra_yes_votes_never_unpass(
+            votes_for in 0..=MAX_COUNT,
+            votes_against in 0..=MAX_COUNT,
+            extra_yes in 0..=MAX_COUNT,
+            total in 0..=MAX_COUNT,
+            quorum_bps in bps(),
+            approval_bps in bps(),
+        ) {
+            let before = outcome(votes_for, votes_against, total, quorum_bps, approval_bps);
+            if before == ProposalStatus::Passed {
+                let after = outcome(
+                    votes_for + extra_yes,
+                    votes_against,
+                    total,
+                    quorum_bps,
+                    approval_bps,
+                );
+                prop_assert_eq!(after, ProposalStatus::Passed);
+            }
+        }
+
+        /// Turnout exactly at `ceil(total * quorum / 10_000)` meets quorum; one vote fewer does not.
+        #[test]
+        fn quorum_holds_exactly_at_boundary(
+            total in 0..=MAX_COUNT,
+            quorum_bps in bps(),
+            approval_bps in bps(),
+        ) {
+            let bps_total = BPS as u128;
+            let needed = ((total as u128) * (quorum_bps as u128)).div_ceil(bps_total).max(1) as u64;
+
+            // All votes in favour, so approval is never the reason for the result.
+            prop_assert_ne!(
+                outcome(needed, 0, total, quorum_bps, approval_bps),
+                ProposalStatus::NoQuorum
+            );
+            if needed > 1 {
+                prop_assert_eq!(
+                    outcome(needed - 1, 0, total, quorum_bps, approval_bps),
+                    ProposalStatus::NoQuorum
+                );
+            }
+        }
+
+        /// With zero total shares, quorum is met by any vote at all and never by none.
+        #[test]
+        fn zero_total_shares(
+            votes_for in 0..=MAX_COUNT,
+            votes_against in 0..=MAX_COUNT,
+            quorum_bps in bps(),
+            approval_bps in bps(),
+        ) {
+            let status = outcome(votes_for, votes_against, 0, quorum_bps, approval_bps);
+            if votes_for + votes_against == 0 {
+                prop_assert_eq!(status, ProposalStatus::NoQuorum);
+            } else {
+                prop_assert!(
+                    status == ProposalStatus::Passed || status == ProposalStatus::Rejected
+                );
+            }
+        }
+    }
+}
