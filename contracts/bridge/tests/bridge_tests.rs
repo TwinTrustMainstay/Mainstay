@@ -1,11 +1,15 @@
 //! Tests for the cross-chain bridge contract (#1743, #1744).
 
-use bridge::{Bridge, BridgeClient, ChainConfig, ReleaseParams, SwapStatus};
+use bridge::{Bridge, BridgeClient, ChainConfig, ContractError, ReleaseParams, SwapStatus};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    vec, Address, Bytes, BytesN, Env, Symbol,
+    vec, Address, Bytes, BytesN, Env, Error, Symbol,
 };
+
+fn is_contract_error<T, C, I>(res: Result<Result<T, C>, Result<Error, I>>, err: ContractError) -> bool {
+    matches!(res, Err(Ok(e)) if e == Error::from_contract_error(err as u32))
+}
 
 const ETH: u32 = 1;
 
@@ -27,6 +31,22 @@ fn eth_config(env: &Env) -> ChainConfig {
         window_secs: 3_600,
         window_cap: 5_000,
         alert_threshold: 4_000,
+        address_len: 42,
+    }
+}
+
+/// A 56-character alphanumeric destination chain with a different address format.
+fn xlm_config(env: &Env) -> ChainConfig {
+    ChainConfig {
+        name: Symbol::new(env, "XLM"),
+        enabled: true,
+        min_amount: 10,
+        max_amount: 1_000,
+        required_confirmations: 1,
+        window_secs: 3_600,
+        window_cap: 5_000,
+        alert_threshold: 4_000,
+        address_len: 56,
     }
 }
 
@@ -99,7 +119,7 @@ fn release(ctx: &Ctx, nonce: u64, recipient: &Address, amount: i128) {
 }
 
 fn dest(ctx: &Ctx) -> Bytes {
-    Bytes::from_slice(&ctx.env, b"0xdeadbeef")
+    Bytes::from_slice(&ctx.env, b"0x00000000000000000000000000000000deadbeef")
 }
 
 // ── Outbound transfers ───────────────────────────────────────
@@ -166,6 +186,62 @@ fn test_bridge_out_rejects_empty_destination() {
         .client
         .try_bridge_out(&user, &ctx.token, &100, &ETH, &empty)
         .is_err());
+}
+
+#[test]
+fn test_bridge_out_rejects_wrong_length_destination_address() {
+    let ctx = setup();
+    let user = Address::generate(&ctx.env);
+    mint(&ctx, &user, 500);
+
+    // One byte short of the 42-byte ETH address format.
+    let short = Bytes::from_slice(&ctx.env, b"0x00000000000000000000000000000000deadbee");
+    let res = ctx
+        .client
+        .try_bridge_out(&user, &ctx.token, &100, &ETH, &short);
+    assert!(is_contract_error(res, ContractError::InvalidDestinationAddress));
+    assert_eq!(balance(&ctx, &user), 500);
+}
+
+#[test]
+fn test_bridge_out_rejects_non_alphanumeric_destination_address() {
+    let ctx = setup();
+    let user = Address::generate(&ctx.env);
+    mint(&ctx, &user, 500);
+
+    // Right length, but contains a space.
+    let bad = Bytes::from_slice(&ctx.env, b"0x0000000000000000000000000000000 deadbeef");
+    let res = ctx
+        .client
+        .try_bridge_out(&user, &ctx.token, &100, &ETH, &bad);
+    assert!(is_contract_error(res, ContractError::InvalidDestinationAddress));
+    assert_eq!(balance(&ctx, &user), 500);
+}
+
+#[test]
+fn test_bridge_out_validates_address_per_destination_chain() {
+    let ctx = setup();
+    ctx.client.add_chain(&ctx.admin, &2, &xlm_config(&ctx.env));
+    let user = Address::generate(&ctx.env);
+    mint(&ctx, &user, 500);
+
+    // The ETH 42-byte format is invalid for the 56-byte XLM chain.
+    let eth_style = Bytes::from_slice(&ctx.env, b"0x00000000000000000000000000000000deadbeef");
+    let res = ctx
+        .client
+        .try_bridge_out(&user, &ctx.token, &100, &2, &eth_style);
+    assert!(is_contract_error(res, ContractError::InvalidDestinationAddress));
+
+    // A 56-byte alphanumeric address is valid on XLM and rejected on ETH.
+    let xlm_style = Bytes::from_slice(
+        &ctx.env,
+        b"GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7",
+    );
+    assert_eq!(ctx.client.bridge_out(&user, &ctx.token, &100, &2, &xlm_style), 1);
+    let res = ctx
+        .client
+        .try_bridge_out(&user, &ctx.token, &100, &ETH, &xlm_style);
+    assert!(is_contract_error(res, ContractError::InvalidDestinationAddress));
 }
 
 #[test]
@@ -545,6 +621,10 @@ fn test_add_chain_rejects_duplicate_and_invalid_config() {
         .client
         .try_add_chain(&ctx.admin, &3, &bad_alert)
         .is_err());
+
+    let mut zero_len = eth_config(&ctx.env);
+    zero_len.address_len = 0;
+    assert!(ctx.client.try_add_chain(&ctx.admin, &4, &zero_len).is_err());
 }
 
 #[test]

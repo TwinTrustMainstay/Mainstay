@@ -76,6 +76,8 @@ pub enum ContractError {
     RelayerAlreadyExists = 23,
     /// Relayer list contains duplicates or is empty.
     InvalidRelayerSet = 24,
+    /// Destination address length or encoding does not match the destination chain.
+    InvalidDestinationAddress = 25,
 }
 
 /// Maximum number of relayers in the set.
@@ -101,6 +103,9 @@ pub struct ChainConfig {
     /// Window outflow level at which a `BR_ALERT` event is emitted.
     /// Must be > 0 and ≤ `window_cap`.
     pub alert_threshold: i128,
+    /// Exact length in bytes of a valid destination address on this chain.
+    /// Must be > 0. Addresses must also be ASCII alphanumeric.
+    pub address_len: u32,
 }
 
 #[contracttype]
@@ -179,8 +184,25 @@ fn validate_chain_config(env: &Env, cfg: &ChainConfig) {
         || cfg.window_cap <= 0
         || cfg.alert_threshold <= 0
         || cfg.alert_threshold > cfg.window_cap
+        || cfg.address_len == 0
     {
         panic_with_error!(env, ContractError::InvalidConfig);
+    }
+}
+
+/// Reject destination addresses that are empty, have the wrong length for the
+/// destination chain, or contain non-alphanumeric bytes.
+fn validate_dest_address(env: &Env, cfg: &ChainConfig, dest_address: &Bytes) {
+    if dest_address.is_empty() {
+        panic_with_error!(env, ContractError::InvalidDestination);
+    }
+    if dest_address.len() != cfg.address_len {
+        panic_with_error!(env, ContractError::InvalidDestinationAddress);
+    }
+    for byte in dest_address.iter() {
+        if !byte.is_ascii_alphanumeric() {
+            panic_with_error!(env, ContractError::InvalidDestinationAddress);
+        }
     }
 }
 
@@ -384,6 +406,7 @@ impl Bridge {
     /// - [`ContractError::ChainNotFound`] / [`ContractError::ChainDisabled`] for an unusable destination
     /// - [`ContractError::AmountOutOfRange`] if `amount` is outside the chain's limits
     /// - [`ContractError::InvalidDestination`] if `dest_address` is empty
+    /// - [`ContractError::InvalidDestinationAddress`] if `dest_address` has the wrong length or encoding for `dest_chain`
     pub fn bridge_out(
         env: Env,
         sender: Address,
@@ -399,9 +422,7 @@ impl Bridge {
             panic_with_error!(&env, ContractError::ChainDisabled);
         }
         ensure_amount_in_range(&env, &cfg, amount);
-        if dest_address.is_empty() {
-            panic_with_error!(&env, ContractError::InvalidDestination);
-        }
+        validate_dest_address(&env, &cfg, &dest_address);
 
         token::Client::new(&env, &token).transfer(
             &sender,
