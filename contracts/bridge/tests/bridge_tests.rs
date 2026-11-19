@@ -7,7 +7,10 @@ use soroban_sdk::{
     vec, Address, Bytes, BytesN, Env, Error, Symbol,
 };
 
-fn is_contract_error<T, C, I>(res: Result<Result<T, C>, Result<Error, I>>, err: ContractError) -> bool {
+fn is_contract_error<T, C, I>(
+    res: Result<Result<T, C>, Result<Error, I>>,
+    err: ContractError,
+) -> bool {
     matches!(res, Err(Ok(e)) if e == Error::from_contract_error(err as u32))
 }
 
@@ -199,7 +202,10 @@ fn test_bridge_out_rejects_wrong_length_destination_address() {
     let res = ctx
         .client
         .try_bridge_out(&user, &ctx.token, &100, &ETH, &short);
-    assert!(is_contract_error(res, ContractError::InvalidDestinationAddress));
+    assert!(is_contract_error(
+        res,
+        ContractError::InvalidDestinationAddress
+    ));
     assert_eq!(balance(&ctx, &user), 500);
 }
 
@@ -214,7 +220,10 @@ fn test_bridge_out_rejects_non_alphanumeric_destination_address() {
     let res = ctx
         .client
         .try_bridge_out(&user, &ctx.token, &100, &ETH, &bad);
-    assert!(is_contract_error(res, ContractError::InvalidDestinationAddress));
+    assert!(is_contract_error(
+        res,
+        ContractError::InvalidDestinationAddress
+    ));
     assert_eq!(balance(&ctx, &user), 500);
 }
 
@@ -230,18 +239,28 @@ fn test_bridge_out_validates_address_per_destination_chain() {
     let res = ctx
         .client
         .try_bridge_out(&user, &ctx.token, &100, &2, &eth_style);
-    assert!(is_contract_error(res, ContractError::InvalidDestinationAddress));
+    assert!(is_contract_error(
+        res,
+        ContractError::InvalidDestinationAddress
+    ));
 
     // A 56-byte alphanumeric address is valid on XLM and rejected on ETH.
     let xlm_style = Bytes::from_slice(
         &ctx.env,
         b"GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7",
     );
-    assert_eq!(ctx.client.bridge_out(&user, &ctx.token, &100, &2, &xlm_style), 1);
+    assert_eq!(
+        ctx.client
+            .bridge_out(&user, &ctx.token, &100, &2, &xlm_style),
+        1
+    );
     let res = ctx
         .client
         .try_bridge_out(&user, &ctx.token, &100, &ETH, &xlm_style);
-    assert!(is_contract_error(res, ContractError::InvalidDestinationAddress));
+    assert!(is_contract_error(
+        res,
+        ContractError::InvalidDestinationAddress
+    ));
 }
 
 #[test]
@@ -539,6 +558,62 @@ fn test_swap_cannot_be_opened_with_past_expiry() {
             &400
         )
         .is_err());
+}
+
+#[test]
+fn test_swap_expiry_capped_by_max_duration() {
+    let ctx = setup();
+    ctx.env.ledger().set_timestamp(1_000);
+    ctx.client.set_max_swap_duration(&ctx.admin, &3_600);
+    assert_eq!(ctx.client.get_max_swap_duration(), 3_600);
+
+    let sender = Address::generate(&ctx.env);
+    mint(&ctx, &sender, 500);
+    let hashlock = BytesN::from_array(&ctx.env, &[9u8; 32]);
+    let recipient = Address::generate(&ctx.env);
+
+    // Exactly at the boundary is accepted.
+    ctx.client.create_swap(
+        &sender,
+        &recipient,
+        &ctx.token,
+        &100,
+        &hashlock,
+        &(1_000 + 3_600),
+    );
+    // One second beyond the boundary is rejected.
+    assert!(ctx
+        .client
+        .try_create_swap(
+            &sender,
+            &recipient,
+            &ctx.token,
+            &100,
+            &hashlock,
+            &(1_000 + 3_601)
+        )
+        .is_err());
+}
+
+#[test]
+fn test_default_max_swap_duration_is_30_days() {
+    let ctx = setup();
+    assert_eq!(ctx.client.get_max_swap_duration(), 30 * 24 * 60 * 60);
+}
+
+#[test]
+fn test_set_max_swap_duration_is_admin_only_and_nonzero() {
+    let ctx = setup();
+    let impostor = Address::generate(&ctx.env);
+    assert!(ctx
+        .client
+        .try_set_max_swap_duration(&impostor, &3_600)
+        .is_err());
+    assert!(ctx
+        .client
+        .try_set_max_swap_duration(&ctx.admin, &0)
+        .is_err());
+    assert_eq!(ctx.client.get_max_swap_duration(), 30 * 24 * 60 * 60);
 }
 
 #[test]

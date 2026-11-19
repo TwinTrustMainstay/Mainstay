@@ -78,10 +78,16 @@ pub enum ContractError {
     InvalidRelayerSet = 24,
     /// Destination address length or encoding does not match the destination chain.
     InvalidDestinationAddress = 25,
+    /// The swap's expiry is further in the future than the configured maximum duration.
+    SwapDurationTooLong = 26,
 }
 
 /// Maximum number of relayers in the set.
 const MAX_RELAYERS: u32 = 20;
+
+/// Default cap on how far in the future a swap expiry may be (30 days).
+/// Used until the admin sets `max_swap_duration_secs`.
+const DEFAULT_MAX_SWAP_DURATION_SECS: u64 = 30 * 24 * 60 * 60;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -175,6 +181,7 @@ pub enum DataKey {
     Pending(u32, u64),
     Window(u32),
     Swap(u64),
+    MaxSwapDuration,
 }
 
 fn validate_chain_config(env: &Env, cfg: &ChainConfig) {
@@ -377,6 +384,28 @@ impl Bridge {
         let key = DataKey::Chain(chain_id);
         env.storage().persistent().set(&key, &config);
         bump(&env, &key);
+    }
+
+    /// Set the maximum number of seconds a swap's expiry may lie beyond the current ledger time.
+    ///
+    /// # Panics
+    /// - [`ContractError::InvalidConfig`] if `max_swap_duration_secs` is 0
+    pub fn set_max_swap_duration(env: Env, admin: Address, max_swap_duration_secs: u64) {
+        require_admin(&env, &admin);
+        if max_swap_duration_secs == 0 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxSwapDuration, &max_swap_duration_secs);
+    }
+
+    /// Maximum allowed swap timelock in seconds (`max_swap_duration_secs`).
+    pub fn get_max_swap_duration(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxSwapDuration)
+            .unwrap_or(DEFAULT_MAX_SWAP_DURATION_SECS)
     }
 
     /// Enable or disable a chain without changing its other constraints.
@@ -585,6 +614,7 @@ impl Bridge {
     /// - [`ContractError::Paused`] if the bridge is paused
     /// - [`ContractError::AmountOutOfRange`] if `amount` is not positive
     /// - [`ContractError::SwapExpired`] if `expiry` is not in the future
+    /// - [`ContractError::SwapDurationTooLong`] if `expiry` is more than `max_swap_duration_secs` ahead
     pub fn create_swap(
         env: Env,
         sender: Address,
@@ -599,8 +629,13 @@ impl Bridge {
         if amount <= 0 {
             panic_with_error!(&env, ContractError::AmountOutOfRange);
         }
-        if expiry <= env.ledger().timestamp() {
+        let now = env.ledger().timestamp();
+        if expiry <= now {
             panic_with_error!(&env, ContractError::SwapExpired);
+        }
+        let max_duration = Self::get_max_swap_duration(env.clone());
+        if expiry - now > max_duration {
+            panic_with_error!(&env, ContractError::SwapDurationTooLong);
         }
 
         token::Client::new(&env, &token).transfer(
