@@ -2,9 +2,10 @@
 
 use bridge::{Bridge, BridgeClient, ChainConfig, ReleaseParams, SwapStatus};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    symbol_short,
+    testutils::{Address as _, Events, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    vec, Address, Bytes, BytesN, Env, Symbol,
+    vec, Address, Bytes, BytesN, Env, IntoVal, Symbol, Val, Vec,
 };
 
 const ETH: u32 = 1;
@@ -446,6 +447,26 @@ fn test_swap_refund_only_after_expiry() {
 }
 
 #[test]
+fn test_swap_refund_emits_sender_token_and_amount() {
+    let ctx = setup();
+    let preimage = Bytes::from_slice(&ctx.env, b"secret");
+    let (id, sender, _) = open_swap(&ctx, &preimage, 1_000);
+
+    ctx.env.ledger().set_timestamp(1_000);
+    ctx.client.refund_swap(&id);
+
+    // BR_SWP_R is published after the payout transfer, so it is the last event.
+    let (contract, topics, data) = ctx.env.events().all().last().unwrap();
+    assert_eq!(contract, ctx.client.address);
+    assert_eq!(
+        topics,
+        vec![&ctx.env, symbol_short!("BR_SWP_R").into_val(&ctx.env)]
+    );
+    let emitted: (u64, Address, Address, i128) = data.into_val(&ctx.env);
+    assert_eq!(emitted, (id, sender, ctx.token.clone(), 200_i128));
+}
+
+#[test]
 fn test_swap_cannot_be_opened_with_past_expiry() {
     let ctx = setup();
     ctx.env.ledger().set_timestamp(500);
@@ -563,4 +584,175 @@ fn test_set_relayers_validates_threshold_and_duplicates() {
         .client
         .try_set_relayers(&ctx.admin, &vec![&ctx.env, a.clone(), a.clone()], &1)
         .is_err());
+}
+
+#[test]
+fn test_initialize_requires_admin_authorization() {
+    let env = Env::default();
+    let contract_id = env.register(Bridge, ());
+    let client = BridgeClient::new(&env, &contract_id);
+
+    // No auth is mocked, so the admin never signed the initialize call.
+    let admin = Address::generate(&env);
+    assert!(client.try_initialize(&admin).is_err());
+}
+
+// ── Admin and configuration events ───────────────────────────
+
+/// Topic and payload of the most recent event emitted by the bridge.
+fn last_event(ctx: &Ctx) -> (Vec<Val>, Val) {
+    let (_, topics, data) = ctx.env.events().all().last().unwrap();
+    (topics, data)
+}
+
+#[test]
+fn test_pause_and_unpause_emit_admin_events() {
+    let ctx = setup();
+
+    ctx.client.pause(&ctx.admin);
+    let (topics, data) = last_event(&ctx);
+    assert_eq!(
+        topics,
+        vec![&ctx.env, symbol_short!("BR_PAUSE").into_val(&ctx.env)]
+    );
+    let (who,): (Address,) = data.into_val(&ctx.env);
+    assert_eq!(who, ctx.admin);
+
+    ctx.client.unpause(&ctx.admin);
+    let (topics, data) = last_event(&ctx);
+    assert_eq!(
+        topics,
+        vec![&ctx.env, symbol_short!("BR_RESUME").into_val(&ctx.env)]
+    );
+    let (who,): (Address,) = data.into_val(&ctx.env);
+    assert_eq!(who, ctx.admin);
+}
+
+#[test]
+fn test_set_relayers_emits_threshold_and_relayer_set() {
+    let ctx = setup();
+    let fresh = [Address::generate(&ctx.env), Address::generate(&ctx.env)];
+    let new_set = vec![&ctx.env, fresh[0].clone(), fresh[1].clone()];
+
+    ctx.client.set_relayers(&ctx.admin, &new_set, &1);
+
+    let (topics, data) = last_event(&ctx);
+    assert_eq!(
+        topics,
+        vec![&ctx.env, symbol_short!("BR_RELAYS").into_val(&ctx.env)]
+    );
+    let emitted: (Address, u32, Vec<Address>) = data.into_val(&ctx.env);
+    assert_eq!(emitted, (ctx.admin.clone(), 1, new_set));
+}
+
+#[test]
+fn test_add_update_and_enable_chain_emit_events() {
+    let ctx = setup();
+    let base_cfg = eth_config(&ctx.env);
+
+    let mut new_cfg = eth_config(&ctx.env);
+    new_cfg.name = Symbol::new(&ctx.env, "POLY");
+    ctx.client.add_chain(&ctx.admin, &2, &new_cfg);
+    let (topics, data) = last_event(&ctx);
+    assert_eq!(
+        topics,
+        vec![&ctx.env, symbol_short!("BR_CH_ADD").into_val(&ctx.env)]
+    );
+    let emitted: (Address, u32, ChainConfig) = data.into_val(&ctx.env);
+    assert_eq!(emitted, (ctx.admin.clone(), 2, new_cfg.clone()));
+
+    let mut updated = base_cfg.clone();
+    updated.max_amount = 2_000;
+    ctx.client.update_chain(&ctx.admin, &ETH, &updated);
+    let (topics, data) = last_event(&ctx);
+    assert_eq!(
+        topics,
+        vec![&ctx.env, symbol_short!("BR_CH_UPD").into_val(&ctx.env)]
+    );
+    let emitted: (Address, u32, ChainConfig) = data.into_val(&ctx.env);
+    assert_eq!(emitted, (ctx.admin.clone(), ETH, updated));
+
+    ctx.client.set_chain_enabled(&ctx.admin, &ETH, &false);
+    let (topics, data) = last_event(&ctx);
+    assert_eq!(
+        topics,
+        vec![&ctx.env, symbol_short!("BR_CH_ENB").into_val(&ctx.env)]
+    );
+    let emitted: (Address, u32, bool) = data.into_val(&ctx.env);
+    assert_eq!(emitted, (ctx.admin.clone(), ETH, false));
+}
+
+// ── Relayer-observed confirmations ───────────────────────────
+
+fn attest_with_confirmations(
+    ctx: &Ctx,
+    relayer: &Address,
+    nonce: u64,
+    recipient: &Address,
+    amount: i128,
+    confirmations: u32,
+) {
+    ctx.client.attest_release(
+        relayer,
+        &ETH,
+        &nonce,
+        &ReleaseParams {
+            token: ctx.token.clone(),
+            recipient: recipient.clone(),
+            amount,
+            confirmations,
+        },
+    );
+}
+
+#[test]
+fn test_disagreeing_confirmations_are_stored_per_relayer() {
+    let ctx = setup();
+    let recipient = Address::generate(&ctx.env);
+    // The release pays out of the bridge's own balance, so fund it first.
+    mint(&ctx, &ctx.client.address, 100);
+
+    attest_with_confirmations(&ctx, &ctx.relayers[0], 7, &recipient, 100, 12);
+    // Stays pending until the threshold is reached, so the record is readable.
+    let pending = ctx.client.get_release(&ETH, &7).unwrap();
+    assert_eq!(pending.confirmations, vec![&ctx.env, 12]);
+    assert!(!pending.executed);
+
+    attest_with_confirmations(&ctx, &ctx.relayers[1], 7, &recipient, 100, 30);
+
+    let pending = ctx.client.get_release(&ETH, &7).unwrap();
+    assert_eq!(pending.approvals.len(), 2);
+    assert_eq!(pending.confirmations, vec![&ctx.env, 12, 30]);
+    assert!(pending.executed);
+    assert_eq!(balance(&ctx, &recipient), 100);
+}
+
+#[test]
+fn test_attestation_below_requirement_does_not_count_toward_threshold() {
+    let ctx = setup();
+    let recipient = Address::generate(&ctx.env);
+    mint(&ctx, &ctx.client.address, 100);
+
+    // Relayer 0 reports 12, which meets the requirement. Relayer 1 reports 11,
+    // which is below it, so its attestation is refused outright.
+    attest_with_confirmations(&ctx, &ctx.relayers[0], 8, &recipient, 100, 12);
+    assert!(ctx
+        .client
+        .try_attest_release(
+            &ctx.relayers[1],
+            &ETH,
+            &8,
+            &ReleaseParams {
+                token: ctx.token.clone(),
+                recipient: recipient.clone(),
+                amount: 100,
+                confirmations: 11,
+            },
+        )
+        .is_err());
+
+    let pending = ctx.client.get_release(&ETH, &8).unwrap();
+    assert_eq!(pending.approvals.len(), 1);
+    assert!(!pending.executed);
+    assert_eq!(balance(&ctx, &recipient), 0);
 }
