@@ -148,6 +148,7 @@ const VOTE_TOPIC: Symbol = symbol_short!("GOV_VOTE");
 const FINALIZE_TOPIC: Symbol = symbol_short!("GOV_FIN");
 const EXECUTE_TOPIC: Symbol = symbol_short!("GOV_EXEC");
 const MINT_TOPIC: Symbol = symbol_short!("GOV_MINT");
+const TRANSFER_TOPIC: Symbol = symbol_short!("GOV_XFER");
 
 fn require_admin_auth(env: &Env, admin: &Address) {
     let stored: Address = env
@@ -312,6 +313,7 @@ impl Governance {
         }
         set_balance(&env, &from, from_balance - amount);
         set_balance(&env, &to, balance_of(&env, &to) + amount);
+        env.events().publish((TRANSFER_TOPIC,), (from, to, amount));
     }
 
     /// Create a proposal. The proposer must hold at least `min_proposal_shares`.

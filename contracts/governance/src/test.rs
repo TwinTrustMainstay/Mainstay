@@ -1,5 +1,8 @@
 use super::*;
-use soroban_sdk::{symbol_short, testutils::Address as _, testutils::Ledger, Address, Env, String};
+use soroban_sdk::{
+    symbol_short, testutils::Address as _, testutils::Events, testutils::Ledger, Address, Env,
+    IntoVal, String,
+};
 
 const T0: u64 = 10_000;
 const PERIOD: u64 = 1_000;
@@ -82,6 +85,25 @@ fn non_admin_cannot_mint_or_fund() {
         ctx.client.try_fund_treasury(&other, &5),
         Err(Ok(contract_err(ContractError::UnauthorizedAdmin)))
     );
+}
+
+#[test]
+fn transfer_emits_from_to_amount_event() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let a = holder(&ctx, 100);
+    let b = Address::generate(&env);
+
+    ctx.client.transfer_shares(&a, &b, &40);
+
+    let events = env.events().all();
+    let (_contract, topics, data) = events.last().unwrap();
+    assert_eq!(
+        topics,
+        soroban_sdk::Vec::from_array(&env, [TRANSFER_TOPIC.into_val(&env)])
+    );
+    let payload: (Address, Address, u64) = data.into_val(&env);
+    assert_eq!(payload, (a, b, 40u64));
 }
 
 #[test]
