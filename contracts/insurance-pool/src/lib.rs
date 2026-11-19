@@ -395,6 +395,10 @@ impl InsurancePool {
 
     /// Approves or rejects a pending claim. Admin only.
     ///
+    /// Settlement rule: a claim filed on or before `expires_at` may be settled at any later
+    /// time. There is no settlement deadline. A claim filed after expiry cannot exist, so
+    /// settlement rejects any claim whose `filed_at` falls outside the policy term.
+    ///
     /// Approval pays `min(claim amount, pool assets)`. The payout comes off the policy's
     /// remaining coverage, and the claim's reservation is released.
     pub fn settle_claim(env: Env, admin: Address, claim_id: u64, approve: bool) -> i128 {
@@ -402,6 +406,10 @@ impl InsurancePool {
         let mut claim = load_claim(&env, claim_id);
         if claim.status != ClaimStatus::Pending {
             panic_with_error!(&env, ContractError::ClaimNotPending);
+        }
+        let policy = load_policy(&env, claim.policy_id);
+        if claim.filed_at > policy.expires_at {
+            panic_with_error!(&env, ContractError::PolicyExpired);
         }
 
         let mut stats = load_stats(&env);
@@ -427,7 +435,7 @@ impl InsurancePool {
         stats.claims_paid += 1;
         save_stats(&env, &stats);
 
-        let mut policy = load_policy(&env, claim.policy_id);
+        let mut policy = policy;
         policy.remaining_coverage -= payout;
         save_policy(&env, &policy);
 

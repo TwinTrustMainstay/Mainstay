@@ -313,3 +313,34 @@ fn settled_claims_leave_only_unpaid_pending_exposure() {
     // Paid claim reduced coverage to 600 and nothing is pending, so a 600 claim fits.
     ctx.client.file_claim(&lender, &policy_id, &600);
 }
+
+#[test]
+fn claim_filed_at_expiry_boundary_settles_after_expiry() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let provider = funded(&env, &ctx, 10_000);
+    ctx.client.provide_capital(&provider, &5_000);
+    let lender = funded(&env, &ctx, 10_000);
+    let policy_id = ctx.client.buy_policy(&lender, &7, &1_000);
+    let expires_at = ctx.client.get_policy(&policy_id).expires_at;
+
+    // Filing at exactly expires_at is still inside the term.
+    env.ledger().with_mut(|l| l.timestamp = expires_at);
+    let claim_id = ctx.client.file_claim(&lender, &policy_id, &400);
+
+    // Settlement after expiry is allowed for a claim filed in time.
+    env.ledger().with_mut(|l| l.timestamp = expires_at + 10_000);
+    assert_eq!(ctx.client.settle_claim(&ctx.admin, &claim_id, &true), 400);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn claim_filed_one_second_after_expiry_cannot_be_filed() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let lender = funded(&env, &ctx, 10_000);
+    let policy_id = ctx.client.buy_policy(&lender, &7, &1_000);
+    let expires_at = ctx.client.get_policy(&policy_id).expires_at;
+    env.ledger().with_mut(|l| l.timestamp = expires_at + 1);
+    ctx.client.file_claim(&lender, &policy_id, &100);
+}
