@@ -74,6 +74,8 @@ pub enum ContractError {
     IncompleteProof = 9,
     /// An open proof session for the asset belongs to someone else, or has not expired yet.
     SessionInProgress = 10,
+    /// The caller is not an authorised maintenance submitter.
+    UnauthorizedSubmitter = 11,
 }
 
 #[contracttype]
@@ -161,6 +163,8 @@ enum DataKey {
     Maintenance(u64),
     Session(u64),
     Collateral(u64),
+    /// Accounts allowed to submit maintenance proofs, keyed by address.
+    MaintenanceSubmitter(Address),
 }
 
 /// Stored form of the commitment bases, so each call skips hash-to-curve.
@@ -410,16 +414,46 @@ impl ZkPrivacy {
         verify_membership_proof(&env, &bases, asset_id, &record, &neg_roster, &proof)
     }
 
-    /// Stores a verified maintenance record commitment for an asset. Anyone can
-    /// submit: the proof shows the record came from an authorised engineer, but
-    /// not that the asset itself was serviced. Gate calls on the lifecycle
-    /// contract's own checks. Resubmitting a stored record is a no-op.
+    /// Grants or revokes the right to submit maintenance proofs. Admin only.
+    pub fn set_maintenance_submitter(
+        env: Env,
+        admin: Address,
+        submitter: Address,
+        allowed: bool,
+    ) -> Result<(), ContractError> {
+        require_admin(&env, &admin)?;
+        let key = DataKey::MaintenanceSubmitter(submitter);
+        if allowed {
+            env.storage().persistent().set(&key, &true);
+        } else {
+            env.storage().persistent().remove(&key);
+        }
+        Ok(())
+    }
+
+    pub fn is_maintenance_submitter(env: Env, submitter: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MaintenanceSubmitter(submitter))
+            .unwrap_or(false)
+    }
+
+    /// Stores a verified maintenance record commitment for an asset. The
+    /// submitter must be authorised by the admin and must sign the call. The
+    /// proof shows the record came from a registered engineer, but not that the
+    /// asset itself was serviced. Gate calls on the lifecycle contract's own
+    /// checks. Resubmitting a stored record is a no-op.
     pub fn submit_maintenance_proof(
         env: Env,
+        submitter: Address,
         asset_id: u64,
         record: BytesN<96>,
         proof: MembershipProof,
     ) -> Result<(), ContractError> {
+        submitter.require_auth();
+        if !Self::is_maintenance_submitter(env.clone(), submitter) {
+            return Err(ContractError::UnauthorizedSubmitter);
+        }
         let neg_roster = load_roster(&env, DataKey::NegRoster);
         if neg_roster.is_empty() {
             return Err(ContractError::EmptyRoster);

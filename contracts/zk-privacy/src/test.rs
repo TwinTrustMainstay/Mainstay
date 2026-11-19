@@ -115,11 +115,13 @@ fn maintenance_proof_hides_engineer_and_stores_record() {
     );
 
     assert!(client.verify_membership(&9, &record, &proof));
-    client.submit_maintenance_proof(&9, &record, &proof);
+    let submitter = Address::generate(&env);
+    client.set_maintenance_submitter(&admin, &submitter, &true);
+    client.submit_maintenance_proof(&submitter, &9, &record, &proof);
     assert_eq!(client.get_maintenance_records(&9).len(), 1);
 
     // Resubmitting the same record does not duplicate it.
-    client.submit_maintenance_proof(&9, &record, &proof);
+    client.submit_maintenance_proof(&submitter, &9, &record, &proof);
     assert_eq!(client.get_maintenance_records(&9).len(), 1);
 }
 
@@ -149,8 +151,10 @@ fn membership_proof_fails_for_unregistered_engineer_or_wrong_asset() {
         &seed(&env, 6),
     );
     assert!(!client.verify_membership(&9, &stranger, &bogus));
+    let submitter = Address::generate(&env);
+    client.set_maintenance_submitter(&admin, &submitter, &true);
     assert_eq!(
-        client.try_submit_maintenance_proof(&9, &stranger, &bogus),
+        client.try_submit_maintenance_proof(&submitter, &9, &stranger, &bogus),
         Err(Ok(ContractError::InvalidProof))
     );
 
@@ -173,15 +177,60 @@ fn membership_proof_fails_for_unregistered_engineer_or_wrong_asset() {
 
 #[test]
 fn maintenance_submission_requires_a_roster() {
-    let (env, id, _admin) = setup();
+    let (env, id, admin) = setup();
     let client = ZkPrivacyClient::new(&env, &id);
+    let submitter = Address::generate(&env);
+    client.set_maintenance_submitter(&admin, &submitter, &true);
     let record = commit_value(&env, 1, &blinding_from_seed(&env, &seed(&env, 1), b"x"));
     let proof = MembershipProof {
         branches: Vec::new(&env),
     };
     assert_eq!(
-        client.try_submit_maintenance_proof(&1, &record, &proof),
+        client.try_submit_maintenance_proof(&submitter, &1, &record, &proof),
         Err(Ok(ContractError::EmptyRoster))
+    );
+}
+
+#[test]
+fn maintenance_submission_rejects_unauthorised_caller() {
+    let (env, id, admin) = setup();
+    let client = ZkPrivacyClient::new(&env, &id);
+    let engineer = blinding_from_seed(&env, &seed(&env, 10), b"eng-11");
+    client.register_roster_commitment(&admin, &commit_value(&env, 11, &engineer));
+    let roster = client.get_roster();
+
+    let rec_blind = blinding_from_seed(&env, &seed(&env, 4), b"rec-1");
+    let record = commit_value(&env, 11, &rec_blind);
+    let proof = prove_membership(
+        &env,
+        9,
+        &record,
+        &roster,
+        0,
+        &rec_blind,
+        &engineer,
+        &seed(&env, 5),
+    );
+    let stranger = Address::generate(&env);
+
+    // A valid proof from an account that is not authorised is rejected.
+    assert_eq!(
+        client.try_submit_maintenance_proof(&stranger, &9, &record, &proof),
+        Err(Ok(ContractError::UnauthorizedSubmitter))
+    );
+    assert_eq!(client.get_maintenance_records(&9).len(), 0);
+
+    // Granting then revoking access toggles the outcome.
+    client.set_maintenance_submitter(&admin, &stranger, &true);
+    assert!(client.is_maintenance_submitter(&stranger));
+    client.submit_maintenance_proof(&stranger, &9, &record, &proof);
+    assert_eq!(client.get_maintenance_records(&9).len(), 1);
+
+    client.set_maintenance_submitter(&admin, &stranger, &false);
+    assert!(!client.is_maintenance_submitter(&stranger));
+    assert_eq!(
+        client.try_submit_maintenance_proof(&stranger, &9, &record, &proof),
+        Err(Ok(ContractError::UnauthorizedSubmitter))
     );
 }
 
@@ -412,8 +461,7 @@ fn open_collateral_session_cannot_be_overwritten_by_another_party() {
     );
 
     // After expiry, the same owner may restart the session.
-    env.ledger()
-        .with_mut(|l| l.timestamp += SESSION_TTL_SECS);
+    env.ledger().with_mut(|l| l.timestamp += SESSION_TTL_SECS);
     client
         .try_begin_collateral_proof(&owner, &7, &c, &1000, &proof.bit_commitments)
         .unwrap()
@@ -436,7 +484,11 @@ fn beginning_collateral_proof_emits_session_event() {
     assert_eq!(contract, id);
     assert_eq!(
         topics,
-        soroban_sdk::vec![&env, symbol_short!("COLL_BEG").into_val(&env), 7u64.into_val(&env)]
+        soroban_sdk::vec![
+            &env,
+            symbol_short!("COLL_BEG").into_val(&env),
+            7u64.into_val(&env)
+        ]
     );
     assert_eq!(Address::try_from_val(&env, &data).unwrap(), owner);
 }
