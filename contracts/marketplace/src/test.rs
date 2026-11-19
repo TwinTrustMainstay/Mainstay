@@ -1,7 +1,7 @@
 use super::*;
 use soroban_sdk::{
-    contracttype, symbol_short, testutils::Address as _, testutils::Ledger, Address, BytesN, Env,
-    String,
+    contracttype, symbol_short, testutils::Address as _, testutils::Events as _, testutils::Ledger,
+    Address, BytesN, Env, String, TryFromVal,
 };
 
 /// Stand-in for the engineer registry: per-address credential status and reputation.
@@ -732,4 +732,32 @@ fn open_auction_tie_goes_to_first_placed_bid() {
     at(&env, BID_END + 1);
     ctx.client.finalize_auction(&id);
     assert_eq!(ctx.client.get_auction(&id).winner, Some(first));
+}
+
+// ---------- Pricing configuration event (#1941) ----------
+
+#[test]
+fn update_pricing_config_emits_old_and_new_config() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let old = pricing();
+    let new = PricingConfig {
+        base_price: 2_000,
+        ..pricing()
+    };
+    ctx.client.update_pricing_config(&ctx.admin, &new);
+
+    let events = env.events().all();
+    let found = events.iter().any(|(contract, topics, data)| {
+        if contract != ctx.client.address {
+            return false;
+        }
+        let topic_ok = topics.len() == 1
+            && Symbol::try_from_val(&env, &topics.get(0).unwrap()) == Ok(symbol_short!("PRC_CFG"));
+        let payload_ok = <(PricingConfig, PricingConfig)>::try_from_val(&env, &data)
+            .map(|(o, n)| o == old && n == new)
+            .unwrap_or(false);
+        topic_ok && payload_ok
+    });
+    assert!(found, "expected a PRC_CFG event carrying (old, new)");
 }

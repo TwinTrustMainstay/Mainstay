@@ -147,6 +147,7 @@ pub trait EngineerRegistry {
 }
 
 const PRICE_UPDATE_TOPIC: Symbol = symbol_short!("PRC_UPD");
+const PRICING_CONFIG_TOPIC: Symbol = symbol_short!("PRC_CFG");
 const AUCTION_NEW_TOPIC: Symbol = symbol_short!("AUC_NEW");
 const BID_TOPIC: Symbol = symbol_short!("AUC_BID");
 const COMMIT_TOPIC: Symbol = symbol_short!("AUC_COMM");
@@ -303,6 +304,9 @@ impl Marketplace {
 
     /// Admin-only: replace the pricing configuration. Existing history is kept.
     ///
+    /// Publishes a `PRC_CFG` event whose data is `(old, new)` so off-chain price
+    /// consumers can detect the change.
+    ///
     /// # Panics
     /// - [`ContractError::UnauthorizedAdmin`] if `admin` is not the stored admin
     /// - [`ContractError::InvalidPricingConfig`] if `pricing` is inconsistent
@@ -311,7 +315,10 @@ impl Marketplace {
         if !pricing::is_valid_config(&pricing) {
             panic_with_error!(&env, ContractError::InvalidPricingConfig);
         }
+        let old = load_pricing(&env);
         env.storage().instance().set(&DataKey::Pricing, &pricing);
+        env.events()
+            .publish((PRICING_CONFIG_TOPIC,), (old, pricing));
     }
 
     /// Admin-only: record the current supply (available engineers) and demand
