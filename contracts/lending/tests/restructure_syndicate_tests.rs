@@ -193,3 +193,107 @@ fn slash_allowed_when_restructure_only_proposed() {
         lending::LoanStatus::Defaulted
     );
 }
+
+// ── #1864: syndicate votes are recorded, de-duplicated, tallied and enforced ──
+
+fn syndicate_setup(
+    env: &Env,
+    client: &LendingContractClient,
+    admin: &Address,
+    loan_id: u64,
+    lenders: &[Address],
+    quorum: u32,
+) {
+    let mut members = soroban_sdk::Vec::new(env);
+    let mut shares = soroban_sdk::Vec::new(env);
+    for l in lenders {
+        members.push_back(l.clone());
+        shares.push_back(1u64);
+    }
+    client.create_syndicate(admin, &loan_id, &members, &shares, &quorum);
+}
+
+#[test]
+fn syndicate_vote_is_recorded_and_tallied() {
+    let env = Env::default();
+    let (contract_id, admin, _token) = setup(&env);
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    let (_borrower, loan_id) = active_loan(&env, &client, 1_000);
+    let l1 = Address::generate(&env);
+    let l2 = Address::generate(&env);
+    let l3 = Address::generate(&env);
+    syndicate_setup(&env, &client, &admin, loan_id, &[l1.clone(), l2.clone(), l3.clone()], 2);
+    let action = soroban_sdk::symbol_short!("RESTRUCT");
+
+    client.syndicate_vote(&l1, &loan_id, &action, &true);
+    client.syndicate_vote(&l2, &loan_id, &action, &false);
+    client.syndicate_vote(&l3, &loan_id, &action, &true);
+
+    // Only approving votes are tallied; the rejection is recorded but not counted.
+    assert_eq!(client.get_syndicate_approvals(&loan_id, &action), 2);
+}
+
+#[test]
+fn syndicate_lender_cannot_vote_twice() {
+    let env = Env::default();
+    let (contract_id, admin, _token) = setup(&env);
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    let (_borrower, loan_id) = active_loan(&env, &client, 1_000);
+    let l1 = Address::generate(&env);
+    syndicate_setup(&env, &client, &admin, loan_id, &[l1.clone()], 1);
+    let action = soroban_sdk::symbol_short!("RESTRUCT");
+
+    client.syndicate_vote(&l1, &loan_id, &action, &true);
+    assert!(client.try_syndicate_vote(&l1, &loan_id, &action, &true).is_err());
+    assert!(client.try_syndicate_vote(&l1, &loan_id, &action, &false).is_err());
+
+    assert_eq!(client.get_syndicate_approvals(&loan_id, &action), 1);
+}
+
+#[test]
+fn non_member_cannot_vote_in_syndicate() {
+    let env = Env::default();
+    let (contract_id, admin, _token) = setup(&env);
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    let (_borrower, loan_id) = active_loan(&env, &client, 1_000);
+    let l1 = Address::generate(&env);
+    let outsider = Address::generate(&env);
+    syndicate_setup(&env, &client, &admin, loan_id, &[l1], 1);
+    let action = soroban_sdk::symbol_short!("RESTRUCT");
+
+    assert!(client
+        .try_syndicate_vote(&outsider, &loan_id, &action, &true)
+        .is_err());
+    assert_eq!(client.get_syndicate_approvals(&loan_id, &action), 0);
+}
+
+#[test]
+fn restructure_blocked_until_syndicate_quorum_reached() {
+    let env = Env::default();
+    let (contract_id, admin, _token) = setup(&env);
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    let (borrower, loan_id) = active_loan(&env, &client, 1_000);
+    let l1 = Address::generate(&env);
+    let l2 = Address::generate(&env);
+    let l3 = Address::generate(&env);
+    syndicate_setup(&env, &client, &admin, loan_id, &[l1.clone(), l2.clone(), l3.clone()], 2);
+    let action = soroban_sdk::symbol_short!("RESTRUCT");
+
+    let new_deadline = env.ledger().timestamp() + 10_000;
+    client.propose_loan_restructure(&borrower, &loan_id, &new_deadline, &600);
+
+    // One approval and one rejection: quorum of 2 not reached.
+    client.syndicate_vote(&l1, &loan_id, &action, &true);
+    client.syndicate_vote(&l2, &loan_id, &action, &false);
+    assert!(client.try_accept_restructure(&l1, &loan_id).is_err());
+
+    // A second approval reaches quorum; a member can now accept.
+    client.syndicate_vote(&l3, &loan_id, &action, &true);
+    assert_eq!(client.get_syndicate_approvals(&loan_id, &action), 2);
+    client.accept_restructure(&l1, &loan_id);
+    assert_eq!(client.get_loan(&borrower).unwrap().deadline, new_deadline);
+}

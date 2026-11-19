@@ -93,6 +93,34 @@ pub enum ContractError {
     RestructureLoanMismatch = 38,
     /// The loan is inside an accepted restructure's forbearance period and cannot be slashed.
     InForbearance = 39,
+    /// This lender has already voted on this action for this loan.
+    AlreadyVoted = 40,
+    /// The syndicate has not reached its quorum of approving votes.
+    QuorumNotReached = 41,
+}
+
+/// Syndicate action symbol used when a restructure must be approved by the syndicate.
+const RESTRUCTURE_ACTION: Symbol = symbol_short!("RESTRUCT");
+
+fn syndicate_vote_key(loan_id: u64, action: &Symbol, lender: &Address) -> (Symbol, u64, Symbol, Address) {
+    (symbol_short!("SVOTE"), loan_id, action.clone(), lender.clone())
+}
+
+/// Counts the approving votes cast for `action` on `loan_id` by the syndicate's lenders.
+fn count_syndicate_approvals(env: &Env, syndicate: &Syndicate, action: &Symbol) -> u32 {
+    let mut approvals: u32 = 0;
+    for lender in syndicate.lenders.iter() {
+        if let Some(vote) = env
+            .storage()
+            .persistent()
+            .get::<_, SyndicateVote>(&syndicate_vote_key(syndicate.loan_id, action, &lender))
+        {
+            if vote.voted {
+                approvals += 1;
+            }
+        }
+    }
+    approvals
 }
 
 impl From<SharedContractError> for ContractError {
@@ -1526,6 +1554,12 @@ impl LendingContract {
             panic_with_error!(&env, ContractError::NotSyndicateLender);
         }
 
+        // #1864: each lender may vote once per action per loan.
+        let key = syndicate_vote_key(loan_id, &action, &lender);
+        if env.storage().persistent().has(&key) {
+            panic_with_error!(&env, ContractError::AlreadyVoted);
+        }
+
         let vote_record = SyndicateVote {
             lender,
             loan_id,
@@ -1533,7 +1567,23 @@ impl LendingContract {
             voted: vote,
         };
 
+        env.storage().persistent().set(&key, &vote_record);
+        extend_persistent_ttl(&env, key.clone());
+
         env.events().publish((SYNDICATE_VOTED,), (loan_id, vote));
+    }
+
+    /// Returns the number of approving votes for `action` on `loan_id`.
+    /// Returns 0 when the loan has no syndicate.
+    pub fn get_syndicate_approvals(env: Env, loan_id: u64, action: Symbol) -> u32 {
+        match env
+            .storage()
+            .persistent()
+            .get::<_, Syndicate>(&syndicate_key(loan_id))
+        {
+            Some(syndicate) => count_syndicate_approvals(&env, &syndicate, &action),
+            None => 0,
+        }
     }
 
     /// Get syndicate details for a loan.
@@ -1603,6 +1653,18 @@ impl LendingContract {
             .persistent()
             .get(&restructure_key(loan_id))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::RestructureNotFound));
+
+        // #1864: a syndicated loan's restructure needs the syndicate's quorum of approvals.
+        if let Some(syndicate) = env
+            .storage()
+            .persistent()
+            .get::<_, Syndicate>(&syndicate_key(loan_id))
+        {
+            let approvals = count_syndicate_approvals(&env, &syndicate, &RESTRUCTURE_ACTION);
+            if approvals < syndicate.quorum_required {
+                panic_with_error!(&env, ContractError::QuorumNotReached);
+            }
+        }
 
         // #1861: A proposal may be accepted once; replaying it would re-extend
         // the deadline and burn restructure slots.
