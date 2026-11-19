@@ -149,6 +149,7 @@ const FINALIZE_TOPIC: Symbol = symbol_short!("GOV_FIN");
 const EXECUTE_TOPIC: Symbol = symbol_short!("GOV_EXEC");
 const MINT_TOPIC: Symbol = symbol_short!("GOV_MINT");
 const TRANSFER_TOPIC: Symbol = symbol_short!("GOV_XFER");
+const FUND_TOPIC: Symbol = symbol_short!("GOV_FUND");
 
 fn require_admin_auth(env: &Env, admin: &Address) {
     let stored: Address = env
@@ -529,6 +530,7 @@ impl Governance {
         env.storage()
             .instance()
             .set(&DataKey::Treasury, &(treasury + amount));
+        env.events().publish((FUND_TOPIC,), (admin, amount));
     }
 
     /// Get a proposal by id.

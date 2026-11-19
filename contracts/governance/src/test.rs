@@ -107,6 +107,23 @@ fn transfer_emits_from_to_amount_event() {
 }
 
 #[test]
+fn fund_treasury_emits_funder_and_amount_event() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    ctx.client.fund_treasury(&ctx.admin, &500);
+
+    let events = env.events().all();
+    let (_contract, topics, data) = events.last().unwrap();
+    assert_eq!(
+        topics,
+        soroban_sdk::Vec::from_array(&env, [FUND_TOPIC.into_val(&env)])
+    );
+    let payload: (Address, u64) = data.into_val(&env);
+    assert_eq!(payload, (ctx.admin.clone(), 500u64));
+}
+
+#[test]
 fn invalid_config_is_rejected() {
     let env = Env::default();
     env.mock_all_auths();
