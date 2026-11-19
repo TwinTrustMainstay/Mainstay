@@ -1178,6 +1178,8 @@ impl Lifecycle {
             let key = attestor_auth_key(asset_id, &attestor);
             env.storage().persistent().set(&key, &true);
             extend_persistent_ttl(&env, &key);
+            env.events()
+                .publish((symbol_short!("ATTST_ON"), asset_id), attestor);
         }
 
         /// Record an attestation from an owner-authorized independent party.
@@ -9138,6 +9140,7 @@ mod tests {
     mod dispute_auth_tests;
     mod snapshot_auth_tests;
     mod snapshot_event_tests;
+    mod attestor_event_tests;
 
     fn setup<'a>(
         env: &'a Env,
