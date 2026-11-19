@@ -130,6 +130,7 @@ enum DataKey {
     Auction(u64),
     Bids(u64),
     Commit(u64, Address),
+    CommitCount(u64),
 }
 
 /// Minimal client for the engineer registry. Only the methods used here are declared.
@@ -503,6 +504,8 @@ impl Marketplace {
     /// - [`ContractError::BiddingClosed`] if `bid_end` has passed
     /// - [`ContractError::NotCredentialed`] if the engineer has no valid credential
     /// - [`ContractError::AlreadyBid`] if the engineer already committed
+    /// - [`ContractError::BidLimitReached`] if the auction already holds
+    ///   [`MAX_BIDS_PER_AUCTION`] commitments
     pub fn commit_bid(env: Env, engineer: Address, auction_id: u64, commitment: BytesN<32>) {
         engineer.require_auth();
         let auction = load_auction(&env, auction_id);
@@ -521,6 +524,15 @@ impl Marketplace {
         if env.storage().persistent().has(&key) {
             panic_with_error!(&env, ContractError::AlreadyBid);
         }
+        let count_key = DataKey::CommitCount(auction_id);
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        if count >= MAX_BIDS_PER_AUCTION {
+            panic_with_error!(&env, ContractError::BidLimitReached);
+        }
+        env.storage().persistent().set(&count_key, &(count + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&count_key, shared::TTL_THRESHOLD, shared::TTL_TARGET);
         env.storage().persistent().set(&key, &commitment);
         env.storage()
             .persistent()

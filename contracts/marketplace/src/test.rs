@@ -563,3 +563,26 @@ fn only_admin_can_create_auctions() {
         Err(Ok(contract_err(ContractError::UnauthorizedAdmin)))
     );
 }
+
+// ---------- Commitment cap per auction (#1934) ----------
+
+#[test]
+fn commit_bid_rejects_commitments_beyond_the_cap() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
+    let salt = BytesN::from_array(&env, &[3u8; 32]);
+    let filler = commitment(&env, id, &ctx.admin, 1_000, &salt);
+    for _ in 0..MAX_BIDS_PER_AUCTION {
+        let e = engineer(&ctx, CredentialStatus::Valid, 0);
+        ctx.client.commit_bid(&e, &id, &filler);
+    }
+
+    let overflow = engineer(&ctx, CredentialStatus::Valid, 0);
+    assert_eq!(
+        ctx.client.try_commit_bid(&overflow, &id, &filler),
+        Err(Ok(contract_err(ContractError::BidLimitReached)))
+    );
+}
