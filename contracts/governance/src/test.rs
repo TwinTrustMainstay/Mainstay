@@ -498,6 +498,55 @@ fn execution_waits_for_delay_after_finalization() {
 }
 
 #[test]
+fn config_proposal_updates_governance_settings() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let a = holder(&ctx, 100);
+    let mut next = config();
+    next.voting_period_secs = 2 * PERIOD;
+    next.quorum_bps = 5_000;
+    next.approval_threshold_bps = 6_000;
+    next.execution_delay_secs = 77;
+
+    let id = ctx
+        .client
+        .create_proposal(&a, &title(&env), &ProposalKind::Config(next.clone()));
+    ctx.client.vote(&a, &id, &true);
+    at(&env, T0 + PERIOD);
+    assert_eq!(ctx.client.finalize_proposal(&id), ProposalStatus::Passed);
+    ctx.client.execute_proposal(&id);
+
+    assert_eq!(ctx.client.get_config(), next);
+}
+
+#[test]
+fn config_proposal_rejects_invalid_settings() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let a = holder(&ctx, 100);
+
+    let mut zero_period = config();
+    zero_period.voting_period_secs = 0;
+    assert_eq!(
+        ctx.client
+            .try_create_proposal(&a, &title(&env), &ProposalKind::Config(zero_period)),
+        Err(Ok(contract_err(ContractError::InvalidConfig)))
+    );
+
+    let mut over_quorum = config();
+    over_quorum.quorum_bps = 10_001;
+    assert_eq!(
+        ctx.client
+            .try_create_proposal(&a, &title(&env), &ProposalKind::Config(over_quorum)),
+        Err(Ok(contract_err(ContractError::InvalidConfig)))
+    );
+
+    // Rejected proposals do not change the stored configuration.
+    assert_eq!(ctx.client.get_config(), config());
+    assert_eq!(ctx.client.get_proposal_count(), 0);
+}
+
+#[test]
 fn execute_requires_finalized_pass() {
     let env = Env::default();
     let ctx = setup(&env);

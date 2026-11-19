@@ -104,6 +104,19 @@ pub enum ContractError {
     ExecutionDelayActive = 20,
 }
 
+/// Rejects governance settings that are out of range. Shared by `initialize`,
+/// proposal creation and execution of a `ProposalKind::Config` proposal.
+fn validate_config(env: &Env, config: &GovernanceConfig) {
+    if config.voting_period_secs == 0
+        || config.quorum_bps == 0
+        || config.quorum_bps as u64 > BPS
+        || config.approval_threshold_bps == 0
+        || config.approval_threshold_bps as u64 > BPS
+    {
+        panic_with_error!(env, ContractError::InvalidConfig);
+    }
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GovernanceConfig {
@@ -125,6 +138,9 @@ pub struct GovernanceConfig {
 pub enum ProposalKind {
     /// Set a platform parameter to a new value.
     Parameter(Symbol, u64),
+    /// Replace the governance configuration (voting period, quorum, approval
+    /// threshold, proposal minimum, execution delay). Passed by vote like any other proposal.
+    Config(GovernanceConfig),
     /// Grant `amount` from the treasury budget to `recipient`. Accounting only: the
     /// budget ledger is debited and a `GOV_FUND` event is emitted. No tokens move
     /// on-chain.
@@ -296,14 +312,7 @@ impl Governance {
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, ContractError::AlreadyInitialized);
         }
-        if config.voting_period_secs == 0
-            || config.quorum_bps == 0
-            || config.quorum_bps as u64 > BPS
-            || config.approval_threshold_bps == 0
-            || config.approval_threshold_bps as u64 > BPS
-        {
-            panic_with_error!(&env, ContractError::InvalidConfig);
-        }
+        validate_config(&env, &config);
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().set(&DataKey::TotalShares, &0u64);
@@ -370,6 +379,7 @@ impl Governance {
     /// - [`ContractError::InsufficientShares`] if the proposer is below the minimum (or holds none)
     /// - [`ContractError::InvalidProposal`] if the title is empty or longer than [`MAX_TITLE_LEN`],
     ///   or a funding amount is zero
+    /// - [`ContractError::InvalidConfig`] if a `Config` proposal carries an out-of-range setting
     /// - [`ContractError::UnknownParameter`] if a parameter name is not in [`GOVERNABLE_PARAMS`]
     /// - [`ContractError::ParameterOutOfRange`] if a parameter value is outside its bounds
     pub fn create_proposal(env: Env, proposer: Address, title: String, kind: ProposalKind) -> u64 {
@@ -383,6 +393,7 @@ impl Governance {
             panic_with_error!(&env, ContractError::InvalidProposal);
         }
         match &kind {
+            ProposalKind::Config(new_config) => validate_config(&env, new_config),
             ProposalKind::Funding(_, 0) => {
                 panic_with_error!(&env, ContractError::InvalidProposal);
             }
@@ -551,6 +562,10 @@ impl Governance {
             panic_with_error!(&env, ContractError::ExecutionDelayActive);
         }
         match proposal.kind.clone() {
+            ProposalKind::Config(new_config) => {
+                validate_config(&env, &new_config);
+                env.storage().instance().set(&DataKey::Config, &new_config);
+            }
             ProposalKind::Parameter(name, value) => {
                 validate_parameter(&env, &name, value);
                 env.storage()
