@@ -2,9 +2,9 @@
 
 use bridge::{Bridge, BridgeClient, ChainConfig, ReleaseParams, SwapStatus};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils::{Address as _, Events, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    vec, Address, Bytes, BytesN, Env, Symbol,
+    symbol_short, vec, Address, Bytes, BytesN, Env, IntoVal, Symbol,
 };
 
 const ETH: u32 = 1;
@@ -443,6 +443,26 @@ fn test_swap_refund_only_after_expiry() {
     assert_eq!(ctx.client.get_swap(&id).status, SwapStatus::Refunded);
     // A refunded swap can no longer be claimed
     assert!(ctx.client.try_claim_swap(&id, &preimage).is_err());
+}
+
+#[test]
+fn test_swap_refund_emits_sender_token_and_amount() {
+    let ctx = setup();
+    let preimage = Bytes::from_slice(&ctx.env, b"secret");
+    let (id, sender, _) = open_swap(&ctx, &preimage, 1_000);
+
+    ctx.env.ledger().set_timestamp(1_000);
+    ctx.client.refund_swap(&id);
+
+    // BR_SWP_R is published after the payout transfer, so it is the last event.
+    let (contract, topics, data) = ctx.env.events().all().last().unwrap();
+    assert_eq!(contract, ctx.client.address);
+    assert_eq!(
+        topics,
+        vec![&ctx.env, symbol_short!("BR_SWP_R").into_val(&ctx.env)]
+    );
+    let emitted: (u64, Address, Address, i128) = data.into_val(&ctx.env);
+    assert_eq!(emitted, (id, sender, ctx.token.clone(), 200_i128));
 }
 
 #[test]

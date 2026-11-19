@@ -662,6 +662,7 @@ impl Bridge {
 
     /// Refund an open swap to its sender after the timelock has passed.
     /// Anyone may trigger the refund; funds always go back to the sender.
+    /// Emits `BR_SWP_R` with `(swap_id, sender, token, amount)`.
     ///
     /// # Panics
     /// - [`ContractError::SwapNotFound`] if the swap does not exist
@@ -690,8 +691,10 @@ impl Bridge {
             &swap.sender,
             &swap.amount,
         );
-        env.events()
-            .publish((symbol_short!("BR_SWP_R"),), (swap_id,));
+        env.events().publish(
+            (symbol_short!("BR_SWP_R"),),
+            (swap_id, swap.sender.clone(), swap.token.clone(), swap.amount),
+        );
     }
 
     /// Get a swap by ID.

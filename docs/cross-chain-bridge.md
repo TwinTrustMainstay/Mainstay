@@ -29,7 +29,7 @@ here. It needs its own toolchain and audit, so it should be a separate change.
 | `BR_ALERT` | `(source_chain, window_outflow, window_cap)` |
 | `BR_SWP_N` | `(swap_id, sender, hashlock, expiry, amount)` |
 | `BR_SWP_C` | `(swap_id, preimage)` |
-| `BR_SWP_R` | `(swap_id)` |
+| `BR_SWP_R` | `(swap_id, sender, token, amount)` |
 
 ## Errors
 

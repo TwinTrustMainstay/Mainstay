@@ -13,10 +13,11 @@ This reference guide provides a comprehensive overview of all smart contract eve
 3. [EngineerRegistry Contract Events](#engineerregistry-contract-events)
 4. [Lifecycle Contract Events](#lifecycle-contract-events)
 5. [Lending Contract Events](#lending-contract-events)
-6. [Parsing Event Data](#parsing-event-data)
+6. [Bridge Contract Events](#bridge-contract-events)
+7. [Parsing Event Data](#parsing-event-data)
    - [TypeScript Parsing Example](#typescript-parsing-example)
    - [Rust Event Parsing Example](#rust-event-parsing-example)
-7. [Subscription & Indexing Strategies](#subscription--indexing-strategies)
+8. [Subscription & Indexing Strategies](#subscription--indexing-strategies)
 
 ---
 
@@ -279,6 +280,17 @@ Emitted when a defaulted loan is slashed by admin after missing deadline.
 - **Data**: `(borrower: Address, slashed_amount: u64)`
 - **Emission Conditions**: Called inside `slash`.
 - **Use Cases**: Initiate collateral liquidation flow; penalize defaulting borrower rating.
+
+---
+
+## Bridge Contract Events
+
+The bridge contract (`contracts/bridge`) publishes its full event set in
+[cross-chain-bridge.md](cross-chain-bridge.md#events). Swap refunds emit:
+
+| Topic | Payload | Description |
+|---|---|---|
+| `BR_SWP_R` | `(swap_id, sender, token, amount)` | An expired, unclaimed swap was refunded to `sender` |
 
 ---
 
