@@ -43,6 +43,8 @@ pub enum ContractError {
     NotListed = 9,
     /// The owner cannot buy their own NFT.
     CannotBuyOwnToken = 10,
+    /// An NFT cannot be transferred to its current owner.
+    SelfTransfer = 11,
 }
 
 #[contracttype]
@@ -215,6 +217,9 @@ impl AssetNft {
         let mut token = load_token(&env, token_id);
         if token.owner != from {
             panic_with_error!(&env, ContractError::NotTokenOwner);
+        }
+        if from == to {
+            panic_with_error!(&env, ContractError::SelfTransfer);
         }
         if env.storage().persistent().has(&DataKey::Listing(token_id)) {
             panic_with_error!(&env, ContractError::TokenListed);

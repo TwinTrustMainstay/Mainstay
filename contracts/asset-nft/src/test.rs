@@ -107,6 +107,16 @@ fn transfer_by_non_owner_is_rejected() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn transfer_to_current_owner_is_rejected() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let alice = Address::generate(&env);
+    let token_id = ctx.client.mint(&ctx.admin, &7, &alice, &uri(&env));
+    ctx.client.transfer(&alice, &alice, &token_id);
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #8)")]
 fn listed_nft_cannot_be_transferred() {
     let env = Env::default();
