@@ -217,7 +217,27 @@ fn elasticity_reflects_demand_response_to_price() {
     at(&env, T0 + 61);
     // Demand doubles and price rises 10%: elasticity = +100% / +10% = 10x.
     ctx.client.record_market_state(&ctx.admin, &10, &20);
-    assert_eq!(ctx.client.get_price_elasticity(), 100_000);
+    assert_eq!(ctx.client.get_price_elasticity(), Some(100_000));
+}
+
+#[test]
+fn elasticity_is_none_when_prior_demand_is_zero() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    // Zero prior demand: elasticity is undefined, not a neutral zero.
+    ctx.client.record_market_state(&ctx.admin, &10, &0);
+    at(&env, T0 + 61);
+    ctx.client.record_market_state(&ctx.admin, &10, &5);
+    assert_eq!(ctx.client.get_price_elasticity(), None);
+}
+
+#[test]
+fn elasticity_is_none_with_fewer_than_two_observations() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    assert_eq!(ctx.client.get_price_elasticity(), None);
+    ctx.client.record_market_state(&ctx.admin, &10, &10);
+    assert_eq!(ctx.client.get_price_elasticity(), None);
 }
 
 #[test]

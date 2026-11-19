@@ -363,13 +363,14 @@ impl Marketplace {
 
     /// Estimated price elasticity of demand between the last two observations, in bps.
     ///
-    /// Negative means demand fell as price rose. Returns `0` when fewer than two
-    /// observations exist or the estimate is undefined.
-    pub fn get_price_elasticity(env: Env) -> i64 {
+    /// Negative means demand fell as price rose. Returns `None` when fewer than two
+    /// observations exist or the estimate is undefined (for example, prior demand or
+    /// price was zero). `Some(0)` is a real measurement of zero elasticity.
+    pub fn get_price_elasticity(env: Env) -> Option<i64> {
         let history = load_history(&env);
         let len = history.len();
         if len < 2 {
-            return 0;
+            return None;
         }
         let prev = history.get(len - 2).unwrap();
         let curr = history.get(len - 1).unwrap();

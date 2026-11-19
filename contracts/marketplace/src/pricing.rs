@@ -64,18 +64,22 @@ pub fn price_for(base_price: u64, multiplier_bps: u32) -> u64 {
 /// Estimated price elasticity of demand between two observations, in bps.
 ///
 /// Computed as `%change in demand / %change in price`. A negative value means
-/// demand falls as price rises. Returns `0` when the estimate is undefined
-/// (previous demand or price was zero, or the price did not change).
-pub fn elasticity_bps(prev: &MarketState, curr: &MarketState) -> i64 {
+/// demand falls as price rises.
+///
+/// Returns `None` when the estimate is undefined: the previous demand or price
+/// was zero (no percentage change can be taken from a zero base), or the price
+/// did not change. `None` is deliberately distinct from `Some(0)`, which means
+/// demand is genuinely unresponsive to price.
+pub fn elasticity_bps(prev: &MarketState, curr: &MarketState) -> Option<i64> {
     if prev.demand == 0 || prev.price == 0 {
-        return 0;
+        return None;
     }
     let pct_demand = (curr.demand as i128 - prev.demand as i128) * BPS / prev.demand as i128;
     let pct_price = (curr.price as i128 - prev.price as i128) * BPS / prev.price as i128;
     if pct_price == 0 {
-        return 0;
+        return None;
     }
-    (pct_demand * BPS / pct_price).clamp(i64::MIN as i128, i64::MAX as i128) as i64
+    Some((pct_demand * BPS / pct_price).clamp(i64::MIN as i128, i64::MAX as i128) as i64)
 }
 
 #[cfg(test)]
@@ -164,11 +168,11 @@ mod tests {
             price: 1_200,
         };
         // %demand = -20%, %price = +20% -> elasticity = -1.0 = -10_000 bps.
-        assert_eq!(elasticity_bps(&a, &b), -10_000);
+        assert_eq!(elasticity_bps(&a, &b), Some(-10_000));
     }
 
     #[test]
-    fn elasticity_undefined_cases_return_zero() {
+    fn elasticity_undefined_cases_return_none() {
         let a = MarketState {
             timestamp: 0,
             supply: 10,
@@ -183,7 +187,7 @@ mod tests {
             multiplier_bps: 12_000,
             price: 1_200,
         };
-        assert_eq!(elasticity_bps(&a, &b), 0);
+        assert_eq!(elasticity_bps(&a, &b), None);
         let c = MarketState {
             timestamp: 1,
             supply: 10,
@@ -198,6 +202,27 @@ mod tests {
             multiplier_bps: 10_000,
             price: 1_000,
         };
-        assert_eq!(elasticity_bps(&d, &c), 0);
+        assert_eq!(elasticity_bps(&d, &c), None);
+    }
+
+    #[test]
+    fn zero_demand_is_not_reported_as_zero_elasticity() {
+        // Prior demand of zero must yield `None`, not a neutral `Some(0)`.
+        let prev = MarketState {
+            timestamp: 0,
+            supply: 10,
+            demand: 0,
+            multiplier_bps: 10_000,
+            price: 1_000,
+        };
+        let curr = MarketState {
+            timestamp: 1,
+            supply: 10,
+            demand: 5,
+            multiplier_bps: 12_000,
+            price: 1_200,
+        };
+        assert_eq!(elasticity_bps(&prev, &curr), None);
+        assert_ne!(elasticity_bps(&prev, &curr), Some(0));
     }
 }
