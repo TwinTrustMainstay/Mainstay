@@ -278,11 +278,13 @@ impl AssetNft {
             &key,
             &Listing {
                 token_id,
-                seller: owner,
+                seller: owner.clone(),
                 price,
             },
         );
         extend_persistent_ttl(&env, key);
+        env.events()
+            .publish((symbol_short!("nft_list"),), (token_id, owner, price));
     }
 
     /// Removes an active listing. Owner only.
@@ -296,6 +298,8 @@ impl AssetNft {
         env.storage()
             .persistent()
             .remove(&DataKey::Listing(token_id));
+        env.events()
+            .publish((symbol_short!("nft_unlst"),), (token_id, owner));
     }
 
     /// Buys a listed NFT. The price is paid to the seller and ownership transfers to the buyer.
