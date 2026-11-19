@@ -19,7 +19,7 @@ mod pricing;
 use shared::require_admin;
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error,
-    symbol_short, Address, BytesN, Env, String, Symbol, Vec,
+    symbol_short, token, Address, BytesN, Env, String, Symbol, Vec,
 };
 
 pub use auction::{
@@ -76,6 +76,12 @@ pub enum ContractError {
     AuctionModeMismatch = 21,
     /// The auction already has the maximum number of bids.
     BidLimitReached = 22,
+    /// No bid deposit has been configured, so commitments cannot be taken.
+    DepositNotConfigured = 23,
+    /// Bid deposit amount must be positive.
+    InvalidDepositConfig = 24,
+    /// The forfeited deposit pool can only be claimed after the reveal window.
+    ForfeitWindowOpen = 25,
 }
 
 /// Credential status as reported by the engineer registry. Variants must match
@@ -131,6 +137,25 @@ enum DataKey {
     Bids(u64),
     Commit(u64, Address),
     CommitCount(u64),
+    BidDeposit,
+    Deposit(u64, Address),
+    DepositPool(u64),
+}
+
+/// Deposit every commitment must lock. Refunded on reveal, forfeited otherwise.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DepositConfig {
+    pub token: Address,
+    pub amount: i128,
+}
+
+/// Unrefunded deposits held for one auction.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DepositPool {
+    pub token: Address,
+    pub held: i128,
 }
 
 /// Minimal client for the engineer registry. Only the methods used here are declared.
@@ -153,6 +178,7 @@ const REVEAL_TOPIC: Symbol = symbol_short!("AUC_REV");
 const FINALIZE_TOPIC: Symbol = symbol_short!("AUC_FIN");
 const DISPUTE_TOPIC: Symbol = symbol_short!("AUC_DISP");
 const RESOLVE_TOPIC: Symbol = symbol_short!("AUC_RSLV");
+const FORFEIT_TOPIC: Symbol = symbol_short!("AUC_FORF");
 
 fn require_admin_auth(env: &Env, admin: &Address) {
     let stored: Address = env
@@ -215,6 +241,62 @@ fn store_bids(env: &Env, auction_id: u64, bids: &Vec<Bid>) {
     env.storage()
         .persistent()
         .extend_ttl(&key, shared::TTL_THRESHOLD, shared::TTL_TARGET);
+}
+
+/// Locks the configured bid deposit from `engineer` into the contract.
+fn take_deposit(env: &Env, auction_id: u64, engineer: &Address) {
+    let config: DepositConfig = env
+        .storage()
+        .instance()
+        .get(&DataKey::BidDeposit)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::DepositNotConfigured));
+    token::Client::new(env, &config.token).transfer(
+        engineer,
+        &env.current_contract_address(),
+        &config.amount,
+    );
+    let key = DataKey::Deposit(auction_id, engineer.clone());
+    env.storage().persistent().set(&key, &config.amount);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, shared::TTL_THRESHOLD, shared::TTL_TARGET);
+
+    let pool_key = DataKey::DepositPool(auction_id);
+    let mut pool = env
+        .storage()
+        .persistent()
+        .get::<_, DepositPool>(&pool_key)
+        .unwrap_or(DepositPool {
+            token: config.token.clone(),
+            held: 0,
+        });
+    pool.held += config.amount;
+    env.storage().persistent().set(&pool_key, &pool);
+    env.storage()
+        .persistent()
+        .extend_ttl(&pool_key, shared::TTL_THRESHOLD, shared::TTL_TARGET);
+}
+
+/// Returns the deposit held for `engineer` on `auction_id`, if any, after a reveal.
+fn refund_deposit(env: &Env, auction_id: u64, engineer: &Address) {
+    let key = DataKey::Deposit(auction_id, engineer.clone());
+    let Some(amount) = env.storage().persistent().get::<_, i128>(&key) else {
+        return;
+    };
+    let pool_key = DataKey::DepositPool(auction_id);
+    let mut pool: DepositPool = env
+        .storage()
+        .persistent()
+        .get(&pool_key)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized));
+    token::Client::new(env, &pool.token).transfer(
+        &env.current_contract_address(),
+        engineer,
+        &amount,
+    );
+    pool.held -= amount;
+    env.storage().persistent().set(&pool_key, &pool);
+    env.storage().persistent().remove(&key);
 }
 
 /// Panics unless `engineer` holds a valid or grace-period credential.
@@ -291,6 +373,57 @@ impl Marketplace {
             panic_with_error!(&env, ContractError::InvalidPricingConfig);
         }
         env.storage().instance().set(&DataKey::Pricing, &pricing);
+    }
+
+    /// Admin-only: set the refundable deposit every commitment must lock.
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if `admin` is not the stored admin
+    /// - [`ContractError::InvalidDepositConfig`] if `amount` is not positive
+    pub fn set_bid_deposit(env: Env, admin: Address, token: Address, amount: i128) {
+        require_admin_auth(&env, &admin);
+        if amount <= 0 {
+            panic_with_error!(&env, ContractError::InvalidDepositConfig);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::BidDeposit, &DepositConfig { token, amount });
+    }
+
+    /// Admin-only: send the deposits forfeited on an auction (commitments never
+    /// revealed) to `to`. Available once the reveal window has closed.
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if `admin` is not the stored admin
+    /// - [`ContractError::ForfeitWindowOpen`] if the reveal window is still open
+    pub fn claim_forfeited_deposits(
+        env: Env,
+        admin: Address,
+        auction_id: u64,
+        to: Address,
+    ) -> i128 {
+        require_admin_auth(&env, &admin);
+        let auction = load_auction(&env, auction_id);
+        if env.ledger().timestamp() <= auction.reveal_end {
+            panic_with_error!(&env, ContractError::ForfeitWindowOpen);
+        }
+        let key = DataKey::DepositPool(auction_id);
+        let Some(mut pool) = env.storage().persistent().get::<_, DepositPool>(&key) else {
+            return 0;
+        };
+        let amount = pool.held;
+        if amount > 0 {
+            token::Client::new(&env, &pool.token).transfer(
+                &env.current_contract_address(),
+                &to,
+                &amount,
+            );
+            pool.held = 0;
+            env.storage().persistent().set(&key, &pool);
+            env.events()
+                .publish((FORFEIT_TOPIC, auction_id), (to, amount));
+        }
+        amount
     }
 
     /// Admin-only: record the current supply (available engineers) and demand
@@ -506,6 +639,10 @@ impl Marketplace {
     /// - [`ContractError::AlreadyBid`] if the engineer already committed
     /// - [`ContractError::BidLimitReached`] if the auction already holds
     ///   [`MAX_BIDS_PER_AUCTION`] commitments
+    /// - [`ContractError::DepositNotConfigured`] if no bid deposit is set
+    ///
+    /// The configured deposit is transferred from `engineer` and held by the
+    /// contract until [`reveal_bid`] refunds it.
     pub fn commit_bid(env: Env, engineer: Address, auction_id: u64, commitment: BytesN<32>) {
         engineer.require_auth();
         let auction = load_auction(&env, auction_id);
@@ -530,9 +667,12 @@ impl Marketplace {
             panic_with_error!(&env, ContractError::BidLimitReached);
         }
         env.storage().persistent().set(&count_key, &(count + 1));
-        env.storage()
-            .persistent()
-            .extend_ttl(&count_key, shared::TTL_THRESHOLD, shared::TTL_TARGET);
+        env.storage().persistent().extend_ttl(
+            &count_key,
+            shared::TTL_THRESHOLD,
+            shared::TTL_TARGET,
+        );
+        take_deposit(&env, auction_id, &engineer);
         env.storage().persistent().set(&key, &commitment);
         env.storage()
             .persistent()
@@ -596,6 +736,7 @@ impl Marketplace {
         store_bids(&env, auction_id, &bids);
         // Remove the commitment so the same reveal cannot be submitted twice.
         env.storage().persistent().remove(&key);
+        refund_deposit(&env, auction_id, &engineer);
         env.events()
             .publish((REVEAL_TOPIC, auction_id), (engineer, price, reputation));
     }

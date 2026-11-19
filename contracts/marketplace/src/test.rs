@@ -1,8 +1,13 @@
 use super::*;
 use soroban_sdk::{
-    contracttype, symbol_short, testutils::Address as _, testutils::Ledger, Address, BytesN, Env,
-    String,
+    contracttype, symbol_short,
+    testutils::{Address as _, Ledger},
+    token::{Client as TokenClient, StellarAssetClient},
+    Address, BytesN, Env, String,
 };
+
+/// Deposit locked by each sealed commitment in tests.
+const DEPOSIT: i128 = 100;
 
 /// Stand-in for the engineer registry: per-address credential status and reputation.
 #[contracttype]
@@ -65,6 +70,7 @@ struct Ctx<'a> {
     client: MarketplaceClient<'a>,
     registry: MockRegistryClient<'a>,
     admin: Address,
+    token: Address,
 }
 
 fn setup(env: &Env) -> Ctx<'_> {
@@ -76,17 +82,24 @@ fn setup(env: &Env) -> Ctx<'_> {
     let id = env.register(Marketplace, ());
     let client = MarketplaceClient::new(env, &id);
     client.initialize(&admin, &registry_id, &pricing());
+    let token_admin = Address::generate(env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    client.set_bid_deposit(&admin, &token, &DEPOSIT);
     Ctx {
         env,
         client,
         registry,
         admin,
+        token,
     }
 }
 
 fn engineer(ctx: &Ctx, status: CredentialStatus, reputation: u32) -> Address {
     let addr = Address::generate(ctx.env);
     ctx.registry.set_engineer(&addr, &status, &reputation);
+    StellarAssetClient::new(ctx.env, &ctx.token).mint(&addr, &DEPOSIT);
     addr
 }
 
@@ -584,5 +597,93 @@ fn commit_bid_rejects_commitments_beyond_the_cap() {
     assert_eq!(
         ctx.client.try_commit_bid(&overflow, &id, &filler),
         Err(Ok(contract_err(ContractError::BidLimitReached)))
+    );
+}
+
+// ---------- Refundable commitment deposit (#1935) ----------
+
+#[test]
+fn commit_locks_deposit_and_reveal_refunds_it() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let token = TokenClient::new(&env, &ctx.token);
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
+    let a = engineer(&ctx, CredentialStatus::Valid, 0);
+    let salt = BytesN::from_array(&env, &[4u8; 32]);
+
+    ctx.client
+        .commit_bid(&a, &id, &commitment(&env, id, &a, 2_000, &salt));
+    assert_eq!(token.balance(&a), 0);
+    assert_eq!(token.balance(&ctx.client.address), DEPOSIT);
+
+    at(&env, BID_END + 1);
+    ctx.client.reveal_bid(&a, &id, &2_000, &salt);
+    assert_eq!(token.balance(&a), DEPOSIT);
+    assert_eq!(token.balance(&ctx.client.address), 0);
+}
+
+#[test]
+fn unrevealed_deposit_is_forfeited_and_only_claimable_after_reveal_window() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let token = TokenClient::new(&env, &ctx.token);
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
+    let a = engineer(&ctx, CredentialStatus::Valid, 0);
+    let b = engineer(&ctx, CredentialStatus::Valid, 0);
+    let salt = BytesN::from_array(&env, &[6u8; 32]);
+    ctx.client
+        .commit_bid(&a, &id, &commitment(&env, id, &a, 2_000, &salt));
+    ctx.client
+        .commit_bid(&b, &id, &commitment(&env, id, &b, 1_500, &salt));
+
+    at(&env, BID_END + 1);
+    ctx.client.reveal_bid(&a, &id, &2_000, &salt);
+    // b never reveals.
+    let treasury = Address::generate(&env);
+    assert_eq!(
+        ctx.client
+            .try_claim_forfeited_deposits(&ctx.admin, &id, &treasury),
+        Err(Ok(contract_err(ContractError::ForfeitWindowOpen)))
+    );
+
+    at(&env, REVEAL_END + 1);
+    let forfeited = ctx
+        .client
+        .claim_forfeited_deposits(&ctx.admin, &id, &treasury);
+    assert_eq!(forfeited, DEPOSIT);
+    assert_eq!(token.balance(&treasury), DEPOSIT);
+    assert_eq!(token.balance(&b), 0);
+    assert_eq!(token.balance(&a), DEPOSIT);
+    assert_eq!(token.balance(&ctx.client.address), 0);
+}
+
+#[test]
+fn commit_requires_a_configured_deposit() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
+    let a = engineer(&ctx, CredentialStatus::Valid, 0);
+    let salt = BytesN::from_array(&env, &[7u8; 32]);
+    let c = commitment(&env, id, &a, 2_000, &salt);
+
+    // A marketplace that never set a deposit must reject commitments.
+    let fresh = env.register(Marketplace, ());
+    let fresh_client = MarketplaceClient::new(&env, &fresh);
+    fresh_client.initialize(&ctx.admin, &ctx.registry.address, &pricing());
+    let fresh_id =
+        fresh_client.create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
+    assert_eq!(
+        fresh_client.try_commit_bid(&a, &fresh_id, &c),
+        Err(Ok(contract_err(ContractError::DepositNotConfigured)))
+    );
+    assert_eq!(
+        ctx.client.try_set_bid_deposit(&ctx.admin, &ctx.token, &0),
+        Err(Ok(contract_err(ContractError::InvalidDepositConfig)))
     );
 }
