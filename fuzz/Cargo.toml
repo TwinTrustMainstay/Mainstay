@@ -20,9 +20,19 @@ path = "../contracts/asset-registry"
 [dependencies.engineer-registry]
 path = "../contracts/engineer-registry"
 
+[dependencies.zk-privacy]
+path = "../contracts/zk-privacy"
+
 [dependencies.soroban-sdk]
 version = "22.0.0"
 features = ["testutils"]
+
+[[bin]]
+name = "zk_verifier_fuzz"
+path = "fuzz_targets/zk_verifier_fuzz.rs"
+test = false
+doc = false
+bench = false
 
 # Prevent this from being lifted into the parent workspace.
 [workspace]
