@@ -12,5 +12,6 @@ asset-registry = { path = "../asset-registry" }
 shared = { path = "../shared" }
 
 [dev-dependencies]
+ed25519-dalek = "2.2.0"
 soroban-sdk = { version = "22.0.0", features = ["testutils"] }
 engineer-registry = { path = "../engineer-registry" }

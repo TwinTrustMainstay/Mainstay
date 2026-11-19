@@ -1156,6 +1156,7 @@ name = "lifecycle"
 version = "0.1.0"
 dependencies = [
  "asset-registry",
+ "ed25519-dalek",
  "engineer-registry",
  "shared",
  "soroban-sdk",
