@@ -130,6 +130,8 @@ enum DataKey {
     Auction(u64),
     Bids(u64),
     Commit(u64, Address),
+    /// Engineers who committed to a sealed auction, in commit order.
+    Committers(u64),
 }
 
 /// Minimal client for the engineer registry. Only the methods used here are declared.
@@ -235,6 +237,21 @@ fn ensure_credentialed(env: &Env, engineer: &Address) {
     if !is_credentialed(env, engineer) {
         panic_with_error!(env, ContractError::NotCredentialed);
     }
+}
+
+fn load_committers(env: &Env, auction_id: u64) -> Vec<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Committers(auction_id))
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+fn store_committers(env: &Env, auction_id: u64, committers: &Vec<Address>) {
+    let key = DataKey::Committers(auction_id);
+    env.storage().persistent().set(&key, committers);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, shared::TTL_THRESHOLD, shared::TTL_TARGET);
 }
 
 fn reputation_of(env: &Env, engineer: &Address) -> u32 {
@@ -530,6 +547,9 @@ impl Marketplace {
         env.storage()
             .persistent()
             .extend_ttl(&key, shared::TTL_THRESHOLD, shared::TTL_TARGET);
+        let mut committers = load_committers(&env, auction_id);
+        committers.push_back(engineer.clone());
+        store_committers(&env, auction_id, &committers);
         env.events()
             .publish((COMMIT_TOPIC, auction_id), (engineer,));
     }
@@ -622,6 +642,19 @@ impl Marketplace {
             }
         }
         auction.finalized_at = now;
+
+        // Unrevealed commitments are forfeited. Remove them and the committer
+        // index now so no sealed-bid state outlives the auction.
+        let committers = load_committers(&env, auction_id);
+        for engineer in committers.iter() {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Commit(auction_id, engineer));
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Committers(auction_id));
+
         match select_winner(&eligible, auction.criterion) {
             Some(idx) => {
                 let bid = eligible.get(idx).unwrap();

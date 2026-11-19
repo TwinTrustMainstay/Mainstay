@@ -610,3 +610,53 @@ fn auction_is_unawarded_when_every_bidder_has_lapsed() {
     assert_eq!(auction.status, AuctionStatus::Unawarded);
     assert_eq!(auction.winner, None);
 }
+
+// ---------- Unrevealed commitment cleanup (#1939) ----------
+
+#[test]
+fn finalize_clears_unrevealed_commitments_from_storage() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
+    let revealer = engineer(&ctx, CredentialStatus::Valid, 0);
+    let silent = engineer(&ctx, CredentialStatus::Valid, 0);
+    let salt = BytesN::from_array(&env, &[3u8; 32]);
+
+    ctx.client.commit_bid(
+        &revealer,
+        &id,
+        &commitment(&env, id, &revealer, 2_000, &salt),
+    );
+    ctx.client
+        .commit_bid(&silent, &id, &commitment(&env, id, &silent, 1_000, &salt));
+
+    at(&env, BID_END + 1);
+    ctx.client.reveal_bid(&revealer, &id, &2_000, &salt);
+
+    at(&env, REVEAL_END + 1);
+    // Before finalization the silent commitment is still stored.
+    env.as_contract(&ctx.client.address, || {
+        assert!(env
+            .storage()
+            .persistent()
+            .has(&DataKey::Commit(id, silent.clone())));
+    });
+
+    ctx.client.finalize_auction(&id);
+
+    env.as_contract(&ctx.client.address, || {
+        assert!(!env
+            .storage()
+            .persistent()
+            .has(&DataKey::Commit(id, silent.clone())));
+        assert!(!env
+            .storage()
+            .persistent()
+            .has(&DataKey::Commit(id, revealer.clone())));
+        assert!(!env.storage().persistent().has(&DataKey::Committers(id)));
+    });
+    // The revealed bid still decides the award.
+    assert_eq!(ctx.client.get_auction(&id).winner, Some(revealer));
+}
