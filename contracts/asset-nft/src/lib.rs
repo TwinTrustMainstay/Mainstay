@@ -12,8 +12,8 @@ mod test;
 
 use shared::{extend_persistent_ttl, require_admin};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
-    Address, Env, String, Vec,
+    contract, contracterror, contractclient, contractimpl, contracttype, panic_with_error,
+    symbol_short, token, Address, Env, String, Vec,
 };
 
 /// Maximum trading history entries kept per NFT. Oldest entries are dropped first.
@@ -47,6 +47,17 @@ pub enum ContractError {
     CannotBuyOwnToken = 10,
     /// The contract is paused; state-changing calls are rejected (issue #1973).
     Paused = 11,
+    /// The NFT's asset is pledged as collateral under a lien in the asset registry (issue #1972).
+    AssetLocked = 12,
+}
+
+/// The slice of the asset registry this contract depends on.
+///
+/// Each NFT represents exactly one registry asset (`AssetToken::asset_id`), so the lien check
+/// queries the registry by that id before the NFT is listed, sold or transferred (issue #1972).
+#[contractclient(name = "AssetRegistryClient")]
+pub trait AssetRegistryInterface {
+    fn is_asset_locked(env: Env, asset_id: u64) -> bool;
 }
 
 #[contracttype]
@@ -102,6 +113,7 @@ pub enum DataKey {
     Listing(u64),
     History(u64),
     Paused,
+    AssetRegistry,
 }
 
 #[contract]
@@ -128,6 +140,18 @@ fn ensure_not_paused(env: &Env) {
         .unwrap_or(false);
     if paused {
         panic_with_error!(env, ContractError::Paused);
+    }
+}
+
+/// Rejects a sale or transfer when the registry reports a lien on the asset (issue #1972).
+fn ensure_asset_unlocked(env: &Env, asset_id: u64) {
+    let registry: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::AssetRegistry)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized));
+    if AssetRegistryClient::new(env, &registry).is_asset_locked(&asset_id) {
+        panic_with_error!(env, ContractError::AssetLocked);
     }
 }
 
@@ -172,8 +196,9 @@ fn move_token(env: &Env, token: &mut AssetToken, to: &Address) {
 
 #[contractimpl]
 impl AssetNft {
-    /// Sets the admin (asset registry bridge) and the token used for NFT sales.
-    pub fn initialize(env: Env, admin: Address, payment_token: Address) {
+    /// Sets the admin (asset registry bridge), the token used for NFT sales, and the asset
+    /// registry whose lien status gates listings, sales and transfers.
+    pub fn initialize(env: Env, admin: Address, payment_token: Address, asset_registry: Address) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, ContractError::AlreadyInitialized);
         }
@@ -181,6 +206,9 @@ impl AssetNft {
         env.storage()
             .instance()
             .set(&DataKey::PaymentToken, &payment_token);
+        env.storage()
+            .instance()
+            .set(&DataKey::AssetRegistry, &asset_registry);
         env.storage().instance().set(&DataKey::NextId, &1u64);
     }
 
@@ -266,6 +294,7 @@ impl AssetNft {
         if env.storage().persistent().has(&DataKey::Listing(token_id)) {
             panic_with_error!(&env, ContractError::TokenListed);
         }
+        ensure_asset_unlocked(&env, token.asset_id);
 
         move_token(&env, &mut token, &to);
         record_trade(
@@ -316,6 +345,7 @@ impl AssetNft {
         if token.owner != owner {
             panic_with_error!(&env, ContractError::NotTokenOwner);
         }
+        ensure_asset_unlocked(&env, token.asset_id);
 
         let key = DataKey::Listing(token_id);
         env.storage().persistent().set(
@@ -352,6 +382,9 @@ impl AssetNft {
         if listing.seller == buyer {
             panic_with_error!(&env, ContractError::CannotBuyOwnToken);
         }
+        let mut token = load_token(&env, token_id);
+        // A lien may be placed after listing, so re-check at sale time.
+        ensure_asset_unlocked(&env, token.asset_id);
 
         let payment: Address = env
             .storage()
@@ -363,7 +396,6 @@ impl AssetNft {
         env.storage()
             .persistent()
             .remove(&DataKey::Listing(token_id));
-        let mut token = load_token(&env, token_id);
         move_token(&env, &mut token, &buyer);
 
         let now = env.ledger().timestamp();
