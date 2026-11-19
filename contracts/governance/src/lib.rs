@@ -11,11 +11,15 @@
 //!   and voted again.
 //! * **Outcome**: a proposal passes when turnout meets `quorum_bps` of the share
 //!   supply at creation and `approval_threshold_bps` of votes cast are in favour.
-//! * **Execution**: a passed proposal can be executed once. Parameter changes are
+//! * **Execution**: a passed proposal can be executed once, and only after
+//!   `execution_delay_secs` has elapsed since it was finalized. Parameter changes are
 //!   written to the on-chain parameter store. Funding grants are debited from the
-//!   treasury budget ledger.
+//!   treasury budget ledger and emit a `GOV_FUND` event carrying the recipient and
+//!   amount.
 //!
-//! The treasury is an accounting ledger. Actual token movement is out of scope.
+//! The treasury is an accounting ledger. This contract does not move tokens to a
+//! funding recipient. Payout is performed off-chain by whatever service consumes
+//! the `GOV_FUND` event. This is the accounting-only behaviour for issue #1946.
 
 use shared::require_admin;
 use soroban_sdk::{
@@ -28,6 +32,35 @@ pub const MAX_VOTES_PER_PROPOSAL: u32 = 500;
 /// Maximum proposal title length in bytes.
 pub const MAX_TITLE_LEN: u32 = 128;
 const BPS: u64 = 10_000;
+
+/// Schema of governable platform parameters: `(name, min, max)`, inclusive bounds.
+/// Only these names can be set by a parameter proposal. All values are `u64`.
+pub const GOVERNABLE_PARAMS: [(&str, u64, u64); 3] = [
+    ("FEE_BPS", 0, 1_000),
+    ("SLASH_BPS", 0, 5_000),
+    ("HEARTBEAT", 60, 86_400),
+];
+
+/// Returns the inclusive `(min, max)` bounds for a governable parameter, or `None`
+/// if the name is not in [`GOVERNABLE_PARAMS`].
+pub fn param_bounds(env: &Env, name: &Symbol) -> Option<(u64, u64)> {
+    GOVERNABLE_PARAMS.iter().find_map(|(key, min, max)| {
+        if *name == Symbol::new(env, key) {
+            Some((*min, *max))
+        } else {
+            None
+        }
+    })
+}
+
+/// Rejects parameter changes whose name is unknown or whose value is out of range.
+fn validate_parameter(env: &Env, name: &Symbol, value: u64) {
+    let (min, max) = param_bounds(env, name)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::UnknownParameter));
+    if value < min || value > max {
+        panic_with_error!(env, ContractError::ParameterOutOfRange);
+    }
+}
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -63,6 +96,25 @@ pub enum ContractError {
     InsufficientBudget = 16,
     /// Proposal has reached `MAX_VOTES_PER_PROPOSAL`.
     TooManyVotes = 17,
+    /// Parameter name is not in the governable schema.
+    UnknownParameter = 18,
+    /// Parameter value is outside the bounds defined in the schema.
+    ParameterOutOfRange = 19,
+    /// The execution delay after finalization has not elapsed.
+    ExecutionDelayActive = 20,
+}
+
+/// Rejects governance settings that are out of range. Shared by `initialize`,
+/// proposal creation and execution of a `ProposalKind::Config` proposal.
+fn validate_config(env: &Env, config: &GovernanceConfig) {
+    if config.voting_period_secs == 0
+        || config.quorum_bps == 0
+        || config.quorum_bps as u64 > BPS
+        || config.approval_threshold_bps == 0
+        || config.approval_threshold_bps as u64 > BPS
+    {
+        panic_with_error!(env, ContractError::InvalidConfig);
+    }
 }
 
 #[contracttype]
@@ -76,6 +128,9 @@ pub struct GovernanceConfig {
     pub approval_threshold_bps: u32,
     /// Minimum shares a holder must own to create a proposal.
     pub min_proposal_shares: u64,
+    /// Seconds between a proposal being finalized as `Passed` and when it may be
+    /// executed. `0` disables the delay. Gives holders a window to react.
+    pub execution_delay_secs: u64,
 }
 
 #[contracttype]
@@ -83,7 +138,12 @@ pub struct GovernanceConfig {
 pub enum ProposalKind {
     /// Set a platform parameter to a new value.
     Parameter(Symbol, u64),
-    /// Grant `amount` from the treasury budget to `recipient`.
+    /// Replace the governance configuration (voting period, quorum, approval
+    /// threshold, proposal minimum, execution delay). Passed by vote like any other proposal.
+    Config(GovernanceConfig),
+    /// Grant `amount` from the treasury budget to `recipient`. Accounting only: the
+    /// budget ledger is debited and a `GOV_FUND` event is emitted. No tokens move
+    /// on-chain.
     Funding(Address, u64),
 }
 
@@ -115,6 +175,8 @@ pub struct Proposal {
     pub status: ProposalStatus,
     /// Timestamp at which the proposal was executed. `0` if not yet executed.
     pub executed_at: u64,
+    /// Timestamp at which the outcome was recorded by `finalize_proposal`. `0` until finalized.
+    pub finalized_at: u64,
 }
 
 #[contracttype]
@@ -148,6 +210,7 @@ const VOTE_TOPIC: Symbol = symbol_short!("GOV_VOTE");
 const FINALIZE_TOPIC: Symbol = symbol_short!("GOV_FIN");
 const EXECUTE_TOPIC: Symbol = symbol_short!("GOV_EXEC");
 const MINT_TOPIC: Symbol = symbol_short!("GOV_MINT");
+const FUND_TOPIC: Symbol = symbol_short!("GOV_FUND");
 
 fn require_admin_auth(env: &Env, admin: &Address) {
     let stored: Address = env
@@ -249,14 +312,7 @@ impl Governance {
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, ContractError::AlreadyInitialized);
         }
-        if config.voting_period_secs == 0
-            || config.quorum_bps == 0
-            || config.quorum_bps as u64 > BPS
-            || config.approval_threshold_bps == 0
-            || config.approval_threshold_bps as u64 > BPS
-        {
-            panic_with_error!(&env, ContractError::InvalidConfig);
-        }
+        validate_config(&env, &config);
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().set(&DataKey::TotalShares, &0u64);
@@ -323,6 +379,9 @@ impl Governance {
     /// - [`ContractError::InsufficientShares`] if the proposer is below the minimum (or holds none)
     /// - [`ContractError::InvalidProposal`] if the title is empty or longer than [`MAX_TITLE_LEN`],
     ///   or a funding amount is zero
+    /// - [`ContractError::InvalidConfig`] if a `Config` proposal carries an out-of-range setting
+    /// - [`ContractError::UnknownParameter`] if a parameter name is not in [`GOVERNABLE_PARAMS`]
+    /// - [`ContractError::ParameterOutOfRange`] if a parameter value is outside its bounds
     pub fn create_proposal(env: Env, proposer: Address, title: String, kind: ProposalKind) -> u64 {
         proposer.require_auth();
         let config = load_config(&env);
@@ -333,8 +392,13 @@ impl Governance {
         if title.is_empty() || title.len() > MAX_TITLE_LEN {
             panic_with_error!(&env, ContractError::InvalidProposal);
         }
-        if let ProposalKind::Funding(_, 0) = kind {
-            panic_with_error!(&env, ContractError::InvalidProposal);
+        match &kind {
+            ProposalKind::Config(new_config) => validate_config(&env, new_config),
+            ProposalKind::Funding(_, 0) => {
+                panic_with_error!(&env, ContractError::InvalidProposal);
+            }
+            ProposalKind::Parameter(name, value) => validate_parameter(&env, name, *value),
+            _ => {}
         }
 
         let id: u64 = env
@@ -359,6 +423,7 @@ impl Governance {
             votes_against: 0,
             status: ProposalStatus::Active,
             executed_at: 0,
+            finalized_at: 0,
         };
         store_proposal(&env, &proposal);
         env.events()
@@ -461,6 +526,7 @@ impl Governance {
             config.quorum_bps,
             config.approval_threshold_bps,
         );
+        proposal.finalized_at = env.ledger().timestamp();
         store_proposal(&env, &proposal);
         env.events()
             .publish((FINALIZE_TOPIC, proposal_id), (proposal.status,));
@@ -473,7 +539,13 @@ impl Governance {
     /// - [`ContractError::ProposalNotFound`] if the proposal does not exist
     /// - [`ContractError::AlreadyExecuted`] if already executed
     /// - [`ContractError::ProposalNotPassed`] if the proposal has not passed
+    /// - [`ContractError::ExecutionDelayActive`] if `execution_delay_secs` has not elapsed since finalization
     /// - [`ContractError::InsufficientBudget`] if a funding grant exceeds the treasury balance
+    /// - [`ContractError::UnknownParameter`] / [`ContractError::ParameterOutOfRange`] if a
+    ///   parameter change fails schema validation (re-checked at execution)
+    ///
+    /// For a funding grant this debits the treasury ledger and emits a `GOV_FUND`
+    /// event with `(recipient, amount)`. It does not transfer tokens.
     pub fn execute_proposal(env: Env, proposal_id: u64) {
         let mut proposal = load_proposal(&env, proposal_id);
         if proposal.status == ProposalStatus::Executed {
@@ -482,13 +554,25 @@ impl Governance {
         if proposal.status != ProposalStatus::Passed {
             panic_with_error!(&env, ContractError::ProposalNotPassed);
         }
+        let config = load_config(&env);
+        let earliest = proposal
+            .finalized_at
+            .saturating_add(config.execution_delay_secs);
+        if env.ledger().timestamp() < earliest {
+            panic_with_error!(&env, ContractError::ExecutionDelayActive);
+        }
         match proposal.kind.clone() {
+            ProposalKind::Config(new_config) => {
+                validate_config(&env, &new_config);
+                env.storage().instance().set(&DataKey::Config, &new_config);
+            }
             ProposalKind::Parameter(name, value) => {
+                validate_parameter(&env, &name, value);
                 env.storage()
                     .persistent()
                     .set(&DataKey::Param(name), &value);
             }
-            ProposalKind::Funding(_, amount) => {
+            ProposalKind::Funding(recipient, amount) => {
                 let treasury: u64 = env
                     .storage()
                     .instance()
@@ -500,6 +584,8 @@ impl Governance {
                 env.storage()
                     .instance()
                     .set(&DataKey::Treasury, &(treasury - amount));
+                env.events()
+                    .publish((FUND_TOPIC, proposal_id), (recipient, amount));
             }
         }
         let now = env.ledger().timestamp();
