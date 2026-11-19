@@ -21,14 +21,31 @@ asset, pays a premium into the pool, and can claim against the policy if the col
 |-----------|--------|---------|
 | `premium_bps` | `initialize` | Premium as basis points of coverage. 500 = 5%. Must be 0 to 10,000. |
 | `term_secs` | `initialize` | Policy term. Claims are accepted only until `expires_at`. |
+| `max_exposure_bps` | `initialize` | Cap on outstanding coverage as basis points of total assets. Must be greater than zero. 10,000 = 100%. |
 
 - **Premium** = `coverage × premium_bps / 10,000`, paid to the pool at purchase. `quote_premium`
   returns it before purchase.
+- **Exposure cap.** `buy_policy` rejects a policy with `ExceedsExposureLimit` unless
+  `total_exposure + coverage <= total_assets × max_exposure_bps / 10,000`. Total assets include
+  the new premium. `total_exposure` is the remaining coverage of policies not yet released. It
+  falls as claims are paid.
+- **Releasing expired policies.** After a policy's `expires_at`, anyone can call
+  `release_expired_policy` once. It removes the policy's remaining coverage from
+  `total_exposure`, which frees capacity for new policies. It emits an `ins_rel` event.
+  Calling it before expiry returns `PolicyNotExpired`, and calling it twice returns
+  `PolicyAlreadyReleased`.
 - **Share price** = pool assets ÷ total shares. The first deposit mints one share per token.
   Later deposits mint shares at the current price, so premiums accrue to existing providers.
 - **Claims** can't exceed a policy's remaining coverage. Approved payouts are capped at pool
   assets, so a claim can't push the pool negative. Each payout reduces the policy's remaining
   coverage.
+- **Filing** a claim also requires the amount to fit in free capital (`total_assets - reserved`).
+  Otherwise the claim fails with `InsufficientFreeFunds`. Because every reservation is backed by
+  assets, an approved claim is normally paid in full. The partial-payout path described below is
+  a defensive guard.
+- **Partial payouts** are reported as `PartiallyPaid`, not `Paid`. The unpaid remainder is
+  stored in the claim's `shortfall` field, and an `ins_shrt` event is emitted with the claim id
+  and shortfall. Full payouts record a shortfall of `0`.
 
 ## Fund management
 

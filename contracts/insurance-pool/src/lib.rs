@@ -55,6 +55,14 @@ pub enum ContractError {
     ClaimNotPending = 13,
     /// Arithmetic overflowed.
     MathOverflow = 14,
+    /// Maximum exposure must be greater than zero.
+    InvalidExposureLimit = 15,
+    /// Outstanding coverage would exceed `max_exposure_bps` of total assets.
+    ExceedsExposureLimit = 16,
+    /// The policy term has not ended, so its coverage cannot be released.
+    PolicyNotExpired = 17,
+    /// The policy's coverage has already been released.
+    PolicyAlreadyReleased = 18,
 }
 
 #[contracttype]
@@ -62,8 +70,12 @@ pub enum ContractError {
 #[repr(u32)]
 pub enum ClaimStatus {
     Pending = 0,
+    /// Approved and paid in full.
     Paid = 1,
     Rejected = 2,
+    /// Approved, but the pool had too few assets to pay the full amount. The unpaid
+    /// remainder is recorded in `Claim::shortfall`.
+    PartiallyPaid = 3,
 }
 
 #[contracttype]
@@ -76,6 +88,9 @@ pub struct Policy {
     pub remaining_coverage: i128,
     pub premium_paid: i128,
     pub expires_at: u64,
+    /// Set once the policy has expired and its remaining coverage was removed from
+    /// `PoolStats::total_exposure`.
+    pub released: bool,
 }
 
 #[contracttype]
@@ -87,6 +102,8 @@ pub struct Claim {
     pub amount: i128,
     /// Amount actually paid. `0` until paid.
     pub paid: i128,
+    /// Approved amount that the pool could not pay: `amount - paid` once settled, `0` otherwise.
+    pub shortfall: i128,
     pub status: ClaimStatus,
     pub filed_at: u64,
 }
@@ -99,6 +116,8 @@ pub struct PoolStats {
     pub total_shares: i128,
     /// Maximum payouts owed on pending claims.
     pub reserved: i128,
+    /// Coverage outstanding on policies not yet released: remaining coverage, net of payouts.
+    pub total_exposure: i128,
     pub premiums_collected: i128,
     pub total_payouts: i128,
     pub claims_filed: u64,
@@ -113,6 +132,7 @@ pub enum DataKey {
     Token,
     PremiumBps,
     TermSecs,
+    MaxExposureBps,
     Stats,
     NextPolicyId,
     NextClaimId,
@@ -154,6 +174,7 @@ fn load_stats(env: &Env) -> PoolStats {
             total_assets: 0,
             total_shares: 0,
             reserved: 0,
+            total_exposure: 0,
             premiums_collected: 0,
             total_payouts: 0,
             claims_filed: 0,
@@ -192,6 +213,13 @@ fn save_claim(env: &Env, claim: &Claim) {
     extend_persistent_ttl(env, key);
 }
 
+fn max_exposure_bps(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MaxExposureBps)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized))
+}
+
 fn mul_div(env: &Env, a: i128, b: i128, div: i128) -> i128 {
     a.checked_mul(b)
         .and_then(|v| v.checked_div(div))
@@ -206,15 +234,29 @@ fn next_id(env: &Env, key: DataKey) -> u64 {
 
 #[contractimpl]
 impl InsurancePool {
-    /// Sets the admin, the pool token, the premium rate (basis points of coverage) and the
-    /// policy term in seconds.
-    pub fn initialize(env: Env, admin: Address, token: Address, premium_bps: u32, term_secs: u64) {
+    /// Sets the admin, the pool token, the premium rate (basis points of coverage), the
+    /// policy term in seconds, and the maximum outstanding coverage as basis points of total
+    /// assets. Must be greater than zero.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        token: Address,
+        premium_bps: u32,
+        term_secs: u64,
+        max_exposure_bps: u32,
+    ) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, ContractError::AlreadyInitialized);
         }
         if i128::from(premium_bps) > BPS_DENOMINATOR {
             panic_with_error!(&env, ContractError::InvalidPremiumRate);
         }
+        if max_exposure_bps == 0 {
+            panic_with_error!(&env, ContractError::InvalidExposureLimit);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxExposureBps, &max_exposure_bps);
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
         env.storage()
@@ -289,6 +331,9 @@ impl InsurancePool {
 
     /// Buys coverage for `asset_id` up to `coverage`. The premium is paid to the pool.
     /// Returns the policy id.
+    ///
+    /// Total outstanding coverage, including this policy, must not exceed `max_exposure_bps`
+    /// of total assets after the premium is added.
     pub fn buy_policy(env: Env, lender: Address, asset_id: u64, coverage: i128) -> u64 {
         lender.require_auth();
         if coverage <= 0 {
@@ -304,15 +349,27 @@ impl InsurancePool {
             .instance()
             .get(&DataKey::TermSecs)
             .unwrap_or(0);
+        let max_exposure_bps = max_exposure_bps(&env);
         let premium = mul_div(&env, coverage, i128::from(premium_bps), BPS_DENOMINATOR);
+
+        let mut stats = load_stats(&env);
+        let limit = mul_div(
+            &env,
+            stats.total_assets + premium,
+            i128::from(max_exposure_bps),
+            BPS_DENOMINATOR,
+        );
+        if stats.total_exposure + coverage > limit {
+            panic_with_error!(&env, ContractError::ExceedsExposureLimit);
+        }
 
         if premium > 0 {
             token_client(&env).transfer(&lender, &env.current_contract_address(), &premium);
         }
 
-        let mut stats = load_stats(&env);
         stats.total_assets += premium;
         stats.premiums_collected += premium;
+        stats.total_exposure += coverage;
         save_stats(&env, &stats);
 
         let id = next_id(&env, DataKey::NextPolicyId);
@@ -323,6 +380,7 @@ impl InsurancePool {
             remaining_coverage: coverage,
             premium_paid: premium,
             expires_at: env.ledger().timestamp() + term,
+            released: false,
         };
         save_policy(&env, &policy);
 
@@ -332,6 +390,8 @@ impl InsurancePool {
     }
 
     /// Files a claim against a policy. Only the policy holder can file, and only before expiry.
+    /// The claim amount must fit within the pool's free capital (`total_assets - reserved`),
+    /// so reservations never exceed the assets that back them.
     pub fn file_claim(env: Env, lender: Address, policy_id: u64, amount: i128) -> u64 {
         lender.require_auth();
         if amount <= 0 {
@@ -347,6 +407,10 @@ impl InsurancePool {
         if amount > policy.remaining_coverage {
             panic_with_error!(&env, ContractError::ExceedsCoverage);
         }
+        let mut stats = load_stats(&env);
+        if amount > stats.total_assets - stats.reserved {
+            panic_with_error!(&env, ContractError::InsufficientFreeFunds);
+        }
 
         let id = next_id(&env, DataKey::NextClaimId);
         save_claim(
@@ -357,12 +421,12 @@ impl InsurancePool {
                 claimant: lender.clone(),
                 amount,
                 paid: 0,
+                shortfall: 0,
                 status: ClaimStatus::Pending,
                 filed_at: env.ledger().timestamp(),
             },
         );
 
-        let mut stats = load_stats(&env);
         stats.reserved += amount;
         stats.claims_filed += 1;
         save_stats(&env, &stats);
@@ -376,6 +440,10 @@ impl InsurancePool {
     ///
     /// Approval pays `min(claim amount, pool assets)`. The payout comes off the policy's
     /// remaining coverage, and the claim's reservation is released.
+    ///
+    /// If the payout is less than the claim amount, the claim is marked `PartiallyPaid`, the
+    /// unpaid remainder is stored in `Claim::shortfall`, and a shortfall event is emitted.
+    /// Approved claims, full or partial, count toward `PoolStats::claims_paid`.
     pub fn settle_claim(env: Env, admin: Address, claim_id: u64, approve: bool) -> i128 {
         require_stored_admin(&env, &admin);
         let mut claim = load_claim(&env, claim_id);
@@ -385,6 +453,7 @@ impl InsurancePool {
 
         let mut stats = load_stats(&env);
         stats.reserved -= claim.amount;
+        let mut policy = load_policy(&env, claim.policy_id);
 
         if !approve {
             claim.status = ClaimStatus::Rejected;
@@ -396,17 +465,27 @@ impl InsurancePool {
         }
 
         let payout = claim.amount.min(stats.total_assets);
+        let shortfall = claim.amount - payout;
         stats.total_assets -= payout;
         stats.total_payouts += payout;
         stats.claims_paid += 1;
+        // A released policy's coverage already left `total_exposure`, so only live policies
+        // give back the payout here.
+        if !policy.released {
+            stats.total_exposure -= payout;
+        }
         save_stats(&env, &stats);
 
-        let mut policy = load_policy(&env, claim.policy_id);
         policy.remaining_coverage -= payout;
         save_policy(&env, &policy);
 
-        claim.status = ClaimStatus::Paid;
+        claim.status = if shortfall > 0 {
+            ClaimStatus::PartiallyPaid
+        } else {
+            ClaimStatus::Paid
+        };
         claim.paid = payout;
+        claim.shortfall = shortfall;
         save_claim(&env, &claim);
 
         if payout > 0 {
@@ -414,7 +493,34 @@ impl InsurancePool {
         }
         env.events()
             .publish((symbol_short!("ins_pay"),), (claim_id, payout));
+        if shortfall > 0 {
+            env.events()
+                .publish((symbol_short!("ins_shrt"),), (claim_id, shortfall));
+        }
         payout
+    }
+
+    /// Removes an expired policy's remaining coverage from `total_exposure`, freeing that
+    /// capacity for new policies. Callable by anyone, once, after `expires_at`. Returns the
+    /// coverage released.
+    pub fn release_expired_policy(env: Env, policy_id: u64) -> i128 {
+        let mut policy = load_policy(&env, policy_id);
+        if env.ledger().timestamp() <= policy.expires_at {
+            panic_with_error!(&env, ContractError::PolicyNotExpired);
+        }
+        if policy.released {
+            panic_with_error!(&env, ContractError::PolicyAlreadyReleased);
+        }
+        let released = policy.remaining_coverage;
+        let mut stats = load_stats(&env);
+        stats.total_exposure -= released;
+        save_stats(&env, &stats);
+
+        policy.released = true;
+        save_policy(&env, &policy);
+        env.events()
+            .publish((symbol_short!("ins_rel"),), (policy_id, released));
+        released
     }
 
     /// Returns a provider's share balance.
