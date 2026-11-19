@@ -85,6 +85,8 @@ pub enum ContractError {
     ZeroInsuranceCoverage = 34,
     /// Suspension period is invalid.
     InvalidSuspensionPeriod = 35,
+    /// The restructure proposal has already been accepted and cannot be reused.
+    RestructureAlreadyProcessed = 36,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -1580,6 +1582,12 @@ impl LendingContract {
             .get(&restructure_key(loan_id))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::RestructureNotFound));
 
+        // #1861: A proposal may be accepted once; replaying it would re-extend
+        // the deadline and burn restructure slots.
+        if proposal.status != 0 {
+            panic_with_error!(&env, ContractError::RestructureAlreadyProcessed);
+        }
+
         // Check restructuring limits (max 3 restructures per borrower)
         let borrower_count_key = restructure_count_key(&proposal.borrower);
         let count: u32 = env.storage().persistent().get(&borrower_count_key).unwrap_or(0);
@@ -1601,6 +1609,12 @@ impl LendingContract {
         // Increment restructure count
         env.storage().persistent().set(&borrower_count_key, &(count + 1));
         extend_persistent_ttl(&env, &borrower_count_key);
+
+        // Mark the proposal as accepted in the same logical write so it cannot be replayed.
+        let mut accepted = proposal.clone();
+        accepted.status = 1;
+        env.storage().persistent().set(&restructure_key(loan_id), &accepted);
+        extend_persistent_ttl(&env, &restructure_key(loan_id));
 
         env.events().publish((RESTRUCTURE_ACCEPTED,), (loan_id, proposal.new_deadline));
     }
