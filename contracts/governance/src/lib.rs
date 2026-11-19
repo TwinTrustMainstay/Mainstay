@@ -32,6 +32,35 @@ pub const MAX_VOTES_PER_PROPOSAL: u32 = 500;
 pub const MAX_TITLE_LEN: u32 = 128;
 const BPS: u64 = 10_000;
 
+/// Schema of governable platform parameters: `(name, min, max)`, inclusive bounds.
+/// Only these names can be set by a parameter proposal. All values are `u64`.
+pub const GOVERNABLE_PARAMS: [(&str, u64, u64); 3] = [
+    ("FEE_BPS", 0, 1_000),
+    ("SLASH_BPS", 0, 5_000),
+    ("HEARTBEAT", 60, 86_400),
+];
+
+/// Returns the inclusive `(min, max)` bounds for a governable parameter, or `None`
+/// if the name is not in [`GOVERNABLE_PARAMS`].
+pub fn param_bounds(env: &Env, name: &Symbol) -> Option<(u64, u64)> {
+    GOVERNABLE_PARAMS.iter().find_map(|(key, min, max)| {
+        if *name == Symbol::new(env, key) {
+            Some((*min, *max))
+        } else {
+            None
+        }
+    })
+}
+
+/// Rejects parameter changes whose name is unknown or whose value is out of range.
+fn validate_parameter(env: &Env, name: &Symbol, value: u64) {
+    let (min, max) = param_bounds(env, name)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::UnknownParameter));
+    if value < min || value > max {
+        panic_with_error!(env, ContractError::ParameterOutOfRange);
+    }
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -66,6 +95,10 @@ pub enum ContractError {
     InsufficientBudget = 16,
     /// Proposal has reached `MAX_VOTES_PER_PROPOSAL`.
     TooManyVotes = 17,
+    /// Parameter name is not in the governable schema.
+    UnknownParameter = 18,
+    /// Parameter value is outside the bounds defined in the schema.
+    ParameterOutOfRange = 19,
 }
 
 #[contracttype]
@@ -329,6 +362,8 @@ impl Governance {
     /// - [`ContractError::InsufficientShares`] if the proposer is below the minimum (or holds none)
     /// - [`ContractError::InvalidProposal`] if the title is empty or longer than [`MAX_TITLE_LEN`],
     ///   or a funding amount is zero
+    /// - [`ContractError::UnknownParameter`] if a parameter name is not in [`GOVERNABLE_PARAMS`]
+    /// - [`ContractError::ParameterOutOfRange`] if a parameter value is outside its bounds
     pub fn create_proposal(env: Env, proposer: Address, title: String, kind: ProposalKind) -> u64 {
         proposer.require_auth();
         let config = load_config(&env);
@@ -339,8 +374,12 @@ impl Governance {
         if title.is_empty() || title.len() > MAX_TITLE_LEN {
             panic_with_error!(&env, ContractError::InvalidProposal);
         }
-        if let ProposalKind::Funding(_, 0) = kind {
-            panic_with_error!(&env, ContractError::InvalidProposal);
+        match &kind {
+            ProposalKind::Funding(_, 0) => {
+                panic_with_error!(&env, ContractError::InvalidProposal);
+            }
+            ProposalKind::Parameter(name, value) => validate_parameter(&env, name, *value),
+            _ => {}
         }
 
         let id: u64 = env
@@ -480,6 +519,8 @@ impl Governance {
     /// - [`ContractError::AlreadyExecuted`] if already executed
     /// - [`ContractError::ProposalNotPassed`] if the proposal has not passed
     /// - [`ContractError::InsufficientBudget`] if a funding grant exceeds the treasury balance
+    /// - [`ContractError::UnknownParameter`] / [`ContractError::ParameterOutOfRange`] if a
+    ///   parameter change fails schema validation (re-checked at execution)
     ///
     /// For a funding grant this debits the treasury ledger and emits a `GOV_FUND`
     /// event with `(recipient, amount)`. It does not transfer tokens.
@@ -493,6 +534,7 @@ impl Governance {
         }
         match proposal.kind.clone() {
             ProposalKind::Parameter(name, value) => {
+                validate_parameter(&env, &name, value);
                 env.storage()
                     .persistent()
                     .set(&DataKey::Param(name), &value);

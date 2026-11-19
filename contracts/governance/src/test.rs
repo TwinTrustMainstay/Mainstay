@@ -1,7 +1,7 @@
 use super::*;
 use soroban_sdk::{
-    symbol_short, testutils::Address as _, testutils::Events as _, testutils::Ledger, Address,
-    Env, String, Symbol, TryFromVal,
+    symbol_short, testutils::Address as _, testutils::Events as _, testutils::Ledger, Address, Env,
+    String, Symbol, TryFromVal,
 };
 
 const T0: u64 = 10_000;
@@ -130,6 +130,48 @@ fn invalid_proposals_are_rejected() {
             .try_create_proposal(&p, &title(&env), &ProposalKind::Funding(recipient, 0)),
         Err(Ok(contract_err(ContractError::InvalidProposal)))
     );
+}
+
+#[test]
+fn parameter_proposals_must_match_schema() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let p = holder(&ctx, 100);
+
+    // Unknown name is rejected at creation.
+    assert_eq!(
+        ctx.client.try_create_proposal(
+            &p,
+            &title(&env),
+            &ProposalKind::Parameter(symbol_short!("NOPE"), 1),
+        ),
+        Err(Ok(contract_err(ContractError::UnknownParameter)))
+    );
+    // Values outside the FEE_BPS bounds (0..=1_000) are rejected at creation.
+    assert_eq!(
+        ctx.client
+            .try_create_proposal(&p, &title(&env), &param_kind(1_001)),
+        Err(Ok(contract_err(ContractError::ParameterOutOfRange)))
+    );
+    // Boundary values are accepted.
+    ctx.client.create_proposal(&p, &title(&env), &param_kind(0));
+    ctx.client
+        .create_proposal(&p, &title(&env), &param_kind(1_000));
+    assert_eq!(ctx.client.get_proposal_count(), 2);
+}
+
+#[test]
+fn parameter_schema_bounds_are_looked_up_by_name() {
+    let env = Env::default();
+    assert_eq!(
+        param_bounds(&env, &symbol_short!("FEE_BPS")),
+        Some((0, 1_000))
+    );
+    assert_eq!(
+        param_bounds(&env, &symbol_short!("HEARTBEAT")),
+        Some((60, 86_400))
+    );
+    assert_eq!(param_bounds(&env, &symbol_short!("NOPE")), None);
 }
 
 #[test]
@@ -374,14 +416,21 @@ fn funding_execution_debits_treasury_ledger_and_emits_recipient() {
     ctx.client.execute_proposal(&id);
 
     // The GOV_FUND event carries the recipient and amount for off-chain payout.
-    let fund_event = env.events().all().iter().find(|(c, _, _)| *c == ctx.client.address);
+    let fund_event = env
+        .events()
+        .all()
+        .iter()
+        .find(|(c, _, _)| *c == ctx.client.address);
     let (_, topics, data) = fund_event.expect("GOV_FUND event emitted");
     assert_eq!(topics.len(), 2);
     assert_eq!(
         Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(),
         symbol_short!("GOV_FUND")
     );
-    assert_eq!(u64::try_from_val(&env, &topics.get(1).unwrap()).unwrap(), id);
+    assert_eq!(
+        u64::try_from_val(&env, &topics.get(1).unwrap()).unwrap(),
+        id
+    );
     assert_eq!(
         <(Address, u64)>::try_from_val(&env, &data).unwrap(),
         (recipient.clone(), 120u64)
