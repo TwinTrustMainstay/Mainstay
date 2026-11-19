@@ -20,6 +20,9 @@ path = "../contracts/asset-registry"
 [dependencies.engineer-registry]
 path = "../contracts/engineer-registry"
 
+[dependencies.bridge]
+path = "../contracts/bridge"
+
 [dependencies.soroban-sdk]
 version = "22.0.0"
 features = ["testutils"]
