@@ -322,3 +322,44 @@ fn history_is_bounded() {
         Err(Ok(ContractError::HistoryFull))
     );
 }
+
+/// Issue #1983: `record_id` is caller-chosen, so a front-runner that registers
+/// its own authority could reserve a predictable identifier before the rightful
+/// submitter. The rightful submitter must still be able to record its own
+/// record under that identifier.
+#[test]
+fn front_run_squatting_does_not_block_rightful_submitter() {
+    let c = setup();
+    let client = TimestampingClient::new(&c.env, &c.id);
+
+    // A second, admin-registered authority plays the front-runner.
+    let attacker = SigningKey::from_bytes(&[9u8; 32]);
+    let attacker_pub = BytesN::from_array(&c.env, &attacker.verifying_key().to_bytes());
+    client.add_authority(&c.admin, &attacker_pub, &(NOW + TEN_YEARS));
+
+    // The front-runner reserves the identifier first, with its own hash.
+    let squat_hash = [5u8; 32];
+    let squat_sig = sign(&attacker, &c.env, TSA_DOMAIN, 77, &squat_hash, NOW - 60);
+    client.submit_timestamp(
+        &77,
+        &BytesN::from_array(&c.env, &squat_hash),
+        &(NOW - 60),
+        &attacker_pub,
+        &squat_sig,
+    );
+
+    // The rightful submitter attests the same identifier for its record.
+    let real_hash = [4u8; 32];
+    let real_sig = sign(&c.tsa, &c.env, TSA_DOMAIN, 77, &real_hash, NOW - 30);
+    let res = client.try_submit_timestamp(
+        &77,
+        &BytesN::from_array(&c.env, &real_hash),
+        &(NOW - 30),
+        &c.tsa_pub,
+        &real_sig,
+    );
+    assert!(
+        matches!(res, Ok(Ok(()))),
+        "a squatted record_id blocked the rightful submitter"
+    );
+}
