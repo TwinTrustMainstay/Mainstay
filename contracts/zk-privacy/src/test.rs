@@ -5,8 +5,8 @@ use crate::{
     BitProof, ContractError, MembershipProof, RangeProof, ZkPrivacy, ZkPrivacyClient,
     ATTESTATION_TTL_SECS, BITS_PER_TX, MAX_ROSTER, SESSION_TTL_SECS,
 };
-use soroban_sdk::testutils::{Address as _, Ledger};
-use soroban_sdk::{Address, BytesN, Env, Vec};
+use soroban_sdk::testutils::{Address as _, Events as _, Ledger};
+use soroban_sdk::{symbol_short, Address, BytesN, Env, IntoVal, TryFromVal, Vec};
 
 fn setup() -> (Env, Address, Address) {
     let env = Env::default();
@@ -419,4 +419,24 @@ fn open_collateral_session_cannot_be_overwritten_by_another_party() {
         .unwrap()
         .unwrap();
     assert_eq!(client.get_collateral_session(&7).unwrap().owner, owner);
+}
+
+#[test]
+fn beginning_collateral_proof_emits_session_event() {
+    let (env, id, _admin) = setup();
+    let client = ZkPrivacyClient::new(&env, &id);
+    let owner = Address::generate(&env);
+    let r = blinding_from_seed(&env, &seed(&env, 1), b"collateral");
+    let (c, proof) = prove_adequacy(&env, 7, 1500, &r, 1000, &seed(&env, 2)).unwrap();
+    client.begin_collateral_proof(&owner, &7, &c, &1000, &proof.bit_commitments);
+
+    let events = env.events().all();
+    assert_eq!(events.len(), 1);
+    let (contract, topics, data) = events.get(0).unwrap();
+    assert_eq!(contract, id);
+    assert_eq!(
+        topics,
+        soroban_sdk::vec![&env, symbol_short!("COLL_BEG").into_val(&env), 7u64.into_val(&env)]
+    );
+    assert_eq!(Address::try_from_val(&env, &data).unwrap(), owner);
 }

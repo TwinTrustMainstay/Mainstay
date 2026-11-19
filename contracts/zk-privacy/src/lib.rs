@@ -479,6 +479,7 @@ impl ZkPrivacy {
                 return Err(ContractError::SessionInProgress);
             }
         }
+        let event_owner = owner.clone();
         let session = CollateralSession {
             owner,
             commitment,
@@ -488,6 +489,8 @@ impl ZkPrivacy {
             started_at: now,
         };
         env.storage().persistent().set(&key, &session);
+        env.events()
+            .publish((symbol_short!("COLL_BEG"), asset_id), event_owner);
         Ok(())
     }
 
