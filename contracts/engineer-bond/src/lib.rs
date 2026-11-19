@@ -230,12 +230,16 @@ impl EngineerBond {
 
     /// Slashes `amount` from the engineer's bond and transfers it to the treasury.
     /// A slash resets the good-job streak, so recovery must be earned again.
+    /// Blocked while a dispute is open; the dispute must be resolved first.
     pub fn slash(env: Env, admin: Address, engineer: Address, amount: i128) {
         require_stored_admin(&env, &admin);
         if amount <= 0 {
             panic_with_error!(&env, ContractError::InvalidAmount);
         }
         let mut bond = load_bond(&env, &engineer);
+        if bond.dispute_open {
+            panic_with_error!(&env, ContractError::DisputeOpen);
+        }
         if amount > bond.staked {
             panic_with_error!(&env, ContractError::InsufficientBond);
         }

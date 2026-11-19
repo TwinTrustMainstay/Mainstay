@@ -166,6 +166,30 @@ fn resolving_dispute_restores_bonded_status() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn slash_is_blocked_while_dispute_is_open() {
+    let env = Env::default();
+    let ctx = setup(&env, 0);
+    let eng = funded_engineer(&ctx, 1_000);
+    ctx.client.post_bond(&eng, &500);
+    ctx.client.open_dispute(&ctx.admin, &eng);
+    ctx.client.slash(&ctx.admin, &eng, &100);
+}
+
+#[test]
+fn slash_succeeds_after_dispute_is_resolved() {
+    let env = Env::default();
+    let ctx = setup(&env, 0);
+    let eng = funded_engineer(&ctx, 1_000);
+    ctx.client.post_bond(&eng, &500);
+    ctx.client.open_dispute(&ctx.admin, &eng);
+    ctx.client.resolve_dispute(&ctx.admin, &eng);
+    ctx.client.slash(&ctx.admin, &eng, &100);
+    assert_eq!(ctx.client.get_bond(&eng).staked, 400);
+    assert_eq!(ctx.token.balance(&ctx.treasury), 100);
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #10)")]
 fn resolve_without_dispute_is_rejected() {
     let env = Env::default();
