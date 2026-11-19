@@ -22,6 +22,15 @@ asset, pays a premium into the pool, and can claim against the policy if the col
 | `premium_bps` | `initialize` | Premium as basis points of coverage. 500 = 5%. Must be 0 to 10,000. |
 | `term_secs` | `initialize` | Policy term. Claims are accepted only until `expires_at`. |
 
+Admins can change both after deployment with `set_premium_bps` and `set_term_secs`:
+
+- `set_premium_bps` accepts 0 to 10,000 basis points, and each change emits an event with the old
+  and new rate.
+- `set_term_secs` accepts 1 hour to 365 days (`MIN_TERM_SECS` to `MAX_TERM_SECS`). Each change
+  emits an event with the old and new term.
+- Changes apply to policies bought afterward. Existing policies keep their stored premium and
+  `expires_at`.
+
 - **Premium** = `coverage × premium_bps / 10,000`, paid to the pool at purchase. `quote_premium`
   returns it before purchase.
 - **Share price** = pool assets ÷ total shares. The first deposit mints one share per token.

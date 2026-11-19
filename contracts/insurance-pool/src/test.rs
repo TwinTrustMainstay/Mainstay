@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use crate::{ClaimStatus, InsurancePool, InsurancePoolClient};
+use crate::{ClaimStatus, InsurancePool, InsurancePoolClient, MAX_TERM_SECS, MIN_TERM_SECS};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
@@ -419,4 +419,86 @@ fn non_admin_cannot_pause() {
     let ctx = setup(&env);
     let intruder = Address::generate(&env);
     ctx.client.pause(&intruder);
+}
+
+#[test]
+fn admin_can_update_premium_rate() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let lender = funded(&env, &ctx, 10_000);
+    ctx.client.set_premium_bps(&ctx.admin, &1_000); // 10%
+    assert_eq!(ctx.client.quote_premium(&1_000), 100);
+    ctx.client.buy_policy(&lender, &7, &1_000);
+    assert_eq!(ctx.token.balance(&lender), 10_000 - 100);
+}
+
+#[test]
+fn premium_rate_bounds_are_inclusive() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    ctx.client.set_premium_bps(&ctx.admin, &0);
+    assert_eq!(ctx.client.quote_premium(&1_000), 0);
+    ctx.client.set_premium_bps(&ctx.admin, &10_000);
+    assert_eq!(ctx.client.quote_premium(&1_000), 1_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn premium_rate_above_maximum_is_rejected_on_update() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    ctx.client.set_premium_bps(&ctx.admin, &10_001);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn non_admin_cannot_update_premium_rate() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let intruder = Address::generate(&env);
+    ctx.client.set_premium_bps(&intruder, &100);
+}
+
+#[test]
+fn term_bounds_are_inclusive_and_apply_to_new_policies() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let lender = funded(&env, &ctx, 10_000);
+    ctx.client.set_term_secs(&ctx.admin, &MIN_TERM_SECS);
+    let short = ctx.client.buy_policy(&lender, &7, &100);
+    assert_eq!(
+        ctx.client.get_policy(&short).expires_at,
+        1_000 + MIN_TERM_SECS
+    );
+    ctx.client.set_term_secs(&ctx.admin, &MAX_TERM_SECS);
+    let long = ctx.client.buy_policy(&lender, &7, &100);
+    assert_eq!(
+        ctx.client.get_policy(&long).expires_at,
+        1_000 + MAX_TERM_SECS
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn term_below_minimum_is_rejected() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    ctx.client.set_term_secs(&ctx.admin, &(MIN_TERM_SECS - 1));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn term_above_maximum_is_rejected() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    ctx.client.set_term_secs(&ctx.admin, &(MAX_TERM_SECS + 1));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn non_admin_cannot_update_term() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let intruder = Address::generate(&env);
+    ctx.client.set_term_secs(&intruder, &MIN_TERM_SECS);
 }

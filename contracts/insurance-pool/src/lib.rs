@@ -23,6 +23,12 @@ use soroban_sdk::{
 /// Basis points denominator (10_000 = 100%).
 pub const BPS_DENOMINATOR: i128 = 10_000;
 
+/// Shortest policy term accepted by `set_term_secs`: one hour.
+pub const MIN_TERM_SECS: u64 = 3_600;
+
+/// Longest policy term accepted by `set_term_secs`: 365 days.
+pub const MAX_TERM_SECS: u64 = 365 * 24 * 3_600;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -57,6 +63,8 @@ pub enum ContractError {
     MathOverflow = 14,
     /// The pool is paused. Filing, purchases and withdrawals are blocked.
     Paused = 15,
+    /// Policy term must be between MIN_TERM_SECS and MAX_TERM_SECS.
+    InvalidTerm = 16,
 }
 
 #[contracttype]
@@ -471,21 +479,61 @@ impl InsurancePool {
         payout
     }
 
+    /// Sets the premium rate in basis points for future policies. Admin only. Existing
+    /// policies keep the premium they were bought with.
+    pub fn set_premium_bps(env: Env, admin: Address, premium_bps: u32) {
+        require_stored_admin(&env, &admin);
+        if i128::from(premium_bps) > BPS_DENOMINATOR {
+            panic_with_error!(&env, ContractError::InvalidPremiumRate);
+        }
+        let old: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PremiumBps)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::PremiumBps, &premium_bps);
+        env.events()
+            .publish((symbol_short!("ins_prm"),), (admin, old, premium_bps));
+    }
+
+    /// Sets the policy term in seconds for future policies. Admin only. Must be between
+    /// MIN_TERM_SECS and MAX_TERM_SECS. Existing policies keep their stored `expires_at`.
+    pub fn set_term_secs(env: Env, admin: Address, term_secs: u64) {
+        require_stored_admin(&env, &admin);
+        if !(MIN_TERM_SECS..=MAX_TERM_SECS).contains(&term_secs) {
+            panic_with_error!(&env, ContractError::InvalidTerm);
+        }
+        let old: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TermSecs)
+            .unwrap_or(0);
+        env.storage().instance().set(&DataKey::TermSecs, &term_secs);
+        env.events()
+            .publish((symbol_short!("ins_trm"),), (admin, old, term_secs));
+    }
+
     /// Halts filing, policy purchases and withdrawals. Settlement stays open so the admin can
     /// still resolve pending claims during an incident. Admin only.
     pub fn pause(env: Env, admin: Address) {
         require_stored_admin(&env, &admin);
         env.storage().instance().set(&DataKey::Paused, &true);
-        env.events()
-            .publish((symbol_short!("ins_pau"),), (admin, env.ledger().timestamp()));
+        env.events().publish(
+            (symbol_short!("ins_pau"),),
+            (admin, env.ledger().timestamp()),
+        );
     }
 
     /// Resumes filing, policy purchases and withdrawals. Admin only.
     pub fn unpause(env: Env, admin: Address) {
         require_stored_admin(&env, &admin);
         env.storage().instance().set(&DataKey::Paused, &false);
-        env.events()
-            .publish((symbol_short!("ins_unp"),), (admin, env.ledger().timestamp()));
+        env.events().publish(
+            (symbol_short!("ins_unp"),),
+            (admin, env.ledger().timestamp()),
+        );
     }
 
     /// Returns whether the pool is paused.
