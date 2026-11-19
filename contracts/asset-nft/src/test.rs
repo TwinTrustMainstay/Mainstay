@@ -1,16 +1,33 @@
 #![cfg(test)]
 
-use crate::{AssetNft, AssetNftClient, TradeKind};
+use crate::{AssetNft, AssetNftClient, Trade, TradeKind, MAX_HISTORY};
 use soroban_sdk::{
-    testutils::Address as _,
+    contract, contractimpl, symbol_short, testutils::Address as _, testutils::Events, IntoVal,
+    TryFromVal,
     token::{Client as TokenClient, StellarAssetClient},
     Address, Env, String,
 };
+
+/// Test double for the asset registry lien query. Lien flags are keyed by asset id.
+#[contract]
+pub struct MockRegistry;
+
+#[contractimpl]
+impl MockRegistry {
+    pub fn set_locked(env: Env, asset_id: u64, locked: bool) {
+        env.storage().persistent().set(&asset_id, &locked);
+    }
+
+    pub fn is_asset_locked(env: Env, asset_id: u64) -> bool {
+        env.storage().persistent().get(&asset_id).unwrap_or(false)
+    }
+}
 
 struct Ctx<'a> {
     client: AssetNftClient<'a>,
     payments: TokenClient<'a>,
     payment_minter: StellarAssetClient<'a>,
+    registry: MockRegistryClient<'a>,
     admin: Address,
 }
 
@@ -22,14 +39,16 @@ fn setup<'a>(env: &'a Env) -> Ctx<'a> {
         .register_stellar_asset_contract_v2(token_admin)
         .address();
 
+    let registry_id = env.register(MockRegistry, ());
     let contract_id = env.register(AssetNft, ());
     let client = AssetNftClient::new(env, &contract_id);
-    client.initialize(&admin, &payment_id);
+    client.initialize(&admin, &payment_id, &registry_id);
 
     Ctx {
         client,
         payments: TokenClient::new(env, &payment_id),
         payment_minter: StellarAssetClient::new(env, &payment_id),
+        registry: MockRegistryClient::new(env, &registry_id),
         admin,
     }
 }
@@ -206,4 +225,212 @@ fn zero_price_listing_is_rejected() {
     let alice = Address::generate(&env);
     let token_id = ctx.client.mint(&ctx.admin, &7, &alice, &uri(&env));
     ctx.client.list_for_sale(&alice, &token_id, &0);
+}
+
+#[test]
+fn history_truncation_emits_dropped_trade() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let token_id = ctx.client.mint(&ctx.admin, &7, &alice, &uri(&env));
+
+    // The mint plus MAX_HISTORY transfers overflows the history by one entry.
+    let (mut from, mut to) = (alice.clone(), bob.clone());
+    for _ in 0..MAX_HISTORY {
+        ctx.client.transfer(&from, &to, &token_id);
+        core::mem::swap(&mut from, &mut to);
+    }
+
+    // Read events before any other contract call, which would replace the event list.
+    let trunc_topic = soroban_sdk::vec![&env, symbol_short!("nft_trunc").into_val(&env)];
+    let events = env.events().all();
+    let trunc = events
+        .iter()
+        .find(|e| e.1 == trunc_topic)
+        .expect("truncation event emitted");
+    assert_eq!(trunc.0, ctx.client.address);
+    let (dropped_id, dropped) = <(u64, Trade)>::try_from_val(&env, &trunc.2).unwrap();
+    assert_eq!(dropped_id, token_id);
+    assert_eq!(dropped.kind, TradeKind::Mint);
+    assert_eq!(dropped.to, alice);
+
+    let history = ctx.client.get_history(&token_id);
+    assert_eq!(history.len(), MAX_HISTORY);
+    assert_eq!(history.get(0).unwrap().kind, TradeKind::Transfer);
+}
+
+#[test]
+fn history_below_limit_emits_no_truncation_event() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let token_id = ctx.client.mint(&ctx.admin, &7, &alice, &uri(&env));
+    ctx.client.transfer(&alice, &bob, &token_id);
+
+    let trunc_topic = soroban_sdk::vec![&env, symbol_short!("nft_trunc").into_val(&env)];
+    let events = env.events().all();
+    assert!(!events.iter().any(|e| e.1 == trunc_topic));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn pause_blocks_mint() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let owner = Address::generate(&env);
+    ctx.client.pause(&ctx.admin);
+    ctx.client.mint(&ctx.admin, &42, &owner, &uri(&env));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn pause_blocks_transfer() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let token_id = ctx.client.mint(&ctx.admin, &7, &alice, &uri(&env));
+    ctx.client.pause(&ctx.admin);
+    ctx.client.transfer(&alice, &bob, &token_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn pause_blocks_metadata_sync() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let alice = Address::generate(&env);
+    let token_id = ctx.client.mint(&ctx.admin, &7, &alice, &uri(&env));
+    ctx.client.pause(&ctx.admin);
+    ctx.client
+        .sync_metadata(&ctx.admin, &token_id, &uri(&env), &85, &12);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn pause_blocks_listing() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let alice = Address::generate(&env);
+    let token_id = ctx.client.mint(&ctx.admin, &7, &alice, &uri(&env));
+    ctx.client.pause(&ctx.admin);
+    ctx.client.list_for_sale(&alice, &token_id, &500);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn pause_blocks_cancelling_listing() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let alice = Address::generate(&env);
+    let token_id = ctx.client.mint(&ctx.admin, &7, &alice, &uri(&env));
+    ctx.client.list_for_sale(&alice, &token_id, &500);
+    ctx.client.pause(&ctx.admin);
+    ctx.client.cancel_listing(&alice, &token_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn pause_blocks_buy() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let seller = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    ctx.payment_minter.mint(&buyer, &1_000);
+    let token_id = ctx.client.mint(&ctx.admin, &7, &seller, &uri(&env));
+    ctx.client.list_for_sale(&seller, &token_id, &600);
+    ctx.client.pause(&ctx.admin);
+    ctx.client.buy(&buyer, &token_id);
+}
+
+#[test]
+fn unpause_restores_state_changing_calls() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    assert!(!ctx.client.is_paused());
+
+    ctx.client.pause(&ctx.admin);
+    assert!(ctx.client.is_paused());
+    ctx.client.unpause(&ctx.admin);
+    assert!(!ctx.client.is_paused());
+
+    let token_id = ctx.client.mint(&ctx.admin, &7, &alice, &uri(&env));
+    ctx.client.transfer(&alice, &bob, &token_id);
+    assert_eq!(ctx.client.get_asset_owner(&7), Some(bob));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn non_admin_cannot_pause() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let intruder = Address::generate(&env);
+    ctx.client.pause(&intruder);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn non_admin_cannot_unpause() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    ctx.client.pause(&ctx.admin);
+    let intruder = Address::generate(&env);
+    ctx.client.unpause(&intruder);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn pledged_asset_cannot_be_listed() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let alice = Address::generate(&env);
+    let token_id = ctx.client.mint(&ctx.admin, &7, &alice, &uri(&env));
+    ctx.registry.set_locked(&7, &true);
+    ctx.client.list_for_sale(&alice, &token_id, &500);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn pledged_asset_cannot_be_transferred() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let token_id = ctx.client.mint(&ctx.admin, &7, &alice, &uri(&env));
+    ctx.registry.set_locked(&7, &true);
+    ctx.client.transfer(&alice, &bob, &token_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn pledged_asset_cannot_be_sold() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let seller = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    ctx.payment_minter.mint(&buyer, &1_000);
+    let token_id = ctx.client.mint(&ctx.admin, &7, &seller, &uri(&env));
+    ctx.client.list_for_sale(&seller, &token_id, &600);
+
+    // Lien placed after listing: the sale must still be refused at buy time.
+    ctx.registry.set_locked(&7, &true);
+    ctx.client.buy(&buyer, &token_id);
+}
+
+#[test]
+fn released_lien_allows_transfer() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let token_id = ctx.client.mint(&ctx.admin, &7, &alice, &uri(&env));
+
+    ctx.registry.set_locked(&7, &true);
+    ctx.registry.set_locked(&7, &false);
+    ctx.client.transfer(&alice, &bob, &token_id);
+    assert_eq!(ctx.client.get_asset_owner(&7), Some(bob));
 }
