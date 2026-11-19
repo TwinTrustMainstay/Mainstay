@@ -1,6 +1,8 @@
 #![cfg(test)]
 
-use crate::{DisputeOutcome, EngineerBond, EngineerBondClient, EventKind, RECOVERY_STREAK};
+use crate::{
+    DisputeOutcome, EngineerBond, EngineerBondClient, EventKind, MAX_HISTORY, RECOVERY_STREAK,
+};
 use soroban_sdk::{
     testutils::Address as _,
     token::{Client as TokenClient, StellarAssetClient},
@@ -300,4 +302,36 @@ fn slash_linked_to_unknown_dispute_is_rejected() {
     let eng = funded_engineer(&ctx, 1_000);
     ctx.client.post_bond(&eng, &500);
     ctx.client.slash(&ctx.admin, &eng, &10, &Some(1));
+}
+
+#[test]
+fn history_truncation_is_counted_and_keeps_newest_entries() {
+    let env = Env::default();
+    let ctx = setup(&env, 0);
+    let eng = funded_engineer(&ctx, 1_000);
+    // Posted is entry 0; each post_bond adds one entry, so this overflows MAX_HISTORY.
+    let extra = 5u32;
+    ctx.client.post_bond(&eng, &1);
+    for _ in 0..(MAX_HISTORY + extra - 1) {
+        ctx.client.record_performance(&ctx.admin, &eng, &true);
+    }
+    ctx.client.record_performance(&ctx.admin, &eng, &false);
+
+    let history = ctx.client.get_history(&eng);
+    assert_eq!(history.len(), MAX_HISTORY);
+    assert_eq!(ctx.client.get_history_dropped(&eng), extra + 1);
+    // The oldest surviving entry is the one that was (extra + 1) positions from the start.
+    assert_eq!(history.get(MAX_HISTORY - 1).unwrap().kind, EventKind::PoorJob);
+    assert_eq!(history.get(0).unwrap().kind, EventKind::GoodJob);
+}
+
+#[test]
+fn history_below_limit_drops_nothing() {
+    let env = Env::default();
+    let ctx = setup(&env, 0);
+    let eng = funded_engineer(&ctx, 1_000);
+    ctx.client.post_bond(&eng, &100);
+    ctx.client.record_performance(&ctx.admin, &eng, &true);
+    assert_eq!(ctx.client.get_history(&eng).len(), 2);
+    assert_eq!(ctx.client.get_history_dropped(&eng), 0);
 }

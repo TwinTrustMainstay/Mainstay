@@ -24,7 +24,11 @@ use soroban_sdk::{
 /// Consecutive good-job outcomes an engineer must reach after a slash before withdrawing.
 pub const RECOVERY_STREAK: u32 = 3;
 
-/// Maximum history entries kept per engineer. Older entries are dropped first.
+/// Retention limit: maximum history entries kept per engineer.
+///
+/// When an engineer's history is full, the oldest entry is removed to make room for the
+/// new one. Each removal emits a `bond_trnc` event carrying the dropped entry's kind, and
+/// is counted in [`EngineerBond::get_history_dropped`], so the loss is never silent.
 pub const MAX_HISTORY: u32 = 50;
 
 #[contracterror]
@@ -120,6 +124,7 @@ pub enum DataKey {
     Bond(Address),
     History(Address),
     Dispute(Address, u32),
+    HistoryDropped(Address),
 }
 
 #[contract]
@@ -187,7 +192,16 @@ fn record(env: &Env, engineer: &Address, kind: EventKind, amount: i128) {
         .get(&key)
         .unwrap_or_else(|| Vec::new(env));
     if history.len() >= MAX_HISTORY {
+        let dropped = history.get(0).unwrap();
         history.remove(0);
+
+        let dropped_key = DataKey::HistoryDropped(engineer.clone());
+        let total: u32 = env.storage().persistent().get(&dropped_key).unwrap_or(0);
+        env.storage().persistent().set(&dropped_key, &(total + 1));
+        extend_persistent_ttl(env, dropped_key);
+
+        env.events()
+            .publish((symbol_short!("bond_trnc"),), (engineer.clone(), dropped.kind));
     }
     history.push_back(BondEvent {
         kind,
@@ -385,6 +399,14 @@ impl EngineerBond {
             .persistent()
             .get(&DataKey::History(engineer))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Number of history entries dropped for this engineer because of [`MAX_HISTORY`].
+    pub fn get_history_dropped(env: Env, engineer: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::HistoryDropped(engineer))
+            .unwrap_or(0)
     }
 }
 
