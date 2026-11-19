@@ -18,7 +18,7 @@ mod test;
 use shared::{extend_persistent_ttl, require_admin};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
-    Address, Env, Vec,
+    Address, BytesN, Env, String, Vec,
 };
 
 /// Consecutive good-job outcomes an engineer must reach after a slash before withdrawing.
@@ -57,6 +57,8 @@ pub enum ContractError {
     NoOpenDispute = 10,
     /// No bond record exists for this engineer; they never staked.
     BondNotFound = 11,
+    /// Dispute reason must not be empty; an empty reason cannot be audited.
+    EmptyReason = 12,
 }
 
 #[contracttype]
@@ -83,6 +85,18 @@ pub struct Bond {
     pub dispute_opened_at: u64,
 }
 
+/// Audit record for a dispute, kept after it is resolved.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeRecord {
+    /// Admin address that opened the dispute.
+    pub opened_by: Address,
+    /// Human-readable reason for the dispute.
+    pub reason: String,
+    /// Hash of the off-chain evidence supporting the dispute.
+    pub evidence_hash: BytesN<32>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BondEvent {
@@ -100,6 +114,7 @@ pub enum DataKey {
     MinBond,
     Bond(Address),
     History(Address),
+    Dispute(Address),
 }
 
 #[contract]
@@ -227,8 +242,18 @@ impl EngineerBond {
     }
 
     /// Opens a dispute against the engineer. Blocks withdrawal until resolved.
-    pub fn open_dispute(env: Env, admin: Address, engineer: Address) {
+    /// Stores the reason, evidence hash and acting admin as an audit record, and emits them.
+    pub fn open_dispute(
+        env: Env,
+        admin: Address,
+        engineer: Address,
+        reason: String,
+        evidence_hash: BytesN<32>,
+    ) {
         require_stored_admin(&env, &admin);
+        if reason.is_empty() {
+            panic_with_error!(&env, ContractError::EmptyReason);
+        }
         let mut bond = load_existing_bond(&env, &engineer);
         if bond.dispute_open {
             panic_with_error!(&env, ContractError::DisputeAlreadyOpen);
@@ -236,7 +261,23 @@ impl EngineerBond {
         bond.dispute_open = true;
         bond.dispute_opened_at = env.ledger().timestamp();
         save_bond(&env, &engineer, &bond);
+
+        let key = DataKey::Dispute(engineer.clone());
+        env.storage().persistent().set(
+            &key,
+            &DisputeRecord {
+                opened_by: admin.clone(),
+                reason: reason.clone(),
+                evidence_hash: evidence_hash.clone(),
+            },
+        );
+        extend_persistent_ttl(&env, key);
+
         record(&env, &engineer, EventKind::DisputeOpened, 0);
+        env.events().publish(
+            (symbol_short!("disp_opn"),),
+            (engineer, admin, reason, evidence_hash),
+        );
     }
 
     /// Closes an open dispute without slashing.
@@ -334,6 +375,11 @@ impl EngineerBond {
 
     pub fn get_bond(env: Env, engineer: Address) -> Bond {
         load_bond(&env, &engineer)
+    }
+
+    /// Returns the audit record of the engineer's most recent dispute, if any.
+    pub fn get_dispute(env: Env, engineer: Address) -> Option<DisputeRecord> {
+        env.storage().persistent().get(&DataKey::Dispute(engineer))
     }
 
     pub fn get_history(env: Env, engineer: Address) -> Vec<BondEvent> {
