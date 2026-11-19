@@ -1,6 +1,6 @@
 use crate::{
     ContractError, MobileApi, MobileApiClient, CURRENT_API_VERSION, MAX_CHANGE_LOG_ENTRIES,
-    MAX_PAGE_SIZE, MIN_API_VERSION,
+    DEFAULT_RATE_LIMIT_REQUESTS, DEFAULT_RATE_LIMIT_WINDOW_SECS, MAX_PAGE_SIZE, MIN_API_VERSION,
 };
 use soroban_sdk::testutils::{Address as _, Ledger};
 use soroban_sdk::{vec, Address, BytesN, Env, Symbol};
@@ -265,4 +265,32 @@ fn register_client_emits_registration_event() {
     assert_eq!(emitted_client, app);
     let emitted_version: u32 = u32::try_from_val(&env, &data).unwrap();
     assert_eq!(emitted_version, negotiated);
+}
+
+#[test]
+fn set_rate_limit_emits_old_and_new_limits() {
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::TryFromVal;
+
+    let (env, id, admin) = setup();
+    let client = MobileApiClient::new(&env, &id);
+    client.set_rate_limit(&admin, &25, &30);
+
+    let target = Symbol::new(&env, "RATE_SET");
+    let found = env.events().all().iter().find(|(addr, topics, _)| {
+        *addr == id
+            && topics
+                .get(0)
+                .and_then(|v| Symbol::try_from_val(&env, &v).ok())
+                .map(|s| s == target)
+                .unwrap_or(false)
+    });
+    let (_, _, data) = found.expect("set_rate_limit must emit a RATE_SET event");
+    let (old_max, old_window, new_max, new_window): (u32, u64, u32, u64) =
+        <(u32, u64, u32, u64)>::try_from_val(&env, &data).unwrap();
+    assert_eq!(
+        (old_max, old_window),
+        (DEFAULT_RATE_LIMIT_REQUESTS, DEFAULT_RATE_LIMIT_WINDOW_SECS)
+    );
+    assert_eq!((new_max, new_window), (25, 30));
 }

@@ -377,12 +377,23 @@ impl MobileApi {
         {
             return Err(ContractError::InvalidRateLimitConfig);
         }
+        let previous = rate_limit_config(&env);
         env.storage().instance().set(
             &DataKey::RateLimit,
             &RateLimitConfig {
                 max_requests,
                 window_secs,
             },
+        );
+        // Audit trail: reconstructs the limit history from events alone.
+        env.events().publish(
+            (soroban_sdk::symbol_short!("RATE_SET"),),
+            (
+                previous.max_requests,
+                previous.window_secs,
+                max_requests,
+                window_secs,
+            ),
         );
         Ok(())
     }
