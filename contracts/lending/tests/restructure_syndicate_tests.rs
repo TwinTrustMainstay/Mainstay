@@ -119,3 +119,77 @@ fn restructure_rejects_zero_payment_amount() {
     assert!(client.try_accept_restructure(&admin, &loan_id).is_err());
     assert_eq!(client.get_loan(&borrower).unwrap().amount, 1_000);
 }
+
+// ── #1863: proposals bind to the active loan and forbearance blocks slashing ──
+
+#[test]
+fn restructure_proposal_must_match_active_loan() {
+    let env = Env::default();
+    let (contract_id, _admin, _token) = setup(&env);
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    let (borrower, loan_id) = active_loan(&env, &client, 1_000);
+    let new_deadline = env.ledger().timestamp() + 10_000;
+    let wrong_loan_id = loan_id + 999;
+
+    assert!(client
+        .try_propose_loan_restructure(&borrower, &wrong_loan_id, &new_deadline, &500)
+        .is_err());
+    assert!(client.get_restructure(&wrong_loan_id).is_none());
+}
+
+#[test]
+fn accepted_restructure_blocks_slash_during_forbearance() {
+    let env = Env::default();
+    let (contract_id, admin, _token) = setup(&env);
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    let (borrower, loan_id) = active_loan(&env, &client, 1_000);
+    let new_deadline = env.ledger().timestamp() + 10_000;
+    client.propose_loan_restructure(&borrower, &loan_id, &new_deadline, &600);
+    client.accept_restructure(&admin, &loan_id);
+
+    assert!(client.try_slash(&admin, &borrower).is_err());
+    assert_eq!(
+        client.get_loan(&borrower).unwrap().status,
+        lending::LoanStatus::Active
+    );
+}
+
+#[test]
+fn slash_allowed_after_forbearance_expires() {
+    let env = Env::default();
+    let (contract_id, admin, _token) = setup(&env);
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    let (borrower, loan_id) = active_loan(&env, &client, 1_000);
+    let new_deadline = env.ledger().timestamp() + 10_000;
+    client.propose_loan_restructure(&borrower, &loan_id, &new_deadline, &600);
+    client.accept_restructure(&admin, &loan_id);
+
+    let forbearance_end = client.get_restructure(&loan_id).unwrap().forbearance_end;
+    env.ledger().with_mut(|li| li.timestamp = forbearance_end);
+
+    client.slash(&admin, &borrower);
+    assert_eq!(
+        client.get_loan(&borrower).unwrap().status,
+        lending::LoanStatus::Defaulted
+    );
+}
+
+#[test]
+fn slash_allowed_when_restructure_only_proposed() {
+    let env = Env::default();
+    let (contract_id, admin, _token) = setup(&env);
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    let (borrower, loan_id) = active_loan(&env, &client, 1_000);
+    let new_deadline = env.ledger().timestamp() + 10_000;
+    client.propose_loan_restructure(&borrower, &loan_id, &new_deadline, &600);
+
+    client.slash(&admin, &borrower);
+    assert_eq!(
+        client.get_loan(&borrower).unwrap().status,
+        lending::LoanStatus::Defaulted
+    );
+}

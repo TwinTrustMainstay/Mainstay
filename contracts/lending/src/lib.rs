@@ -89,6 +89,10 @@ pub enum ContractError {
     RestructureAlreadyProcessed = 36,
     /// Restructured payment must be greater than zero and not exceed the loan amount.
     RestructureAmountInvalid = 37,
+    /// The restructure proposal does not refer to the borrower's active loan.
+    RestructureLoanMismatch = 38,
+    /// The loan is inside an accepted restructure's forbearance period and cannot be slashed.
+    InForbearance = 39,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -947,6 +951,17 @@ impl LendingContract {
             panic_with_error!(&env, ContractError::NoActiveLoan);
         }
 
+        // #1863: An accepted restructure suspends default until its forbearance ends.
+        if let Some(proposal) = env
+            .storage()
+            .persistent()
+            .get::<_, RestructureProposal>(&restructure_key(loan.id))
+        {
+            if proposal.status == 1 && env.ledger().timestamp() < proposal.forbearance_end {
+                panic_with_error!(&env, ContractError::InForbearance);
+            }
+        }
+
         loan.status = LoanStatus::Defaulted;
         env.storage().persistent().set(&key, &loan);
         extend_persistent_ttl(&env, key.clone());
@@ -1548,6 +1563,11 @@ impl LendingContract {
 
         if loan.status != LoanStatus::Active {
             panic_with_error!(&env, ContractError::NoActiveLoan);
+        }
+
+        // #1863: The proposal must bind to the borrower's active loan.
+        if loan.id != loan_id {
+            panic_with_error!(&env, ContractError::RestructureLoanMismatch);
         }
 
         // Set forbearance period to 30 days from now
