@@ -50,3 +50,9 @@ pub(crate) const EVENT_TASK_DUE_SOON: Symbol = symbol_short!("TASK_SOON");
 
 /// Emitted when an engineer's Ed25519 signature over a maintenance record is stored via `sign_maintenance_record`.
 pub(crate) const EVENT_MNT_SIG: Symbol = symbol_short!("MNT_SIG");
+
+/// Emitted when a new external score provider is added via `register_score_provider`.
+pub(crate) const EVENT_PROV_REG: Symbol = symbol_short!("PROV_REG");
+
+/// Emitted when an external score provider is removed via `remove_score_provider`.
+pub(crate) const EVENT_PROV_RM: Symbol = symbol_short!("PROV_RM");

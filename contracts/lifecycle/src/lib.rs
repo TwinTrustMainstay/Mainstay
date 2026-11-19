@@ -25,7 +25,7 @@ pub(crate) use storage::{
 pub(crate) use events::{
     EVENT_ADMIN_SET, EVENT_DECAY, EVENT_INIT, EVENT_MAINT, EVENT_PROP_ADMIN, EVENT_PRUNED,
     EVENT_REG_AST, EVENT_REG_ENG, EVENT_RST_SCR, EVENT_XFER, EVENT_WEIGHT_PROP, EVENT_WEIGHT_EXEC,
-    EVENT_RECONSTR, EVENT_TASK_DUE_SOON, EVENT_MNT_SIG,
+    EVENT_RECONSTR, EVENT_TASK_DUE_SOON, EVENT_MNT_SIG, EVENT_PROV_REG, EVENT_PROV_RM,
 };
 
 use crate::errors::ContractError;
@@ -7783,6 +7783,7 @@ impl Lifecycle {
         providers.push_back(provider.clone());
         env.storage().persistent().set(&providers_key, &providers);
         shared::extend_persistent_ttl(&env, &providers_key);
+        env.events().publish((EVENT_PROV_REG,), (provider,));
     }
 
     /// Remove a score provider from the registry.
@@ -7805,15 +7806,21 @@ impl Lifecycle {
             .unwrap_or_else(|| Vec::new(&env));
 
         let mut new_providers: Vec<Address> = Vec::new(&env);
+        let mut removed = false;
         for p in 0..providers.len() {
             let addr = providers.get(p).unwrap();
             if addr != provider {
                 new_providers.push_back(addr);
+            } else {
+                removed = true;
             }
         }
 
         env.storage().persistent().set(&providers_key, &new_providers);
         shared::extend_persistent_ttl(&env, &providers_key);
+        if removed {
+            env.events().publish((EVENT_PROV_RM,), (provider,));
+        }
     }
 
     /// Submit an external score from a provider for consensus scoring.
@@ -9105,6 +9112,7 @@ mod tests {
     mod maintenance_fuzz_tests;
     mod maintenance_ttl_tests;
     mod maintenance_signature_event_tests;
+    mod score_provider_event_tests;
 
     fn setup<'a>(
         env: &'a Env,
