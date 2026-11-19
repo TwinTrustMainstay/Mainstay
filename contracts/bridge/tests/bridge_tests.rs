@@ -564,3 +564,14 @@ fn test_set_relayers_validates_threshold_and_duplicates() {
         .try_set_relayers(&ctx.admin, &vec![&ctx.env, a.clone(), a.clone()], &1)
         .is_err());
 }
+
+#[test]
+fn test_initialize_requires_admin_authorization() {
+    let env = Env::default();
+    let contract_id = env.register(Bridge, ());
+    let client = BridgeClient::new(&env, &contract_id);
+
+    // No auth is mocked, so the admin never signed the initialize call.
+    let admin = Address::generate(&env);
+    assert!(client.try_initialize(&admin).is_err());
+}

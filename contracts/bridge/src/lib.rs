@@ -276,9 +276,13 @@ pub struct Bridge;
 impl Bridge {
     /// Initialize the bridge with an admin. Can be called only once.
     ///
+    /// The proposed admin must authorize the call, so an arbitrary caller cannot
+    /// front-run deployment and install itself as admin.
+    ///
     /// # Panics
     /// - [`ContractError::AlreadyInitialized`] if the admin is already set
     pub fn initialize(env: Env, admin: Address) {
+        admin.require_auth();
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, ContractError::AlreadyInitialized);
         }
