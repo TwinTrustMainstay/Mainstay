@@ -273,3 +273,43 @@ fn premium_rate_above_100_percent_is_rejected() {
     let client = InsurancePoolClient::new(&env, &contract_id);
     client.initialize(&admin, &token_id, &10_001, &TERM_SECS);
 }
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn pending_claims_cannot_collectively_exceed_coverage() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let lender = funded(&env, &ctx, 10_000);
+    let policy_id = ctx.client.buy_policy(&lender, &7, &1_000);
+    ctx.client.file_claim(&lender, &policy_id, &600);
+    // 600 is still pending, so 600 more would total 1_200 against 1_000 of coverage.
+    ctx.client.file_claim(&lender, &policy_id, &600);
+}
+
+#[test]
+fn rejected_claim_frees_its_coverage_for_new_claims() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let lender = funded(&env, &ctx, 10_000);
+    let policy_id = ctx.client.buy_policy(&lender, &7, &1_000);
+    let first = ctx.client.file_claim(&lender, &policy_id, &600);
+    ctx.client.settle_claim(&ctx.admin, &first, &false);
+
+    // The rejected claim no longer reserves coverage, so this fits exactly.
+    ctx.client.file_claim(&lender, &policy_id, &1_000);
+}
+
+#[test]
+fn settled_claims_leave_only_unpaid_pending_exposure() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let provider = funded(&env, &ctx, 10_000);
+    ctx.client.provide_capital(&provider, &5_000);
+    let lender = funded(&env, &ctx, 10_000);
+    let policy_id = ctx.client.buy_policy(&lender, &7, &1_000);
+    let paid = ctx.client.file_claim(&lender, &policy_id, &400);
+    ctx.client.settle_claim(&ctx.admin, &paid, &true);
+
+    // Paid claim reduced coverage to 600 and nothing is pending, so a 600 claim fits.
+    ctx.client.file_claim(&lender, &policy_id, &600);
+}

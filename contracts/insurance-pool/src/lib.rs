@@ -118,6 +118,8 @@ pub enum DataKey {
     NextClaimId,
     Shares(Address),
     Policy(u64),
+    /// Sum of pending claim amounts against a policy.
+    PolicyReserved(u64),
     Claim(u64),
 }
 
@@ -176,6 +178,19 @@ fn load_policy(env: &Env, id: u64) -> Policy {
 fn save_policy(env: &Env, policy: &Policy) {
     let key = DataKey::Policy(policy.id);
     env.storage().persistent().set(&key, policy);
+    extend_persistent_ttl(env, key);
+}
+
+fn policy_reserved(env: &Env, policy_id: u64) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::PolicyReserved(policy_id))
+        .unwrap_or(0)
+}
+
+fn set_policy_reserved(env: &Env, policy_id: u64, amount: i128) {
+    let key = DataKey::PolicyReserved(policy_id);
+    env.storage().persistent().set(&key, &amount);
     extend_persistent_ttl(env, key);
 }
 
@@ -344,9 +359,15 @@ impl InsurancePool {
         if env.ledger().timestamp() > policy.expires_at {
             panic_with_error!(&env, ContractError::PolicyExpired);
         }
-        if amount > policy.remaining_coverage {
+        // Pending claims on the same policy share its coverage, so count them all.
+        let reserved = policy_reserved(&env, policy_id);
+        let exposure = reserved
+            .checked_add(amount)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::MathOverflow));
+        if exposure > policy.remaining_coverage {
             panic_with_error!(&env, ContractError::ExceedsCoverage);
         }
+        set_policy_reserved(&env, policy_id, exposure);
 
         let id = next_id(&env, DataKey::NextClaimId);
         save_claim(
@@ -385,6 +406,11 @@ impl InsurancePool {
 
         let mut stats = load_stats(&env);
         stats.reserved -= claim.amount;
+        set_policy_reserved(
+            &env,
+            claim.policy_id,
+            policy_reserved(&env, claim.policy_id) - claim.amount,
+        );
 
         if !approve {
             claim.status = ClaimStatus::Rejected;
