@@ -775,3 +775,55 @@ fn test_swap_scope_cannot_be_registered_as_chain() {
         .try_add_chain(&ctx.admin, &SWAP_SCOPE, &eth_config(&ctx.env))
         .is_err());
 }
+
+// ── Swap liveness across idle periods (#1925) ────────────────
+
+const DAY_SECS: u64 = 86_400;
+const DAY_LEDGERS: u32 = 17_280;
+
+/// Advance the ledger sequence and timestamp together, as real time passing would.
+fn advance_days(ctx: &Ctx, days: u32) {
+    ctx.env.ledger().with_mut(|li| {
+        li.sequence_number += days * DAY_LEDGERS;
+        li.timestamp += days as u64 * DAY_SECS;
+    });
+}
+
+#[test]
+fn test_open_swap_record_survives_idle_past_old_ttl() {
+    let ctx = setup();
+    let preimage = Bytes::from_slice(&ctx.env, b"secret");
+    // Expiry is 60 days out. The old fixed 30-day TTL would archive the record
+    // at day 30, long before expiry.
+    let (id, _, _) = open_swap(&ctx, &preimage, 60 * DAY_SECS);
+
+    advance_days(&ctx, 45);
+    let swap = ctx.client.get_swap(&id);
+    assert_eq!(swap.status, SwapStatus::Open);
+    assert_eq!(swap.expiry, 60 * DAY_SECS);
+}
+
+#[test]
+fn test_bump_swap_keeps_open_swap_alive_until_expiry() {
+    let ctx = setup();
+    let preimage = Bytes::from_slice(&ctx.env, b"secret");
+    let (id, _, _) = open_swap(&ctx, &preimage, 60 * DAY_SECS);
+
+    advance_days(&ctx, 30);
+    // Permissionless: a stranger with no auth can bump the swap.
+    ctx.client.bump_swap(&id);
+
+    advance_days(&ctx, 25);
+    assert_eq!(ctx.client.get_swap(&id).status, SwapStatus::Open);
+}
+
+#[test]
+fn test_bump_swap_rejects_unknown_and_closed_swaps() {
+    let ctx = setup();
+    assert!(ctx.client.try_bump_swap(&42).is_err());
+
+    let preimage = Bytes::from_slice(&ctx.env, b"secret");
+    let (id, _, _) = open_swap(&ctx, &preimage, 1_000);
+    ctx.client.claim_swap(&id, &preimage);
+    assert!(ctx.client.try_bump_swap(&id).is_err());
+}

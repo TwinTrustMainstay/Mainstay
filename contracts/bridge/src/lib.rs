@@ -91,6 +91,12 @@ const MAX_RELAYERS: u32 = 20;
 /// they use this reserved scope. Chain ID 0 cannot be registered.
 pub const SWAP_SCOPE: u32 = 0;
 
+/// Approximate seconds per ledger, used to convert swap expiry into TTL ledgers.
+const LEDGER_SECS: u64 = 5;
+
+/// Ledgers a swap stays readable after its expiry, so the sender can still refund.
+const SWAP_GRACE_LEDGERS: u32 = TTL_TARGET;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChainConfig {
@@ -202,6 +208,25 @@ fn bump(env: &Env, key: &DataKey) {
     env.storage()
         .persistent()
         .extend_ttl(key, TTL_THRESHOLD, TTL_TARGET);
+}
+
+/// TTL target for an open swap: enough ledgers to cover the time left until
+/// `expiry` plus a grace period for refunding, capped at the network maximum.
+fn swap_ttl_target(env: &Env, expiry: u64) -> u32 {
+    let remaining_secs = expiry.saturating_sub(env.ledger().timestamp());
+    let ledgers = remaining_secs / LEDGER_SECS + SWAP_GRACE_LEDGERS as u64;
+    ledgers.min(env.storage().max_ttl() as u64) as u32
+}
+
+/// Extend a swap entry's TTL to cover its expiry plus the grace period. The
+/// contract instance (admin, relayers, pause flag) is extended to the same
+/// target, since swap calls cannot run if the instance has been archived.
+fn bump_swap_entry(env: &Env, key: &DataKey, expiry: u64) {
+    let target = swap_ttl_target(env, expiry);
+    env.storage()
+        .persistent()
+        .extend_ttl(key, TTL_THRESHOLD, target);
+    env.storage().instance().extend_ttl(TTL_THRESHOLD, target);
 }
 
 fn is_paused(env: &Env) -> bool {
@@ -714,7 +739,7 @@ impl Bridge {
         };
         let key = DataKey::Swap(id);
         env.storage().persistent().set(&key, &swap);
-        bump(&env, &key);
+        bump_swap_entry(&env, &key, expiry);
 
         env.events().publish(
             (symbol_short!("BR_SWP_N"),),
@@ -751,7 +776,7 @@ impl Bridge {
 
         swap.status = SwapStatus::Claimed;
         env.storage().persistent().set(&key, &swap);
-        bump(&env, &key);
+        bump_swap_entry(&env, &key, swap.expiry);
 
         token::Client::new(&env, &swap.token).transfer(
             &env.current_contract_address(),
@@ -785,7 +810,7 @@ impl Bridge {
 
         swap.status = SwapStatus::Refunded;
         env.storage().persistent().set(&key, &swap);
-        bump(&env, &key);
+        bump_swap_entry(&env, &key, swap.expiry);
 
         token::Client::new(&env, &swap.token).transfer(
             &env.current_contract_address(),
@@ -794,6 +819,26 @@ impl Bridge {
         );
         env.events()
             .publish((symbol_short!("BR_SWP_R"),), (swap_id,));
+    }
+
+    /// Extend the TTL of an open swap so it stays readable until its expiry and
+    /// grace period. Anyone may call this. It only extends the entry and does not
+    /// change the swap.
+    ///
+    /// # Panics
+    /// - [`ContractError::SwapNotFound`] if the swap does not exist
+    /// - [`ContractError::SwapNotOpen`] if the swap was already claimed or refunded
+    pub fn bump_swap(env: Env, swap_id: u64) {
+        let key = DataKey::Swap(swap_id);
+        let swap: Swap = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::SwapNotFound));
+        if swap.status != SwapStatus::Open {
+            panic_with_error!(&env, ContractError::SwapNotOpen);
+        }
+        bump_swap_entry(&env, &key, swap.expiry);
     }
 
     /// Get a swap by ID.
