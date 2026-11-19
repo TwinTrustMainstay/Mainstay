@@ -45,6 +45,8 @@ pub enum ContractError {
     NotListed = 9,
     /// The owner cannot buy their own NFT.
     CannotBuyOwnToken = 10,
+    /// The contract is paused; state-changing calls are rejected (issue #1973).
+    Paused = 11,
 }
 
 #[contracttype]
@@ -99,6 +101,7 @@ pub enum DataKey {
     TokenByAsset(u64),
     Listing(u64),
     History(u64),
+    Paused,
 }
 
 #[contract]
@@ -114,6 +117,17 @@ fn stored_admin(env: &Env) -> Address {
 fn require_stored_admin(env: &Env, admin: &Address) {
     if require_admin(admin, &stored_admin(env)).is_err() {
         panic_with_error!(env, ContractError::UnauthorizedAdmin);
+    }
+}
+
+fn ensure_not_paused(env: &Env) {
+    let paused: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false);
+    if paused {
+        panic_with_error!(env, ContractError::Paused);
     }
 }
 
@@ -170,8 +184,34 @@ impl AssetNft {
         env.storage().instance().set(&DataKey::NextId, &1u64);
     }
 
+    /// Pauses all state-changing calls: mint, transfer, metadata sync, listing, cancelling
+    /// and buying. Admin only (issue #1973).
+    pub fn pause(env: Env, admin: Address) {
+        require_stored_admin(&env, &admin);
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events()
+            .publish((symbol_short!("nft_pause"),), (admin,));
+    }
+
+    /// Lifts a pause set by [`AssetNft::pause`]. Admin only.
+    pub fn unpause(env: Env, admin: Address) {
+        require_stored_admin(&env, &admin);
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events()
+            .publish((symbol_short!("nft_unpse"),), (admin,));
+    }
+
+    /// Returns whether state-changing calls are currently blocked.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
     /// Mints the NFT for an asset to `owner`. Admin only. One NFT per asset. Returns the token id.
     pub fn mint(env: Env, admin: Address, asset_id: u64, owner: Address, uri: String) -> u64 {
+        ensure_not_paused(&env);
         require_stored_admin(&env, &admin);
         if env
             .storage()
@@ -217,6 +257,7 @@ impl AssetNft {
 
     /// Transfers the NFT and the asset it represents. Fails while the NFT is listed.
     pub fn transfer(env: Env, from: Address, to: Address, token_id: u64) {
+        ensure_not_paused(&env);
         from.require_auth();
         let mut token = load_token(&env, token_id);
         if token.owner != from {
@@ -251,6 +292,7 @@ impl AssetNft {
         collateral_score: u32,
         maintenance_count: u32,
     ) {
+        ensure_not_paused(&env);
         require_stored_admin(&env, &admin);
         let mut token = load_token(&env, token_id);
         token.uri = uri;
@@ -265,6 +307,7 @@ impl AssetNft {
 
     /// Lists an NFT for sale at `price` payment-token units. Owner only.
     pub fn list_for_sale(env: Env, owner: Address, token_id: u64, price: i128) {
+        ensure_not_paused(&env);
         owner.require_auth();
         if price <= 0 {
             panic_with_error!(&env, ContractError::InvalidPrice);
@@ -288,6 +331,7 @@ impl AssetNft {
 
     /// Removes an active listing. Owner only.
     pub fn cancel_listing(env: Env, owner: Address, token_id: u64) {
+        ensure_not_paused(&env);
         owner.require_auth();
         let listing = Self::get_listing(env.clone(), token_id)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotListed));
@@ -301,6 +345,7 @@ impl AssetNft {
 
     /// Buys a listed NFT. The price is paid to the seller and ownership transfers to the buyer.
     pub fn buy(env: Env, buyer: Address, token_id: u64) {
+        ensure_not_paused(&env);
         buyer.require_auth();
         let listing = Self::get_listing(env.clone(), token_id)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotListed));

@@ -21,6 +21,9 @@ Tracking issue: #1736. Contract: `contracts/asset-nft`.
 
 ## Operational notes
 
+- **Pause.** The admin can `pause` the contract (`unpause` lifts it). While paused, `mint`,
+  `transfer`, `sync_metadata`, `list_for_sale`, `cancel_listing` and `buy` fail with
+  `Paused` (error #11). Read-only calls keep working (issue #1973).
 - Mint only after the asset is registered and verified in `asset-registry`. Minting is the
   point where the on-chain asset owner is fixed.
 - Keep the admin key aligned with the asset registry admin. Metadata sync trusts the admin.

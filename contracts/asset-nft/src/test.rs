@@ -254,3 +254,111 @@ fn history_below_limit_emits_no_truncation_event() {
     let events = env.events().all();
     assert!(!events.iter().any(|e| e.1 == trunc_topic));
 }
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn pause_blocks_mint() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let owner = Address::generate(&env);
+    ctx.client.pause(&ctx.admin);
+    ctx.client.mint(&ctx.admin, &42, &owner, &uri(&env));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn pause_blocks_transfer() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let token_id = ctx.client.mint(&ctx.admin, &7, &alice, &uri(&env));
+    ctx.client.pause(&ctx.admin);
+    ctx.client.transfer(&alice, &bob, &token_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn pause_blocks_metadata_sync() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let alice = Address::generate(&env);
+    let token_id = ctx.client.mint(&ctx.admin, &7, &alice, &uri(&env));
+    ctx.client.pause(&ctx.admin);
+    ctx.client
+        .sync_metadata(&ctx.admin, &token_id, &uri(&env), &85, &12);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn pause_blocks_listing() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let alice = Address::generate(&env);
+    let token_id = ctx.client.mint(&ctx.admin, &7, &alice, &uri(&env));
+    ctx.client.pause(&ctx.admin);
+    ctx.client.list_for_sale(&alice, &token_id, &500);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn pause_blocks_cancelling_listing() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let alice = Address::generate(&env);
+    let token_id = ctx.client.mint(&ctx.admin, &7, &alice, &uri(&env));
+    ctx.client.list_for_sale(&alice, &token_id, &500);
+    ctx.client.pause(&ctx.admin);
+    ctx.client.cancel_listing(&alice, &token_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn pause_blocks_buy() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let seller = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    ctx.payment_minter.mint(&buyer, &1_000);
+    let token_id = ctx.client.mint(&ctx.admin, &7, &seller, &uri(&env));
+    ctx.client.list_for_sale(&seller, &token_id, &600);
+    ctx.client.pause(&ctx.admin);
+    ctx.client.buy(&buyer, &token_id);
+}
+
+#[test]
+fn unpause_restores_state_changing_calls() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    assert!(!ctx.client.is_paused());
+
+    ctx.client.pause(&ctx.admin);
+    assert!(ctx.client.is_paused());
+    ctx.client.unpause(&ctx.admin);
+    assert!(!ctx.client.is_paused());
+
+    let token_id = ctx.client.mint(&ctx.admin, &7, &alice, &uri(&env));
+    ctx.client.transfer(&alice, &bob, &token_id);
+    assert_eq!(ctx.client.get_asset_owner(&7), Some(bob));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn non_admin_cannot_pause() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let intruder = Address::generate(&env);
+    ctx.client.pause(&intruder);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn non_admin_cannot_unpause() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    ctx.client.pause(&ctx.admin);
+    let intruder = Address::generate(&env);
+    ctx.client.unpause(&intruder);
+}
