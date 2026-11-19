@@ -6987,6 +6987,12 @@ impl Lifecycle {
         env.storage().persistent().set(&key, &snapshots);
         extend_persistent_ttl(&env, &key);
 
+        // Publish so off-chain indexers can react without polling storage.
+        env.events().publish(
+            (symbol_short!("HLTH_SNP"), asset_id),
+            snapshot.snapshot_timestamp,
+        );
+
         snapshot
     }
 
@@ -9131,6 +9137,7 @@ mod tests {
     mod maintenance_ttl_tests;
     mod dispute_auth_tests;
     mod snapshot_auth_tests;
+    mod snapshot_event_tests;
 
     fn setup<'a>(
         env: &'a Env,
