@@ -87,6 +87,8 @@ pub enum ContractError {
     InvalidSuspensionPeriod = 35,
     /// The restructure proposal has already been accepted and cannot be reused.
     RestructureAlreadyProcessed = 36,
+    /// Restructured payment must be greater than zero and not exceed the loan amount.
+    RestructureAmountInvalid = 37,
 }
 
 impl From<SharedContractError> for ContractError {
@@ -1602,6 +1604,13 @@ impl LendingContract {
             .get(&loan_key(&proposal.borrower))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoActiveLoan));
 
+        // #1862: reduced_payment_amount is the restructured amount due. It must
+        // lower the obligation (never raise it, never reach zero) and is applied
+        // to the loan so repay settles against the agreed amount.
+        if proposal.reduced_payment_amount == 0 || proposal.reduced_payment_amount > loan.amount {
+            panic_with_error!(&env, ContractError::RestructureAmountInvalid);
+        }
+        loan.amount = proposal.reduced_payment_amount;
         loan.deadline = proposal.new_deadline;
         env.storage().persistent().set(&loan_key(&proposal.borrower), &loan);
         extend_persistent_ttl(&env, &loan_key(&proposal.borrower));

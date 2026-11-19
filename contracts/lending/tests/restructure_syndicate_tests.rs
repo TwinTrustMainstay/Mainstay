@@ -55,3 +55,67 @@ fn accept_restructure_cannot_be_replayed() {
     let replay = client.try_accept_restructure(&admin, &loan_id);
     assert!(replay.is_err(), "replaying an accepted restructure must fail");
 }
+
+// ── #1862: reduced_payment_amount is applied to the loan on accept ──
+
+#[test]
+fn accepted_restructure_applies_reduced_payment_amount() {
+    let env = Env::default();
+    let (contract_id, admin, _token) = setup(&env);
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    let (borrower, loan_id) = active_loan(&env, &client, 1_000);
+    let new_deadline = env.ledger().timestamp() + 10_000;
+    client.propose_loan_restructure(&borrower, &loan_id, &new_deadline, &600);
+    client.accept_restructure(&admin, &loan_id);
+
+    let loan = client.get_loan(&borrower).unwrap();
+    assert_eq!(loan.amount, 600, "amount due must be the restructured payment");
+    assert_eq!(loan.deadline, new_deadline);
+}
+
+#[test]
+fn repay_after_restructure_settles_against_reduced_amount() {
+    let env = Env::default();
+    let (contract_id, admin, _token) = setup(&env);
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    let (borrower, loan_id) = active_loan(&env, &client, 1_000);
+    let new_deadline = env.ledger().timestamp() + 10_000;
+    client.propose_loan_restructure(&borrower, &loan_id, &new_deadline, &600);
+    client.accept_restructure(&admin, &loan_id);
+
+    client.repay(&borrower);
+
+    let loan = client.get_loan(&borrower).unwrap();
+    assert_eq!(loan.status, lending::LoanStatus::Repaid);
+    assert_eq!(loan.amount, 600);
+}
+
+#[test]
+fn restructure_rejects_amount_above_loan_amount() {
+    let env = Env::default();
+    let (contract_id, admin, _token) = setup(&env);
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    let (borrower, loan_id) = active_loan(&env, &client, 1_000);
+    let new_deadline = env.ledger().timestamp() + 10_000;
+    client.propose_loan_restructure(&borrower, &loan_id, &new_deadline, &1_001);
+
+    assert!(client.try_accept_restructure(&admin, &loan_id).is_err());
+    assert_eq!(client.get_loan(&borrower).unwrap().amount, 1_000);
+}
+
+#[test]
+fn restructure_rejects_zero_payment_amount() {
+    let env = Env::default();
+    let (contract_id, admin, _token) = setup(&env);
+    let client = LendingContractClient::new(&env, &contract_id);
+
+    let (borrower, loan_id) = active_loan(&env, &client, 1_000);
+    let new_deadline = env.ledger().timestamp() + 10_000;
+    client.propose_loan_restructure(&borrower, &loan_id, &new_deadline, &0);
+
+    assert!(client.try_accept_restructure(&admin, &loan_id).is_err());
+    assert_eq!(client.get_loan(&borrower).unwrap().amount, 1_000);
+}
