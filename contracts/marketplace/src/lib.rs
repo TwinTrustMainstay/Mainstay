@@ -709,6 +709,7 @@ impl Marketplace {
         if now <= auction.bid_end || now > auction.reveal_end {
             panic_with_error!(&env, ContractError::RevealWindowClosed);
         }
+        ensure_credentialed(&env, &engineer);
 
         let key = DataKey::Commit(auction_id, engineer.clone());
         let stored: BytesN<32> = env

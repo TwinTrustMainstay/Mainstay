@@ -729,3 +729,28 @@ fn reveal_at_bid_cap_is_rejected_with_event_and_settled() {
         Err(Ok(contract_err(ContractError::NoCommitment)))
     );
 }
+
+// ---------- Credential recheck on reveal (#1937) ----------
+
+#[test]
+fn revoked_engineer_cannot_reveal_after_committing() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
+    let a = engineer(&ctx, CredentialStatus::Valid, 0);
+    let salt = BytesN::from_array(&env, &[10u8; 32]);
+    ctx.client
+        .commit_bid(&a, &id, &commitment(&env, id, &a, 1_000, &salt));
+
+    // Credential is revoked between commit and reveal.
+    ctx.registry
+        .set_engineer(&a, &CredentialStatus::Revoked, &0);
+    at(&env, BID_END + 1);
+    assert_eq!(
+        ctx.client.try_reveal_bid(&a, &id, &1_000, &salt),
+        Err(Ok(contract_err(ContractError::NotCredentialed)))
+    );
+    assert!(ctx.client.get_bids(&id).is_empty());
+}
