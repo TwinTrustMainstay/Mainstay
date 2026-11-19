@@ -1,5 +1,8 @@
 use super::*;
-use soroban_sdk::{symbol_short, testutils::Address as _, testutils::Ledger, Address, Env, String};
+use soroban_sdk::{
+    symbol_short, testutils::Address as _, testutils::Events as _, testutils::Ledger, Address,
+    Env, String, Symbol, TryFromVal,
+};
 
 const T0: u64 = 10_000;
 const PERIOD: u64 = 1_000;
@@ -346,6 +349,54 @@ fn funding_grant_debits_treasury_and_checks_budget_at_execution() {
         Err(Ok(contract_err(ContractError::InsufficientBudget)))
     );
     assert_eq!(ctx.client.get_treasury_balance(), 200);
+}
+
+#[test]
+fn funding_execution_debits_treasury_ledger_and_emits_recipient() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    ctx.client.fund_treasury(&ctx.admin, &500);
+    let a = holder(&ctx, 100);
+    let recipient = Address::generate(&env);
+    let id = ctx.client.create_proposal(
+        &a,
+        &title(&env),
+        &ProposalKind::Funding(recipient.clone(), 120),
+    );
+    ctx.client.vote(&a, &id, &true);
+    at(&env, T0 + PERIOD);
+    assert_eq!(ctx.client.finalize_proposal(&id), ProposalStatus::Passed);
+
+    // Balances before execution: nothing has been debited yet.
+    assert_eq!(ctx.client.get_treasury_balance(), 500);
+    assert_eq!(ctx.client.get_shares(&recipient), 0);
+
+    ctx.client.execute_proposal(&id);
+
+    // The GOV_FUND event carries the recipient and amount for off-chain payout.
+    let fund_event = env.events().all().iter().find(|(c, _, _)| *c == ctx.client.address);
+    let (_, topics, data) = fund_event.expect("GOV_FUND event emitted");
+    assert_eq!(topics.len(), 2);
+    assert_eq!(
+        Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(),
+        symbol_short!("GOV_FUND")
+    );
+    assert_eq!(u64::try_from_val(&env, &topics.get(1).unwrap()).unwrap(), id);
+    assert_eq!(
+        <(Address, u64)>::try_from_val(&env, &data).unwrap(),
+        (recipient.clone(), 120u64)
+    );
+
+    // Ledger is debited by exactly the grant amount.
+    assert_eq!(ctx.client.get_treasury_balance(), 380);
+    // Accounting-only: the recipient's voting shares are untouched.
+    assert_eq!(ctx.client.get_shares(&recipient), 0);
+    assert_eq!(ctx.client.get_total_shares(), 100);
+    // The grant is recorded in the proposal as executed.
+    assert_eq!(
+        ctx.client.get_proposal(&id).status,
+        ProposalStatus::Executed
+    );
 }
 
 #[test]

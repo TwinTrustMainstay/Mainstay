@@ -13,9 +13,12 @@
 //!   supply at creation and `approval_threshold_bps` of votes cast are in favour.
 //! * **Execution**: a passed proposal can be executed once. Parameter changes are
 //!   written to the on-chain parameter store. Funding grants are debited from the
-//!   treasury budget ledger.
+//!   treasury budget ledger and emit a `GOV_FUND` event carrying the recipient and
+//!   amount.
 //!
-//! The treasury is an accounting ledger. Actual token movement is out of scope.
+//! The treasury is an accounting ledger. This contract does not move tokens to a
+//! funding recipient. Payout is performed off-chain by whatever service consumes
+//! the `GOV_FUND` event. This is the accounting-only behaviour for issue #1946.
 
 use shared::require_admin;
 use soroban_sdk::{
@@ -83,7 +86,9 @@ pub struct GovernanceConfig {
 pub enum ProposalKind {
     /// Set a platform parameter to a new value.
     Parameter(Symbol, u64),
-    /// Grant `amount` from the treasury budget to `recipient`.
+    /// Grant `amount` from the treasury budget to `recipient`. Accounting only: the
+    /// budget ledger is debited and a `GOV_FUND` event is emitted. No tokens move
+    /// on-chain.
     Funding(Address, u64),
 }
 
@@ -148,6 +153,7 @@ const VOTE_TOPIC: Symbol = symbol_short!("GOV_VOTE");
 const FINALIZE_TOPIC: Symbol = symbol_short!("GOV_FIN");
 const EXECUTE_TOPIC: Symbol = symbol_short!("GOV_EXEC");
 const MINT_TOPIC: Symbol = symbol_short!("GOV_MINT");
+const FUND_TOPIC: Symbol = symbol_short!("GOV_FUND");
 
 fn require_admin_auth(env: &Env, admin: &Address) {
     let stored: Address = env
@@ -474,6 +480,9 @@ impl Governance {
     /// - [`ContractError::AlreadyExecuted`] if already executed
     /// - [`ContractError::ProposalNotPassed`] if the proposal has not passed
     /// - [`ContractError::InsufficientBudget`] if a funding grant exceeds the treasury balance
+    ///
+    /// For a funding grant this debits the treasury ledger and emits a `GOV_FUND`
+    /// event with `(recipient, amount)`. It does not transfer tokens.
     pub fn execute_proposal(env: Env, proposal_id: u64) {
         let mut proposal = load_proposal(&env, proposal_id);
         if proposal.status == ProposalStatus::Executed {
@@ -488,7 +497,7 @@ impl Governance {
                     .persistent()
                     .set(&DataKey::Param(name), &value);
             }
-            ProposalKind::Funding(_, amount) => {
+            ProposalKind::Funding(recipient, amount) => {
                 let treasury: u64 = env
                     .storage()
                     .instance()
@@ -500,6 +509,8 @@ impl Governance {
                 env.storage()
                     .instance()
                     .set(&DataKey::Treasury, &(treasury - amount));
+                env.events()
+                    .publish((FUND_TOPIC, proposal_id), (recipient, amount));
             }
         }
         let now = env.ledger().timestamp();
