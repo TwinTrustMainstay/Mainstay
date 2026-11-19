@@ -363,3 +363,25 @@ fn front_run_squatting_does_not_block_rightful_submitter() {
         "a squatted record_id blocked the rightful submitter"
     );
 }
+
+/// Issue #1984: an invalid Ed25519 signature must surface as a typed contract
+/// error, not as a host trap. A trap reaches callers as an abort with no
+/// ContractError, so `try_` returns `Err(Err(_))` rather than `Err(Ok(_))`.
+#[test]
+fn invalid_signature_returns_contract_error_not_host_panic() {
+    let c = setup();
+    let client = TimestampingClient::new(&c.env, &c.id);
+    let hash = [6u8; 32];
+    let hash_b = BytesN::from_array(&c.env, &hash);
+
+    let other = SigningKey::from_bytes(&[8u8; 32]);
+    let bad = sign(&other, &c.env, TSA_DOMAIN, 9, &hash, NOW);
+    let res = client.try_submit_timestamp(&9, &hash_b, &NOW, &c.tsa_pub, &bad);
+    assert!(
+        matches!(res, Err(Ok(_))),
+        "invalid signature trapped in the host instead of returning a ContractError"
+    );
+
+    // The rejected attestation must not leave a record behind.
+    assert!(client.try_get_timestamped_record(&9).is_err());
+}
