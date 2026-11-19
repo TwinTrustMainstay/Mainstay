@@ -564,3 +564,65 @@ fn test_set_relayers_validates_threshold_and_duplicates() {
         .try_set_relayers(&ctx.admin, &vec![&ctx.env, a.clone(), a.clone()], &1)
         .is_err());
 }
+
+// ── Permissionless release execution (#1922) ─────────────────
+
+#[test]
+fn test_lowered_threshold_lets_anyone_execute_qualifying_release() {
+    let ctx = setup();
+    let recipient = Address::generate(&ctx.env);
+    mint(&ctx, &ctx.client.address, 1_000);
+
+    // One approval is below the threshold of 2, so nothing is paid yet.
+    attest(&ctx, &ctx.relayers[0], 3, &recipient, 250);
+    assert_eq!(balance(&ctx, &recipient), 0);
+
+    // Admin lowers the threshold to 1. The pending release now qualifies.
+    ctx.client.set_relayers(
+        &ctx.admin,
+        &vec![
+            &ctx.env,
+            ctx.relayers[0].clone(),
+            ctx.relayers[1].clone(),
+            ctx.relayers[2].clone(),
+        ],
+        &1,
+    );
+    assert_eq!(balance(&ctx, &recipient), 0);
+
+    // Any account can execute it without another relayer attestation.
+    ctx.client.execute_release(&ETH, &3);
+
+    assert_eq!(balance(&ctx, &recipient), 250);
+    assert!(ctx.client.get_release(&ETH, &3).unwrap().executed);
+}
+
+#[test]
+fn test_execute_release_rejects_below_threshold() {
+    let ctx = setup();
+    let recipient = Address::generate(&ctx.env);
+    mint(&ctx, &ctx.client.address, 1_000);
+
+    attest(&ctx, &ctx.relayers[0], 4, &recipient, 250);
+    assert!(ctx.client.try_execute_release(&ETH, &4).is_err());
+    assert_eq!(balance(&ctx, &recipient), 0);
+    assert!(!ctx.client.get_release(&ETH, &4).unwrap().executed);
+}
+
+#[test]
+fn test_execute_release_cannot_replay_executed_release() {
+    let ctx = setup();
+    let recipient = Address::generate(&ctx.env);
+    mint(&ctx, &ctx.client.address, 1_000);
+
+    release(&ctx, 5, &recipient, 200);
+    assert_eq!(balance(&ctx, &recipient), 200);
+    assert!(ctx.client.try_execute_release(&ETH, &5).is_err());
+    assert_eq!(balance(&ctx, &recipient), 200);
+}
+
+#[test]
+fn test_execute_release_unknown_release_rejected() {
+    let ctx = setup();
+    assert!(ctx.client.try_execute_release(&ETH, &99).is_err());
+}

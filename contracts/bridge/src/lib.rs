@@ -76,6 +76,10 @@ pub enum ContractError {
     RelayerAlreadyExists = 23,
     /// Relayer list contains duplicates or is empty.
     InvalidRelayerSet = 24,
+    /// No attestations exist for the given `(source_chain, nonce)`.
+    ReleaseNotFound = 25,
+    /// The release has fewer approvals than the current threshold.
+    InsufficientApprovals = 26,
 }
 
 /// Maximum number of relayers in the set.
@@ -227,6 +231,41 @@ fn load_chain(env: &Env, chain_id: u32) -> ChainConfig {
         .unwrap_or_else(|| panic_with_error!(env, ContractError::ChainNotFound));
     bump(env, &key);
     cfg
+}
+
+fn threshold(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::Threshold)
+        .unwrap_or(0)
+}
+
+/// Pay out a release and mark it executed. The caller must have checked that the
+/// approval count meets the threshold and that the release has not executed.
+fn execute_release(
+    env: &Env,
+    source_chain: u32,
+    nonce: u64,
+    cfg: &ChainConfig,
+    pending: &mut PendingRelease,
+) {
+    account_window_outflow(env, source_chain, cfg, pending.amount);
+    pending.executed = true;
+    token::Client::new(env, &pending.token).transfer(
+        &env.current_contract_address(),
+        &pending.recipient,
+        &pending.amount,
+    );
+    env.events().publish(
+        (symbol_short!("BR_REL"),),
+        (
+            source_chain,
+            nonce,
+            pending.recipient.clone(),
+            pending.token.clone(),
+            pending.amount,
+        ),
+    );
 }
 
 fn ensure_amount_in_range(env: &Env, cfg: &ChainConfig, amount: i128) {
@@ -501,30 +540,44 @@ impl Bridge {
         }
         pending.approvals.push_back(relayer.clone());
 
-        let threshold: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Threshold)
-            .unwrap_or(0);
-        if pending.approvals.len() >= threshold {
-            account_window_outflow(&env, source_chain, &cfg, amount);
-            pending.executed = true;
-            token::Client::new(&env, &token).transfer(
-                &env.current_contract_address(),
-                &recipient,
-                &amount,
-            );
-            env.events().publish(
-                (symbol_short!("BR_REL"),),
-                (
-                    source_chain,
-                    nonce,
-                    recipient.clone(),
-                    token.clone(),
-                    amount,
-                ),
-            );
+        if pending.approvals.len() >= threshold(&env) {
+            execute_release(&env, source_chain, nonce, &cfg, &mut pending);
         }
+
+        env.storage().persistent().set(&key, &pending);
+        bump(&env, &key);
+    }
+
+    /// Execute a release that already has enough approvals under the current
+    /// threshold. Anyone may call this, so a release that qualifies after
+    /// `set_relayers` lowers the threshold does not wait for another attestation.
+    ///
+    /// # Panics
+    /// - [`ContractError::Paused`] if the bridge is paused
+    /// - [`ContractError::ReleaseNotFound`] if no relayer has attested to this release
+    /// - [`ContractError::ChainNotFound`] / [`ContractError::ChainDisabled`] for an unusable source chain
+    /// - [`ContractError::AlreadyProcessed`] if this release already executed
+    /// - [`ContractError::InsufficientApprovals`] if the approval count is below the threshold
+    /// - [`ContractError::WindowCapExceeded`] if the release would breach the outflow cap
+    pub fn execute_release(env: Env, source_chain: u32, nonce: u64) {
+        ensure_not_paused(&env);
+        let key = DataKey::Pending(source_chain, nonce);
+        let mut pending: PendingRelease = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ReleaseNotFound));
+        if pending.executed {
+            panic_with_error!(&env, ContractError::AlreadyProcessed);
+        }
+        if pending.approvals.len() < threshold(&env) {
+            panic_with_error!(&env, ContractError::InsufficientApprovals);
+        }
+        let cfg = load_chain(&env, source_chain);
+        if !cfg.enabled {
+            panic_with_error!(&env, ContractError::ChainDisabled);
+        }
+        execute_release(&env, source_chain, nonce, &cfg, &mut pending);
 
         env.storage().persistent().set(&key, &pending);
         bump(&env, &key);
