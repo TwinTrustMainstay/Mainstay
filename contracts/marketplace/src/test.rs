@@ -687,3 +687,45 @@ fn commit_requires_a_configured_deposit() {
         Err(Ok(contract_err(ContractError::InvalidDepositConfig)))
     );
 }
+
+// ---------- Reveal at the bid cap (#1936) ----------
+
+#[test]
+fn reveal_at_bid_cap_is_rejected_with_event_and_settled() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let token = TokenClient::new(&env, &ctx.token);
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
+    let a = engineer(&ctx, CredentialStatus::Valid, 0);
+    let salt = BytesN::from_array(&env, &[8u8; 32]);
+    ctx.client
+        .commit_bid(&a, &id, &commitment(&env, id, &a, 2_000, &salt));
+
+    // Fill the stored bid list to the cap without going through reveals.
+    let filler = Address::generate(&env);
+    let mut full: Vec<Bid> = Vec::new(&env);
+    for _ in 0..MAX_BIDS_PER_AUCTION {
+        full.push_back(Bid {
+            engineer: filler.clone(),
+            price: 4_000,
+            reputation: 0,
+            placed_at: T0,
+        });
+    }
+    env.as_contract(&ctx.client.address, || {
+        env.storage().persistent().set(&DataKey::Bids(id), &full);
+    });
+
+    at(&env, BID_END + 1);
+    ctx.client.reveal_bid(&a, &id, &2_000, &salt);
+
+    // Not recorded, but no revert: the bid list is unchanged and the deposit is returned.
+    assert_eq!(ctx.client.get_bids(&id).len(), MAX_BIDS_PER_AUCTION);
+    assert_eq!(token.balance(&a), DEPOSIT);
+    assert_eq!(
+        ctx.client.try_reveal_bid(&a, &id, &2_000, &salt),
+        Err(Ok(contract_err(ContractError::NoCommitment)))
+    );
+}

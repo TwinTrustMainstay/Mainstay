@@ -179,6 +179,7 @@ const FINALIZE_TOPIC: Symbol = symbol_short!("AUC_FIN");
 const DISPUTE_TOPIC: Symbol = symbol_short!("AUC_DISP");
 const RESOLVE_TOPIC: Symbol = symbol_short!("AUC_RSLV");
 const FORFEIT_TOPIC: Symbol = symbol_short!("AUC_FORF");
+const REJECT_TOPIC: Symbol = symbol_short!("AUC_REJ");
 
 fn require_admin_auth(env: &Env, admin: &Address) {
     let stored: Address = env
@@ -722,9 +723,18 @@ impl Marketplace {
             panic_with_error!(&env, ContractError::InvalidBid);
         }
 
+        // Remove the commitment so the same reveal cannot be submitted twice.
+        env.storage().persistent().remove(&key);
+        refund_deposit(&env, auction_id, &engineer);
+
         let mut bids = load_bids(&env, auction_id);
         if bids.len() >= MAX_BIDS_PER_AUCTION {
-            panic_with_error!(&env, ContractError::BidLimitReached);
+            // The reveal was valid but there is no room for it. Emit a rejection
+            // instead of reverting so the bidder sees the outcome and the
+            // commitment and deposit are settled.
+            env.events()
+                .publish((REJECT_TOPIC, auction_id), (engineer, price));
+            return;
         }
         let reputation = reputation_of(&env, &engineer);
         bids.push_back(Bid {
@@ -734,9 +744,6 @@ impl Marketplace {
             placed_at: now,
         });
         store_bids(&env, auction_id, &bids);
-        // Remove the commitment so the same reveal cannot be submitted twice.
-        env.storage().persistent().remove(&key);
-        refund_deposit(&env, auction_id, &engineer);
         env.events()
             .publish((REVEAL_TOPIC, auction_id), (engineer, price, reputation));
     }
