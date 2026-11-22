@@ -19,14 +19,16 @@ pub(crate) use storage::{
     transfer_hist_key, submission_window_key, retirement_state_key, retirement_certificate_key,
     maintenance_audit_key, maintenance_attestations_key, attestor_auth_key,
     coordinated_task_key, coordinated_subtasks_key, seasonal_adjustment_key,
+    external_scores_key, score_anomalies_key, peer_group_key,
+    external_scores_cleanup_cursor_key, anomalies_cleanup_cursor_key,
 };
 
 // Re-export event constants at the crate root for the same reason.
 pub(crate) use events::{
-    EVENT_ADMIN_SET, EVENT_DECAY, EVENT_INIT, EVENT_MAINT, EVENT_PROP_ADMIN, EVENT_PRUNED,
-    EVENT_REG_AST, EVENT_REG_ENG, EVENT_RST_SCR, EVENT_XFER, EVENT_WEIGHT_PROP, EVENT_WEIGHT_EXEC,
-    EVENT_RECONSTR, EVENT_TASK_DUE_SOON, EVENT_MNT_SIG, EVENT_PROV_REG, EVENT_PROV_RM,
-    EVENT_EXT_SCR, EVENT_DEG_CRV,
+    EVENT_ADMIN_SET, EVENT_ANOMALY, EVENT_ANOMALY_STS, EVENT_DECAY, EVENT_INIT, EVENT_MAINT,
+    EVENT_PEER_GROUP, EVENT_PROP_ADMIN, EVENT_PRUNED, EVENT_REG_AST, EVENT_REG_ENG, EVENT_RST_SCR,
+    EVENT_XFER, EVENT_WEIGHT_PROP, EVENT_WEIGHT_EXEC, EVENT_RECONSTR, EVENT_TASK_DUE_SOON,
+    EVENT_MNT_SIG, EVENT_PROV_REG, EVENT_PROV_RM, EVENT_EXT_SCR, EVENT_DEG_CRV,
 };
 
 use crate::errors::ContractError;
@@ -146,6 +148,11 @@ const MAX_BUILT_IN_TASK_WEIGHT: u32 = 10;
 pub const MAX_BATCH_SIZE: u32 = 50;
 /// Hard cap on engineers accepted by one bulk authorization-revocation call.
 pub const MAX_BATCH_REVOKE_SIZE: u32 = 50;
+/// Maximum number of entries examined by one `clear_old_external_scores` /
+/// `clear_old_anomalies` call. A stored cursor lets cleanup resume on the next
+/// call, so a long history is cleared across bounded transactions instead of
+/// rebuilding the whole vector in one call (Issues #2000 / #2001).
+pub const MAX_CLEANUP_BATCH: u32 = 50;
 /// Maximum number of safety incidents retained per asset.
 const DEFAULT_MAX_INCIDENTS: u32 = 200;
 /// Hard cap on the number of addresses in the admin multisig set.
@@ -8199,6 +8206,10 @@ impl Lifecycle {
         anomalies.push_back(anomaly);
         env.storage().persistent().set(&anomalies_key, &anomalies);
         shared::extend_persistent_ttl(&env, &anomalies_key);
+        env.events().publish(
+            (EVENT_ANOMALY, asset_id),
+            (baseline_score, observed_score, stdev_multiple),
+        );
     }
 
     /// Update anomaly investigation status.
@@ -8228,10 +8239,15 @@ impl Lifecycle {
 
         if anomaly_index < anomalies.len() {
             let mut anomaly = anomalies.get(anomaly_index).unwrap();
-            anomaly.investigation_status = status;
+            let previous_status = anomaly.investigation_status.clone();
+            anomaly.investigation_status = status.clone();
             anomalies.set(anomaly_index, anomaly);
             env.storage().persistent().set(&anomalies_key, &anomalies);
             shared::extend_persistent_ttl(&env, &anomalies_key);
+            env.events().publish(
+                (EVENT_ANOMALY_STS, asset_id),
+                (anomaly_index, previous_status, status),
+            );
         }
     }
 
@@ -8346,6 +8362,10 @@ impl Lifecycle {
         let peer_group_key = peer_group_key(&group_id);
         env.storage().persistent().set(&peer_group_key, &peer_group);
         shared::extend_persistent_ttl(&env, &peer_group_key);
+        env.events().publish(
+            (EVENT_PEER_GROUP, group_id.clone()),
+            (member_count, mean_score),
+        );
     }
 
     /// Return anonymized maintenance benchmarks for an asset category.
@@ -8548,6 +8568,10 @@ impl Lifecycle {
     }
 
     /// Clear old external scores older than a threshold (maintenance function).
+    ///
+    /// Bounded per call: at most [`MAX_CLEANUP_BATCH`] entries are examined, and a
+    /// resumable cursor records progress so a long history is cleared across
+    /// multiple calls instead of rebuilding the whole vector in one transaction.
     pub fn clear_old_external_scores(env: Env, admin: Address, asset_id: u64, age_seconds: u64) {
         admin.require_auth();
 
@@ -8560,6 +8584,7 @@ impl Lifecycle {
         config.admin.require_auth();
 
         let ext_scores_key = external_scores_key(asset_id);
+        let cursor_key = external_scores_cleanup_cursor_key(asset_id);
         let mut scores: Vec<ExternalScoreEntry> = env
             .storage()
             .persistent()
@@ -8567,20 +8592,45 @@ impl Lifecycle {
             .unwrap_or_else(|| Vec::new(&env));
 
         let current_time = env.ledger().timestamp();
-        let mut filtered: Vec<ExternalScoreEntry> = Vec::new(&env);
+        // Resume from the stored cursor, or start a fresh pass.
+        let mut cursor: u32 = env
+            .storage()
+            .persistent()
+            .get(&cursor_key)
+            .unwrap_or(0);
+        let mut processed = 0u32;
 
-        for s in 0..scores.len() {
-            let entry = scores.get(s).unwrap();
-            if current_time.saturating_sub(entry.timestamp) < age_seconds {
-                filtered.push_back(entry);
+        while cursor < scores.len() && processed < MAX_CLEANUP_BATCH {
+            let entry = scores.get(cursor).unwrap();
+            if current_time.saturating_sub(entry.timestamp) >= age_seconds {
+                // Expired: drop it. The next entry slides into `cursor`, so do not
+                // advance the cursor; just re-examine the new entry there.
+                scores.remove(cursor);
+            } else {
+                // Recent: keep it and move past it.
+                cursor += 1;
             }
+            processed += 1;
         }
 
-        env.storage().persistent().set(&ext_scores_key, &filtered);
+        env.storage().persistent().set(&ext_scores_key, &scores);
         shared::extend_persistent_ttl(&env, &ext_scores_key);
+
+        // Advance or reset the resumable cursor. Resetting once a pass completes
+        // means a later cleanup with a different threshold rescans from the start.
+        if cursor >= scores.len() {
+            env.storage().persistent().remove(&cursor_key);
+        } else {
+            env.storage().persistent().set(&cursor_key, &cursor);
+            shared::extend_persistent_ttl(&env, &cursor_key);
+        }
     }
 
     /// Batch clear anomalies older than a threshold.
+    ///
+    /// Bounded per call: at most [`MAX_CLEANUP_BATCH`] entries are examined, and a
+    /// resumable cursor records progress so a large log is cleared across multiple
+    /// calls instead of rebuilding the whole vector in one transaction.
     pub fn clear_old_anomalies(env: Env, admin: Address, asset_id: u64, age_seconds: u64) {
         admin.require_auth();
 
@@ -8593,6 +8643,7 @@ impl Lifecycle {
         config.admin.require_auth();
 
         let anomalies_key = score_anomalies_key(asset_id);
+        let cursor_key = anomalies_cleanup_cursor_key(asset_id);
         let mut anomalies: Vec<ScoreAnomaly> = env
             .storage()
             .persistent()
@@ -8600,17 +8651,38 @@ impl Lifecycle {
             .unwrap_or_else(|| Vec::new(&env));
 
         let current_time = env.ledger().timestamp();
-        let mut filtered: Vec<ScoreAnomaly> = Vec::new(&env);
+        // Resume from the stored cursor, or start a fresh pass.
+        let mut cursor: u32 = env
+            .storage()
+            .persistent()
+            .get(&cursor_key)
+            .unwrap_or(0);
+        let mut processed = 0u32;
 
-        for a in 0..anomalies.len() {
-            let anomaly = anomalies.get(a).unwrap();
-            if current_time.saturating_sub(anomaly.timestamp) < age_seconds {
-                filtered.push_back(anomaly);
+        while cursor < anomalies.len() && processed < MAX_CLEANUP_BATCH {
+            let anomaly = anomalies.get(cursor).unwrap();
+            if current_time.saturating_sub(anomaly.timestamp) >= age_seconds {
+                // Expired: drop it. The next entry slides into `cursor`, so do not
+                // advance the cursor; just re-examine the new entry there.
+                anomalies.remove(cursor);
+            } else {
+                // Recent: keep it and move past it.
+                cursor += 1;
             }
+            processed += 1;
         }
 
-        env.storage().persistent().set(&anomalies_key, &filtered);
+        env.storage().persistent().set(&anomalies_key, &anomalies);
         shared::extend_persistent_ttl(&env, &anomalies_key);
+
+        // Advance or reset the resumable cursor. Resetting once a pass completes
+        // means a later cleanup with a different threshold rescans from the start.
+        if cursor >= anomalies.len() {
+            env.storage().persistent().remove(&cursor_key);
+        } else {
+            env.storage().persistent().set(&cursor_key, &cursor);
+            shared::extend_persistent_ttl(&env, &cursor_key);
+        }
     }
 
     /// Get all external scores for an asset.
@@ -21137,5 +21209,243 @@ mod tests {
 
         // Should have no events for inactive tasks
         assert_eq!(task_soon_events.len(), 0, "Should not emit event for inactive tasks");
+    }
+
+    // =========================================================================
+    // Issues #1998 / #1999 / #2000 / #2001 — anomaly & peer-group events, and
+    // batched, resumable cleanup of external scores and anomalies.
+    // =========================================================================
+
+    #[test]
+    fn test_record_score_anomaly_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_registry, _engineer_registry, admin) = setup(&env, 0);
+        let (asset_id, _owner) = register_asset(&env, &asset_registry);
+
+        client.record_score_anomaly(&admin, &asset_id, &80, &30, &3);
+
+        let events = env.events().all();
+        let anomaly_event = events.iter().find(|(_, topics, _)| {
+            topics.len() == 2
+                && topics
+                    .get(0)
+                    .and_then(|v| TryIntoVal::<_, Symbol>::try_into_val(&v, &env).ok())
+                    .map(|s: Symbol| s == EVENT_ANOMALY)
+                    .unwrap_or(false)
+                && topics
+                    .get(1)
+                    .and_then(|v| TryIntoVal::<_, u64>::try_into_val(&v, &env).ok())
+                    .map(|id: u64| id == asset_id)
+                    .unwrap_or(false)
+        });
+        assert!(anomaly_event.is_some(), "record_score_anomaly should emit an ANOMALY event");
+        let (_, _, data) = anomaly_event.unwrap();
+        let (baseline, observed, stdev): (u32, u32, u32) = data.try_into_val(&env).unwrap();
+        assert_eq!(baseline, 80);
+        assert_eq!(observed, 30);
+        assert_eq!(stdev, 3);
+    }
+
+    #[test]
+    fn test_update_anomaly_status_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_registry, _engineer_registry, admin) = setup(&env, 0);
+        let (asset_id, _owner) = register_asset(&env, &asset_registry);
+
+        // Create an anomaly first (its initial status is PENDING).
+        client.record_score_anomaly(&admin, &asset_id, &80, &30, &3);
+
+        let new_status = symbol_short!("RESOLVED");
+        client.update_anomaly_status(&admin, &asset_id, &0, &new_status);
+
+        let events = env.events().all();
+        let status_event = events.iter().find(|(_, topics, _)| {
+            topics.len() == 2
+                && topics
+                    .get(0)
+                    .and_then(|v| TryIntoVal::<_, Symbol>::try_into_val(&v, &env).ok())
+                    .map(|s: Symbol| s == EVENT_ANOMALY_STS)
+                    .unwrap_or(false)
+                && topics
+                    .get(1)
+                    .and_then(|v| TryIntoVal::<_, u64>::try_into_val(&v, &env).ok())
+                    .map(|id: u64| id == asset_id)
+                    .unwrap_or(false)
+        });
+        assert!(status_event.is_some(), "update_anomaly_status should emit an ANOMALY_STS event");
+        let (_, _, data) = status_event.unwrap();
+        let (index, previous, new): (u32, Symbol, Symbol) = data.try_into_val(&env).unwrap();
+        assert_eq!(index, 0);
+        assert_eq!(previous, symbol_short!("PENDING"));
+        assert_eq!(new, new_status);
+    }
+
+    #[test]
+    fn test_register_peer_group_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _asset_registry, _engineer_registry, admin) = setup(&env, 0);
+
+        let group_id = symbol_short!("GENSET_P");
+        client.register_peer_group(
+            &admin,
+            &group_id,
+            &symbol_short!("GENSET"),
+            &0u64,
+            &3_600u64,
+            &5u32,
+            &70u32,
+            &70u32,
+            &2u32,
+        );
+
+        let events = env.events().all();
+        let peer_event = events.iter().find(|(_, topics, _)| {
+            topics.len() == 2
+                && topics
+                    .get(0)
+                    .and_then(|v| TryIntoVal::<_, Symbol>::try_into_val(&v, &env).ok())
+                    .map(|s: Symbol| s == EVENT_PEER_GROUP)
+                    .unwrap_or(false)
+                && topics
+                    .get(1)
+                    .and_then(|v| TryIntoVal::<_, Symbol>::try_into_val(&v, &env).ok())
+                    .map(|g: Symbol| g == group_id)
+                    .unwrap_or(false)
+        });
+        assert!(peer_event.is_some(), "register_peer_group should emit a PEER_GRP event");
+        let (_, _, data) = peer_event.unwrap();
+        let (member_count, mean_score): (u32, u32) = data.try_into_val(&env).unwrap();
+        assert_eq!(member_count, 5);
+        assert_eq!(mean_score, 70);
+    }
+
+    #[test]
+    fn test_clear_old_external_scores_batches_large_vector() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_registry, _engineer_registry, admin) = setup(&env, 0);
+        let (asset_id, _owner) = register_asset(&env, &asset_registry);
+
+        let current_time: u64 = 100_000;
+        env.ledger().set_timestamp(current_time);
+        let age_seconds = 10_000u64;
+
+        // Build a large external-scores vector directly in storage: a long run of
+        // old entries (timestamps 0..149) followed by a few recent ones.
+        let total = 3u32 * MAX_CLEANUP_BATCH + 5; // 155
+        let contract_id = client.address.clone();
+        let provider = Address::generate(&env);
+        let mut scores: Vec<ExternalScoreEntry> = Vec::new(&env);
+        for i in 0..total {
+            let ts = if i < total - 5 { i as u64 } else { current_time - 1 };
+            scores.push_back(ExternalScoreEntry {
+                provider: provider.clone(),
+                score: 50,
+                timestamp: ts,
+                provider_reputation: 100,
+            });
+        }
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&external_scores_key(asset_id), &scores);
+        });
+
+        // A single call is batch-bounded: it removes exactly one batch and leaves
+        // the rest for subsequent calls (resumable cursor).
+        client.clear_old_external_scores(&admin, &asset_id, &age_seconds);
+        assert_eq!(
+            client.get_external_scores(&asset_id).len(),
+            total - MAX_CLEANUP_BATCH,
+            "first call should remove exactly one batch"
+        );
+
+        // Continue cleanup across calls until it converges.
+        let mut prev_len = total;
+        for _ in 0..20 {
+            client.clear_old_external_scores(&admin, &asset_id, &age_seconds);
+            let len = client.get_external_scores(&asset_id).len();
+            if len == prev_len {
+                break;
+            }
+            prev_len = len;
+        }
+
+        let remaining = client.get_external_scores(&asset_id);
+        assert_eq!(remaining.len(), 5, "only the 5 recent scores should remain");
+        for i in 0..remaining.len() {
+            let entry = remaining.get(i).unwrap();
+            assert!(
+                current_time.saturating_sub(entry.timestamp) < age_seconds,
+                "remaining entry must be newer than the cutoff"
+            );
+        }
+
+        // The resumable cursor must be reset once a cleanup pass completes.
+        let cursor_exists = env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .has(&external_scores_cleanup_cursor_key(asset_id))
+        });
+        assert!(!cursor_exists, "cursor should be reset after cleanup completes");
+    }
+
+    #[test]
+    fn test_clear_old_anomalies_batches_large_log() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, asset_registry, _engineer_registry, admin) = setup(&env, 0);
+        let (asset_id, _owner) = register_asset(&env, &asset_registry);
+
+        // Populate a large anomaly log (well over one batch) at an early time.
+        let base_time: u64 = 100;
+        env.ledger().set_timestamp(base_time);
+        let old_count = 3u32 * MAX_CLEANUP_BATCH + 5; // 155 old entries
+        for _ in 0..old_count {
+            client.record_score_anomaly(&admin, &asset_id, &80, &30, &3);
+        }
+
+        // Advance time and add a few recent anomalies that must be retained.
+        env.ledger().set_timestamp(base_time + 10_000);
+        let recent_count = 5u32;
+        for _ in 0..recent_count {
+            client.record_score_anomaly(&admin, &asset_id, &80, &30, &3);
+        }
+
+        let total = old_count + recent_count; // 160
+        let age_seconds = 1_000u64;
+
+        // A single call is batch-bounded: it removes exactly one batch and leaves
+        // the rest for subsequent calls (resumable cursor).
+        client.clear_old_anomalies(&admin, &asset_id, &age_seconds);
+        assert_eq!(
+            client.get_score_anomalies(&asset_id).len(),
+            total - MAX_CLEANUP_BATCH,
+            "first call should remove exactly one batch"
+        );
+
+        // Continue cleanup across calls until it converges.
+        let mut prev_len = total;
+        for _ in 0..20 {
+            client.clear_old_anomalies(&admin, &asset_id, &age_seconds);
+            let len = client.get_score_anomalies(&asset_id).len();
+            if len == prev_len {
+                break;
+            }
+            prev_len = len;
+        }
+
+        let remaining = client.get_score_anomalies(&asset_id);
+        assert_eq!(remaining.len(), recent_count, "only the recent anomalies should remain");
+        for i in 0..remaining.len() {
+            let anomaly = remaining.get(i).unwrap();
+            assert!(
+                (base_time + 10_000).saturating_sub(anomaly.timestamp) < age_seconds,
+                "remaining anomaly must be newer than the cutoff"
+            );
+        }
     }
 }

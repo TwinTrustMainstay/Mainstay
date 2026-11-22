@@ -167,3 +167,32 @@ pub(crate) fn coordinated_subtasks_key(task_id: u64) -> (Symbol, u64) {
 pub(crate) fn seasonal_adjustment_key(asset_type: &Symbol) -> (Symbol, Symbol) {
     (symbol_short!("SEAS_ADJ"), asset_type.clone())
 }
+
+// ---------------------------------------------------------------------------
+// Peer comparison / anomaly / external-score keys
+// ---------------------------------------------------------------------------
+
+/// External provider scores for an asset: `Vec<ExternalScoreEntry>` (Issue #1637).
+pub(crate) fn external_scores_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("EXT_SCR"), asset_id)
+}
+
+/// Detected score anomalies for an asset: `Vec<ScoreAnomaly>` (Issue #1639).
+pub(crate) fn score_anomalies_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("ANOM"), asset_id)
+}
+
+/// Registered peer group statistics: `PeerGroup` (Issue #1640).
+pub(crate) fn peer_group_key(group_id: &Symbol) -> (Symbol, Symbol) {
+    (symbol_short!("PEERGRP"), group_id.clone())
+}
+
+/// Resumable cleanup cursor for `clear_old_external_scores` (Issue #2000): `u32`.
+pub(crate) fn external_scores_cleanup_cursor_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("EXTC_CSR"), asset_id)
+}
+
+/// Resumable cleanup cursor for `clear_old_anomalies` (Issue #2001): `u32`.
+pub(crate) fn anomalies_cleanup_cursor_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("ANOMC_CSR"), asset_id)
+}
