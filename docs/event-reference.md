@@ -13,10 +13,11 @@ This reference guide provides a comprehensive overview of all smart contract eve
 3. [EngineerRegistry Contract Events](#engineerregistry-contract-events)
 4. [Lifecycle Contract Events](#lifecycle-contract-events)
 5. [Lending Contract Events](#lending-contract-events)
-6. [Parsing Event Data](#parsing-event-data)
+6. [Bridge Contract Events](#bridge-contract-events)
+7. [Parsing Event Data](#parsing-event-data)
    - [TypeScript Parsing Example](#typescript-parsing-example)
    - [Rust Event Parsing Example](#rust-event-parsing-example)
-7. [Subscription & Indexing Strategies](#subscription--indexing-strategies)
+8. [Subscription & Indexing Strategies](#subscription--indexing-strategies)
 
 ---
 
@@ -279,6 +280,25 @@ Emitted when a defaulted loan is slashed by admin after missing deadline.
 - **Data**: `(borrower: Address, slashed_amount: u64)`
 - **Emission Conditions**: Called inside `slash`.
 - **Use Cases**: Initiate collateral liquidation flow; penalize defaulting borrower rating.
+
+---
+
+## Bridge Contract Events
+
+Emitted by `contracts/bridge`. Topic is the first element; payload is the tuple below. The full event set is also documented in [cross-chain-bridge.md](cross-chain-bridge.md#events).
+
+| Topic | Payload | Emitted when |
+|---|---|---|
+| `BR_OUT` | `(dest_chain, nonce, sender, token, amount, dest_address)` | `bridge_out` locks tokens |
+| `BR_REL` | `(source_chain, nonce, recipient, token, amount, approvers)` | A release reaches the attestation threshold and pays out. `approvers` is the `Vec<Address>` of relayers that attested, in attestation order |
+| `BR_ALERT` | `(source_chain, window_outflow, window_cap)` | Window outflow crosses `alert_threshold` |
+| `BR_SWP_N` | `(swap_id, sender, hashlock, expiry, amount)` | `create_swap` opens a swap |
+| `BR_SWP_C` | `(swap_id, preimage)` | `claim_swap` succeeds |
+| `BR_SWP_R` | `(swap_id, sender, token, amount)` | An expired, unclaimed swap was refunded to `sender` |
+| `BR_PAUSE` / `BR_RESUME` | `(admin)` | Bridge paused or resumed by `admin` |
+| `BR_RELAYS` | `(admin, threshold, relayers)` | Relayer set and threshold replaced |
+| `BR_CH_ADD` / `BR_CH_UPD` | `(admin, chain_id, config)` | Chain registered or its constraints replaced |
+| `BR_CH_ENB` | `(admin, chain_id, enabled)` | Chain enabled or disabled |
 
 ---
 

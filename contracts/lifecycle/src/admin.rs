@@ -194,10 +194,10 @@ pub(crate) fn set_admin_quorum(env: Env, admin: Address, new_admins: Vec<Address
     let n = new_admins.len();
     let mut i: u32 = 0;
     while i < n {
-        let a = new_admins.get(i).unwrap();
+        let a = new_admins.get(i).unwrap_or_else(|| panic_with_error!(&env, ContractError::IndexOutOfBounds));
         let mut j = i + 1;
         while j < n {
-            if new_admins.get(j).unwrap() == a {
+            if new_admins.get(j).unwrap_or_else(|| panic_with_error!(&env, ContractError::IndexOutOfBounds)) == a {
                 panic_with_error!(&env, ContractError::DuplicateAdmin);
             }
             j += 1;
@@ -619,9 +619,9 @@ pub(crate) fn prune_asset_history(env: Env, admin: Address, asset_id: u64) {
         if history.len() > config.max_history {
             let start = history.len() - config.max_history;
             let pruned_count = start as u32;
-            let oldest_ts = history.get(0).unwrap().timestamp;
+            let oldest_ts = history.get(0).unwrap_or_else(|| panic_with_error!(&env, ContractError::IndexOutOfBounds)).timestamp;
             let mut kept: Vec<MaintenanceRecord> = Vec::new(&env);
-            for i in start..history.len() { kept.push_back(history.get(i).unwrap()); }
+            for i in start..history.len() { kept.push_back(history.get(i).unwrap_or_else(|| panic_with_error!(&env, ContractError::IndexOutOfBounds))); }
             // The new oldest record's `previous_record_hash` still points at a now-pruned
             // record; clear it so the hash chain doesn't reference missing history.
             if let Some(mut oldest) = kept.get(0) {
@@ -634,14 +634,14 @@ pub(crate) fn prune_asset_history(env: Env, admin: Address, asset_id: u64) {
             // Remove engineers whose records were entirely pruned
             let mut retained: Vec<Address> = Vec::new(&env);
             for i in start..history.len() {
-                let eng = history.get(i).unwrap().engineer;
+                let eng = history.get(i).unwrap_or_else(|| panic_with_error!(&env, ContractError::IndexOutOfBounds)).engineer;
                 let mut found = false;
                 for e in retained.iter() { if e == eng { found = true; break; } }
                 if !found { retained.push_back(eng); }
             }
             let mut removed: Vec<Address> = Vec::new(&env);
             for i in 0..start {
-                let eng = history.get(i).unwrap().engineer;
+                let eng = history.get(i).unwrap_or_else(|| panic_with_error!(&env, ContractError::IndexOutOfBounds)).engineer;
                 let mut in_retained = false;
                 for e in retained.iter() { if e == eng { in_retained = true; break; } }
                 if in_retained { continue; }
@@ -660,7 +660,7 @@ pub(crate) fn prune_asset_history(env: Env, admin: Address, asset_id: u64) {
         if sh.len() > config.max_history {
             let start = sh.len() - config.max_history;
             let mut kept: Vec<ScoreEntry> = Vec::new(&env);
-            for i in start..sh.len() { kept.push_back(sh.get(i).unwrap()); }
+            for i in start..sh.len() { kept.push_back(sh.get(i).unwrap_or_else(|| panic_with_error!(&env, ContractError::IndexOutOfBounds))); }
             env.storage().persistent().set(&sc_key, &kept);
             extend_persistent_ttl(&env, &sc_key);
         }
@@ -671,7 +671,7 @@ pub(crate) fn prune_asset_history(env: Env, admin: Address, asset_id: u64) {
         if vh.len() > config.max_history {
             let start = vh.len() - config.max_history;
             let mut kept: Vec<(u64, u64)> = Vec::new(&env);
-            for i in start..vh.len() { kept.push_back(vh.get(i).unwrap()); }
+            for i in start..vh.len() { kept.push_back(vh.get(i).unwrap_or_else(|| panic_with_error!(&env, ContractError::IndexOutOfBounds))); }
             env.storage().persistent().set(&val_key, &kept);
             extend_persistent_ttl(&env, &val_key);
         }
@@ -688,9 +688,7 @@ pub(crate) fn purge_asset_data(env: Env, admin: Address, asset_id: u64) {
     admin.require_auth();
     let config: Config = env.storage().persistent().get(&CONFIG)
         .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-    if config.admin != admin {
-        panic_with_error!(&env, ContractError::UnauthorizedAdmin);
-    }
+    require_quorum(&env, &config, &admin);
     let hist_key = history_key(asset_id);
     if let Some(history) = env.storage().persistent().get::<_, Vec<MaintenanceRecord>>(&hist_key) {
         let mut engineers: Vec<Address> = Vec::new(&env);

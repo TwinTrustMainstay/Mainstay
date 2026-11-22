@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and hash-based maintenance evidence attachments to the lifecycle contract.
 
 ### Added
+- `lending`: `record_lien` now emits a `lien_cr` event with `asset_id` and `loan_id` (closes [#2007](https://github.com/TwinTrustMainstay/Mainstay/issues/2007))
+- `lending`: `release_lien` now emits a `lien_rl` event with `asset_id` and `loan_id` (closes [#2007](https://github.com/TwinTrustMainstay/Mainstay/issues/2007))
+- `lending`: `set_market_oracle` now emits an `oracl_set` event with the new oracle address (closes [#2008](https://github.com/TwinTrustMainstay/Mainstay/issues/2008))
+- `lending`: `update_market_conditions` now emits a `mkt_upd` event with `volatility` and `price_change_bps` (closes [#2008](https://github.com/TwinTrustMainstay/Mainstay/issues/2008))
+- `lending`: `slash_treasury` now emits a `trsry_sl` event with the admin address and amount transferred (closes [#2009](https://github.com/TwinTrustMainstay/Mainstay/issues/2009))
+- `lending`: `set_max_ltv_bps` now emits an `ltv_set` event with the old and new basis-point values (closes [#2006](https://github.com/TwinTrustMainstay/Mainstay/issues/2006))
 - Frequently asked questions (#1721): 28 questions in eight topics, generated
   from `docs/faq/faq.json` into `docs/faq.md` and a searchable page at
   `docs/faq/index.html`. The page supports "was this helpful?" votes. An
@@ -55,6 +61,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Lifecycle contract now emits events for score-anomaly creation (`ANOMALY`), anomaly investigation-status transitions (`ANOM_STS`), and peer-group registration (`PEER_GRP`), so operators can alert on new anomalies and peer-group benchmark changes (closes [#1998](https://github.com/TwinTrustMainstay/Mainstay/issues/1998), [#1999](https://github.com/TwinTrustMainstay/Mainstay/issues/1999))
 
 ### Fixed
+- Engineer bonds (#1962, #1963, #1964): `slash` is refused while a dispute is
+  open. Disputes lapse after a 30-day deadline so a bond cannot be locked
+  forever. `open_dispute` and `record_performance` reject engineers with no
+  bond (`BondNotFound`) instead of creating phantom records.
+- Engineer bonds (#1965): `open_dispute` takes a reason and an evidence hash.
+  They are stored in an audit record (`get_dispute`) and emitted in an event.
 - Metrics exporter: the exporter no longer crashes on its first collection, and its HTTP endpoint now returns metrics (the response was never sent before).
 - Backup checksums use paths relative to the backup directory, so backups verify after being copied to another location.
 - `update_reputation` in `engineer-registry`: decay is now applied to the stored score before the delta is added. Previously an inactive engineer's decayed reputation was overwritten by the undecayed stored value on the next update (closes [#1741](https://github.com/TwinTrustMainstay/Mainstay/issues/1741))
