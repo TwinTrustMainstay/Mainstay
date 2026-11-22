@@ -1,7 +1,10 @@
 #![cfg(test)]
 
 use crate::{IncidentManagement, IncidentManagementClient, Severity, Status};
-use soroban_sdk::{testutils::Address as _, Address, Env, String};
+use soroban_sdk::{
+    symbol_short, testutils::Address as _, testutils::Events, vec, Address, Env, IntoVal, String,
+    TryFromVal,
+};
 
 fn setup(env: &Env) -> (IncidentManagementClient<'_>, Address) {
     env.mock_all_auths();
@@ -154,4 +157,29 @@ fn unknown_action_item_is_rejected() {
     let id = open(&env, &client, Severity::Sev2);
     let owner = Address::generate(&env);
     client.complete_action_item(&owner, &id, &99);
+}
+
+#[test]
+fn add_action_item_emits_event() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let id = open(&env, &client, Severity::Sev3);
+    let owner = Address::generate(&env);
+
+    let item_id = client.add_action_item(
+        &admin,
+        &id,
+        &String::from_str(&env, "Add generator alert"),
+        &owner,
+    );
+
+    let events = env.events().all();
+    let last = events.last().unwrap();
+    assert_eq!(last.0, client.address);
+    assert_eq!(
+        last.1,
+        vec![&env, symbol_short!("inc_actn").into_val(&env)]
+    );
+    let data = <(u64, u32, Address)>::try_from_val(&env, &last.2).unwrap();
+    assert_eq!(data, (id, item_id, owner));
 }

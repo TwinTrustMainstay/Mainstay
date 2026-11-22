@@ -245,10 +245,13 @@ impl IncidentManagement {
         items.push_back(ActionItem {
             id: item_id,
             description,
-            owner,
+            owner: owner.clone(),
             completed: false,
         });
         save_action_items(&env, id, &items);
+
+        env.events()
+            .publish((symbol_short!("inc_actn"),), (id, item_id, owner));
         item_id
     }
 

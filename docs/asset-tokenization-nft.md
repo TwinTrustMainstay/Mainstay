@@ -14,11 +14,21 @@ Tracking issue: #1736. Contract: `contracts/asset-nft`.
   it. A listed NFT cannot be transferred until delisted, so a sale can't race a transfer.
 - **Sales.** `buy` pays the seller and transfers the NFT in one call. Owners cannot buy their own
   listing.
+- **Liens (issue #1972).** Each NFT maps to exactly one registry asset (`AssetToken::asset_id`,
+  the same id as `get_token_for_asset`). `list_for_sale`, `buy` and `transfer` call the asset
+  registry's read-only `is_asset_locked` and fail with `AssetLocked` (error #12) while the asset
+  is pledged. `buy` re-checks at sale time, so a lien placed after listing still blocks the sale.
+  The registry address is set in `initialize`.
 - **Trading history.** Mints, transfers and sales are recorded per NFT (`get_history`), capped at
-  100 entries with the oldest dropped first.
+  100 entries (`MAX_HISTORY`) with the oldest dropped first. Each dropped entry is announced with
+  an `nft_trunc` event carrying `(token_id, trade)`, so older provenance remains recoverable from
+  the event log (issue #1971).
 
 ## Operational notes
 
+- **Pause.** The admin can `pause` the contract (`unpause` lifts it). While paused, `mint`,
+  `transfer`, `sync_metadata`, `list_for_sale`, `cancel_listing` and `buy` fail with
+  `Paused` (error #11). Read-only calls keep working (issue #1973).
 - Mint only after the asset is registered and verified in `asset-registry`. Minting is the
   point where the on-chain asset owner is fixed.
 - Keep the admin key aligned with the asset registry admin. Metadata sync trusts the admin.
