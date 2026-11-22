@@ -18,9 +18,10 @@ pub const DISPUTE_WINDOW_SECS: u64 = 3 * 24 * 60 * 60;
 #[soroban_sdk::contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WinnerCriterion {
-    /// Lowest price wins. Ties go to the earliest bid.
+    /// Lowest price wins. Ties go to the earliest bid (commit order for sealed auctions).
     LowestPrice = 0,
-    /// Highest reputation at bid time wins. Ties go to the lower price, then the earliest bid.
+    /// Highest reputation at bid time wins. Ties go to the lower price, then the earliest bid
+    /// (commit order for sealed auctions).
     HighestReputation = 1,
 }
 
@@ -105,6 +106,10 @@ pub fn commitment(
 }
 
 /// Index of the winning bid under `criterion`, or `None` if there are no bids.
+///
+/// Ties are broken by slice order: the first bid in `bids` that ties for best wins.
+/// `finalize_auction` passes bids in commit order for sealed auctions and in
+/// placement order for open auctions, so ties never depend on reveal timing.
 pub fn select_winner(bids: &Vec<Bid>, criterion: WinnerCriterion) -> Option<u32> {
     let mut best: Option<(u32, Bid)> = None;
     for (idx, bid) in bids.iter().enumerate() {
