@@ -1,7 +1,7 @@
 use super::*;
 use soroban_sdk::{
     symbol_short, testutils::Address as _, testutils::Events as _, testutils::Ledger, Address, Env,
-    String, Symbol, TryFromVal,
+    IntoVal, String, Symbol, TryFromVal,
 };
 
 const T0: u64 = 10_000;
@@ -85,6 +85,77 @@ fn non_admin_cannot_mint_or_fund() {
     assert_eq!(
         ctx.client.try_fund_treasury(&other, &5),
         Err(Ok(contract_err(ContractError::UnauthorizedAdmin)))
+    );
+}
+
+#[test]
+fn transfer_emits_from_to_amount_event() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let a = holder(&ctx, 100);
+    let b = Address::generate(&env);
+
+    ctx.client.transfer_shares(&a, &b, &40);
+
+    let events = env.events().all();
+    let (_contract, topics, data) = events.last().unwrap();
+    assert_eq!(
+        topics,
+        soroban_sdk::Vec::from_array(&env, [TRANSFER_TOPIC.into_val(&env)])
+    );
+    let payload: (Address, Address, u64) = data.into_val(&env);
+    assert_eq!(payload, (a, b, 40u64));
+}
+
+#[test]
+fn fund_treasury_emits_funder_and_amount_event() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    ctx.client.fund_treasury(&ctx.admin, &500);
+
+    let events = env.events().all();
+    let (_contract, topics, data) = events.last().unwrap();
+    assert_eq!(
+        topics,
+        soroban_sdk::Vec::from_array(&env, [FUND_TOPIC.into_val(&env)])
+    );
+    let payload: (Address, u64) = data.into_val(&env);
+    assert_eq!(payload, (ctx.admin.clone(), 500u64));
+}
+
+#[test]
+fn active_proposals_per_address_are_capped() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let proposer = holder(&ctx, 50);
+    let other = holder(&ctx, 50);
+
+    let mut ids = Vec::new(&env);
+    for _ in 0..MAX_ACTIVE_PROPOSALS_PER_ADDRESS {
+        ids.push_back(
+            ctx.client
+                .create_proposal(&proposer, &title(&env), &param_kind(1)),
+        );
+    }
+    assert_eq!(
+        ctx.client
+            .try_create_proposal(&proposer, &title(&env), &param_kind(1)),
+        Err(Ok(contract_err(ContractError::ProposalLimitReached)))
+    );
+    // The cap is per address: another holder is unaffected.
+    ctx.client
+        .create_proposal(&other, &title(&env), &param_kind(1));
+
+    // Finalizing one of the proposer's proposals frees a slot.
+    at(&env, T0 + PERIOD);
+    ctx.client.finalize_proposal(&ids.get(0).unwrap());
+    ctx.client
+        .create_proposal(&proposer, &title(&env), &param_kind(1));
+    assert_eq!(
+        ctx.client
+            .try_create_proposal(&proposer, &title(&env), &param_kind(1)),
+        Err(Ok(contract_err(ContractError::ProposalLimitReached)))
     );
 }
 
@@ -348,14 +419,18 @@ fn vote_cap_is_enforced() {
     let env = Env::default();
     let ctx = setup(&env);
     let proposer = holder(&ctx, 50);
+    // Voters must hold shares when the proposal is created to carry any weight.
+    let mut voters: Vec<Address> = Vec::new(&env);
+    for _ in 0..=MAX_VOTES_PER_PROPOSAL {
+        voters.push_back(holder(&ctx, 1));
+    }
     let id = ctx
         .client
         .create_proposal(&proposer, &title(&env), &param_kind(1));
-    for _ in 0..MAX_VOTES_PER_PROPOSAL {
-        let v = holder(&ctx, 1);
-        ctx.client.vote(&v, &id, &true);
+    for i in 0..MAX_VOTES_PER_PROPOSAL {
+        ctx.client.vote(&voters.get(i).unwrap(), &id, &true);
     }
-    let extra = holder(&ctx, 1);
+    let extra = voters.get(MAX_VOTES_PER_PROPOSAL).unwrap();
     assert_eq!(
         ctx.client.try_vote(&extra, &id, &true),
         Err(Ok(contract_err(ContractError::TooManyVotes)))
@@ -556,4 +631,154 @@ fn execute_requires_finalized_pass() {
         ctx.client.try_execute_proposal(&id),
         Err(Ok(contract_err(ContractError::ProposalNotPassed)))
     );
+}
+
+#[test]
+fn shares_received_after_creation_carry_no_vote_weight() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let a = holder(&ctx, 100);
+    let id = ctx.client.create_proposal(&a, &title(&env), &param_kind(1));
+
+    // Shares transferred in after creation are not part of the snapshot.
+    let late = Address::generate(&env);
+    ctx.client.transfer_shares(&a, &late, &60);
+    assert_eq!(
+        ctx.client.try_vote(&late, &id, &true),
+        Err(Ok(contract_err(ContractError::InsufficientShares)))
+    );
+
+    // The original holder votes with the snapshot balance, not the reduced live one.
+    ctx.client.vote(&a, &id, &true);
+    assert_eq!(ctx.client.get_proposal(&id).votes_for, 100);
+    assert_eq!(ctx.client.get_votes(&id).get(0).unwrap().weight, 100);
+}
+
+#[test]
+fn inbound_transfer_after_creation_does_not_change_vote_weight() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let voter = holder(&ctx, 50);
+    let id = ctx
+        .client
+        .create_proposal(&voter, &title(&env), &param_kind(1));
+
+    // A third party sends a share to the voter after creation. The vote still
+    // counts only the snapshot balance, and the voter cannot be locked out.
+    let dust_sender = holder(&ctx, 1);
+    ctx.client.transfer_shares(&dust_sender, &voter, &1);
+    ctx.client.vote(&voter, &id, &true);
+    assert_eq!(ctx.client.get_proposal(&id).votes_for, 50);
+}
+
+#[test]
+fn shares_sent_after_creation_still_count_once_for_the_sender() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let a = holder(&ctx, 100);
+    let b = Address::generate(&env);
+    let id = ctx.client.create_proposal(&a, &title(&env), &param_kind(1));
+
+    // `a` sends 60 to `b` after creation. Both sides together carry the
+    // snapshot total exactly once: `a` votes 100, `b` gets no weight.
+    ctx.client.transfer_shares(&a, &b, &60);
+    ctx.client.vote(&a, &id, &true);
+    assert_eq!(
+        ctx.client.try_vote(&b, &id, &true),
+        Err(Ok(contract_err(ContractError::InsufficientShares)))
+    );
+    assert_eq!(ctx.client.get_proposal(&id).total_shares_snapshot, 100);
+    assert_eq!(ctx.client.get_proposal(&id).votes_for, 100);
+}
+
+#[test]
+fn snapshot_weight_spans_multiple_changes_after_creation() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let a = holder(&ctx, 40);
+    let id = ctx.client.create_proposal(&a, &title(&env), &param_kind(1));
+    // Several changes to the same holder after creation; weight must still be 40.
+    let b = Address::generate(&env);
+    ctx.client.mint_shares(&ctx.admin, &a, &10);
+    ctx.client.transfer_shares(&a, &b, &20);
+    ctx.client.mint_shares(&ctx.admin, &a, &5);
+    ctx.client.vote(&a, &id, &false);
+    assert_eq!(ctx.client.get_proposal(&id).votes_against, 40);
+}
+
+mod outcome_properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    const MAX_COUNT: u64 = u32::MAX as u64;
+
+    fn bps() -> impl Strategy<Value = u32> {
+        1u32..=10_000
+    }
+
+    proptest! {
+        /// Additional yes votes never turn a Passed proposal into Rejected (or NoQuorum).
+        #[test]
+        fn extra_yes_votes_never_unpass(
+            votes_for in 0..=MAX_COUNT,
+            votes_against in 0..=MAX_COUNT,
+            extra_yes in 0..=MAX_COUNT,
+            total in 0..=MAX_COUNT,
+            quorum_bps in bps(),
+            approval_bps in bps(),
+        ) {
+            let before = outcome(votes_for, votes_against, total, quorum_bps, approval_bps);
+            if before == ProposalStatus::Passed {
+                let after = outcome(
+                    votes_for + extra_yes,
+                    votes_against,
+                    total,
+                    quorum_bps,
+                    approval_bps,
+                );
+                prop_assert_eq!(after, ProposalStatus::Passed);
+            }
+        }
+
+        /// Turnout exactly at `ceil(total * quorum / 10_000)` meets quorum; one vote fewer does not.
+        #[test]
+        fn quorum_holds_exactly_at_boundary(
+            total in 0..=MAX_COUNT,
+            quorum_bps in bps(),
+            approval_bps in bps(),
+        ) {
+            let bps_total = BPS as u128;
+            let needed = ((total as u128) * (quorum_bps as u128)).div_ceil(bps_total).max(1) as u64;
+
+            // All votes in favour, so approval is never the reason for the result.
+            prop_assert_ne!(
+                outcome(needed, 0, total, quorum_bps, approval_bps),
+                ProposalStatus::NoQuorum
+            );
+            if needed > 1 {
+                prop_assert_eq!(
+                    outcome(needed - 1, 0, total, quorum_bps, approval_bps),
+                    ProposalStatus::NoQuorum
+                );
+            }
+        }
+
+        /// With zero total shares, quorum is met by any vote at all and never by none.
+        #[test]
+        fn zero_total_shares(
+            votes_for in 0..=MAX_COUNT,
+            votes_against in 0..=MAX_COUNT,
+            quorum_bps in bps(),
+            approval_bps in bps(),
+        ) {
+            let status = outcome(votes_for, votes_against, 0, quorum_bps, approval_bps);
+            if votes_for + votes_against == 0 {
+                prop_assert_eq!(status, ProposalStatus::NoQuorum);
+            } else {
+                prop_assert!(
+                    status == ProposalStatus::Passed || status == ProposalStatus::Rejected
+                );
+            }
+        }
+    }
 }
