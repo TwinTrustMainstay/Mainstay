@@ -341,6 +341,13 @@ const RESTRUCTURE_PROPOSED: Symbol = symbol_short!("rest_pr");
 const RESTRUCTURE_ACCEPTED: Symbol = symbol_short!("rest_ac");
 const INSURANCE_REGISTERED: Symbol = symbol_short!("ins_reg");
 const INSURANCE_CLAIMED: Symbol = symbol_short!("ins_clm");
+/// Event symbols for issues #2006–#2009
+const LIEN_CREATED: Symbol = symbol_short!("lien_cr");
+const LIEN_RELEASED: Symbol = symbol_short!("lien_rl");
+const ORACLE_SET: Symbol = symbol_short!("oracl_set");
+const MARKET_UPDATED: Symbol = symbol_short!("mkt_upd");
+const TREASURY_SLASHED: Symbol = symbol_short!("trsry_sl");
+const LTV_SET: Symbol = symbol_short!("ltv_set");
 
 fn loan_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
     (symbol_short!("LOAN"), borrower.clone())
@@ -1095,6 +1102,8 @@ impl LendingContract {
             );
             env.storage().persistent().set(&SLASH_BAL, &0u64);
             extend_persistent_ttl(&env, &SLASH_BAL);
+            env.events()
+                .publish((TREASURY_SLASHED,), (admin.clone(), slash_balance));
         }
     }
 
@@ -1254,6 +1263,7 @@ impl LendingContract {
         }
 
         let mut config = get_config(&env);
+        let old_ltv_bps = config.max_ltv_bps;
         config.max_ltv_bps = max_ltv_bps;
         env.storage().persistent().set(&CONFIG_KEY, &config);
         extend_persistent_ttl(&env, &CONFIG_KEY);
@@ -1261,6 +1271,8 @@ impl LendingContract {
             .persistent()
             .set(&BASE_MAX_LTV_KEY, &max_ltv_bps);
         extend_persistent_ttl(&env, &BASE_MAX_LTV_KEY);
+        env.events()
+            .publish((LTV_SET,), (old_ltv_bps, max_ltv_bps));
     }
 
     /// Returns the credit score for a borrower based on their repayment/default history.
@@ -1342,6 +1354,8 @@ impl LendingContract {
         env.storage()
             .persistent()
             .extend_ttl(&la_key, TTL_THRESHOLD, TTL_TARGET);
+        env.events()
+            .publish((LIEN_CREATED,), (asset_id, loan_id));
     }
 
     /// Release a lien only after its loan has been repaid or defaulted.
@@ -1396,6 +1410,8 @@ impl LendingContract {
                 {
                     env.storage().persistent().remove(&loan_asset_key(loan_id));
                 }
+                env.events()
+                    .publish((LIEN_RELEASED,), (asset_id, loan_id));
             }
             None => panic_with_error!(&env, ContractError::LienNotFound),
         }
@@ -1418,6 +1434,8 @@ impl LendingContract {
             .persistent()
             .set(&MARKET_ORACLE_KEY, &oracle_addr);
         extend_persistent_ttl(&env, &MARKET_ORACLE_KEY);
+        env.events()
+            .publish((ORACLE_SET,), (oracle_addr.clone(),));
     }
 
     /// Adjust LTV based on current market conditions (volatility).
@@ -1500,6 +1518,8 @@ impl LendingContract {
 
         env.storage().persistent().set(&MARKET_CONDITION_KEY, &market);
         extend_persistent_ttl(&env, &MARKET_CONDITION_KEY);
+        env.events()
+            .publish((MARKET_UPDATED,), (volatility, price_change_bps));
     }
 
     // ── Issue #1646: Loan Syndication Support ──
@@ -2826,5 +2846,197 @@ mod tests {
             .is_err());
         assert_eq!(client.get_insurance(&7), Some(insurance));
         assert_eq!(client.claim_insurance(&lender, &7, &100), 100);
+    }
+
+    // ── issue #2007: lien events ───────────────────────────────────────────
+
+    #[test]
+    fn test_record_lien_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (contract_id, admin, _) = setup_contract(&env);
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let lender = Address::generate(&env);
+        client.record_lien(&admin, &5, &lender, &10, &500);
+
+        let events = env.events().all();
+        let found = events.iter().any(|e| {
+            if let soroban_sdk::xdr::ContractEvent::V0(v0) = &e.event {
+                v0.topics.len() > 0
+                    && v0.topics.get(0).map_or(false, |t| {
+                        if let soroban_sdk::xdr::ScVal::Symbol(sym) = t {
+                            sym.0.as_slice() == b"lien_cr"
+                        } else {
+                            false
+                        }
+                    })
+            } else {
+                false
+            }
+        });
+        assert!(found, "record_lien must emit lien_cr event");
+    }
+
+    #[test]
+    fn test_release_lien_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (contract_id, admin, _) = setup_contract(&env);
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let lender = Address::generate(&env);
+        client.record_lien(&admin, &5, &lender, &10, &500);
+
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&loan_status_key(10), &LoanStatus::Repaid);
+        });
+        client.release_lien(&admin, &5, &lender, &10);
+
+        let events = env.events().all();
+        let found = events.iter().any(|e| {
+            if let soroban_sdk::xdr::ContractEvent::V0(v0) = &e.event {
+                v0.topics.len() > 0
+                    && v0.topics.get(0).map_or(false, |t| {
+                        if let soroban_sdk::xdr::ScVal::Symbol(sym) = t {
+                            sym.0.as_slice() == b"lien_rl"
+                        } else {
+                            false
+                        }
+                    })
+            } else {
+                false
+            }
+        });
+        assert!(found, "release_lien must emit lien_rl event");
+    }
+
+    // ── issue #2008: market condition events ──────────────────────────────
+
+    #[test]
+    fn test_set_market_oracle_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (contract_id, admin, _) = setup_contract(&env);
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let oracle_addr = Address::generate(&env);
+        client.set_market_oracle(&admin, &oracle_addr);
+
+        let events = env.events().all();
+        let found = events.iter().any(|e| {
+            if let soroban_sdk::xdr::ContractEvent::V0(v0) = &e.event {
+                v0.topics.len() > 0
+                    && v0.topics.get(0).map_or(false, |t| {
+                        if let soroban_sdk::xdr::ScVal::Symbol(sym) = t {
+                            sym.0.as_slice() == b"oracl_set"
+                        } else {
+                            false
+                        }
+                    })
+            } else {
+                false
+            }
+        });
+        assert!(found, "set_market_oracle must emit oracl_set event");
+    }
+
+    #[test]
+    fn test_update_market_conditions_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (contract_id, admin, _) = setup_contract(&env);
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        client.update_market_conditions(&admin, &2500, &-100);
+
+        let events = env.events().all();
+        let found = events.iter().any(|e| {
+            if let soroban_sdk::xdr::ContractEvent::V0(v0) = &e.event {
+                v0.topics.len() > 0
+                    && v0.topics.get(0).map_or(false, |t| {
+                        if let soroban_sdk::xdr::ScVal::Symbol(sym) = t {
+                            sym.0.as_slice() == b"mkt_upd"
+                        } else {
+                            false
+                        }
+                    })
+            } else {
+                false
+            }
+        });
+        assert!(found, "update_market_conditions must emit mkt_upd event");
+    }
+
+    // ── issue #2009: slash_treasury event ─────────────────────────────────
+
+    #[test]
+    fn test_slash_treasury_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (contract_id, admin, _) = setup_contract(&env);
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        // Seed a non-zero slash balance directly so the transfer branch runs.
+        env.as_contract(&contract_id, || {
+            env.storage().persistent().set(&SLASH_BAL, &1000u64);
+        });
+
+        client.slash_treasury(&admin);
+
+        let events = env.events().all();
+        let found = events.iter().any(|e| {
+            if let soroban_sdk::xdr::ContractEvent::V0(v0) = &e.event {
+                v0.topics.len() > 0
+                    && v0.topics.get(0).map_or(false, |t| {
+                        if let soroban_sdk::xdr::ScVal::Symbol(sym) = t {
+                            sym.0.as_slice() == b"trsry_sl"
+                        } else {
+                            false
+                        }
+                    })
+            } else {
+                false
+            }
+        });
+        assert!(found, "slash_treasury must emit trsry_sl event");
+    }
+
+    // ── issue #2006: set_max_ltv_bps event ────────────────────────────────
+
+    #[test]
+    fn test_set_max_ltv_bps_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (contract_id, admin, _) = setup_contract(&env);
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        // Initial max_ltv_bps is 0 (default). Set to 7000.
+        client.set_max_ltv_bps(&admin, &7000);
+
+        let events = env.events().all();
+        let found = events.iter().any(|e| {
+            if let soroban_sdk::xdr::ContractEvent::V0(v0) = &e.event {
+                v0.topics.len() > 0
+                    && v0.topics.get(0).map_or(false, |t| {
+                        if let soroban_sdk::xdr::ScVal::Symbol(sym) = t {
+                            sym.0.as_slice() == b"ltv_set"
+                        } else {
+                            false
+                        }
+                    })
+            } else {
+                false
+            }
+        });
+        assert!(found, "set_max_ltv_bps must emit ltv_set event");
     }
 }

@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and hash-based maintenance evidence attachments to the lifecycle contract.
 
 ### Added
+- `lending`: `record_lien` now emits a `lien_cr` event with `asset_id` and `loan_id` (closes [#2007](https://github.com/TwinTrustMainstay/Mainstay/issues/2007))
+- `lending`: `release_lien` now emits a `lien_rl` event with `asset_id` and `loan_id` (closes [#2007](https://github.com/TwinTrustMainstay/Mainstay/issues/2007))
+- `lending`: `set_market_oracle` now emits an `oracl_set` event with the new oracle address (closes [#2008](https://github.com/TwinTrustMainstay/Mainstay/issues/2008))
+- `lending`: `update_market_conditions` now emits a `mkt_upd` event with `volatility` and `price_change_bps` (closes [#2008](https://github.com/TwinTrustMainstay/Mainstay/issues/2008))
+- `lending`: `slash_treasury` now emits a `trsry_sl` event with the admin address and amount transferred (closes [#2009](https://github.com/TwinTrustMainstay/Mainstay/issues/2009))
+- `lending`: `set_max_ltv_bps` now emits an `ltv_set` event with the old and new basis-point values (closes [#2006](https://github.com/TwinTrustMainstay/Mainstay/issues/2006))
 - Frequently asked questions (#1721): 28 questions in eight topics, generated
   from `docs/faq/faq.json` into `docs/faq.md` and a searchable page at
   `docs/faq/index.html`. The page supports "was this helpful?" votes. An
