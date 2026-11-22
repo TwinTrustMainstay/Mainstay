@@ -6,6 +6,9 @@ use soroban_sdk::{
     Address, BytesN, Env, String, TryFromVal,
 };
 
+/// Deposit locked by each sealed commitment in tests.
+const DEPOSIT: i128 = 100;
+
 /// Stand-in for the engineer registry: per-address credential status and reputation.
 #[contracttype]
 #[derive(Clone)]
@@ -67,6 +70,7 @@ struct Ctx<'a> {
     client: MarketplaceClient<'a>,
     registry: MockRegistryClient<'a>,
     admin: Address,
+    token: Address,
 }
 
 fn setup(env: &Env) -> Ctx<'_> {
@@ -78,17 +82,24 @@ fn setup(env: &Env) -> Ctx<'_> {
     let id = env.register(Marketplace, ());
     let client = MarketplaceClient::new(env, &id);
     client.initialize(&admin, &registry_id, &pricing());
+    let token_admin = Address::generate(env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    client.set_bid_deposit(&admin, &token, &DEPOSIT);
     Ctx {
         env,
         client,
         registry,
         admin,
+        token,
     }
 }
 
 fn engineer(ctx: &Ctx, status: CredentialStatus, reputation: u32) -> Address {
     let addr = Address::generate(ctx.env);
     ctx.registry.set_engineer(&addr, &status, &reputation);
+    StellarAssetClient::new(ctx.env, &ctx.token).mint(&addr, &DEPOSIT);
     addr
 }
 
@@ -220,26 +231,6 @@ fn elasticity_reflects_demand_response_to_price() {
     // Demand doubles and price rises 10%: elasticity = +100% / +10% = 10x.
     ctx.client.record_market_state(&ctx.admin, &10, &20);
     assert_eq!(ctx.client.get_price_elasticity(), Some(100_000));
-}
-
-#[test]
-fn elasticity_is_none_when_prior_demand_is_zero() {
-    let env = Env::default();
-    let ctx = setup(&env);
-    // Zero prior demand: elasticity is undefined, not a neutral zero.
-    ctx.client.record_market_state(&ctx.admin, &10, &0);
-    at(&env, T0 + 61);
-    ctx.client.record_market_state(&ctx.admin, &10, &5);
-    assert_eq!(ctx.client.get_price_elasticity(), None);
-}
-
-#[test]
-fn elasticity_is_none_with_fewer_than_two_observations() {
-    let env = Env::default();
-    let ctx = setup(&env);
-    assert_eq!(ctx.client.get_price_elasticity(), None);
-    ctx.client.record_market_state(&ctx.admin, &10, &10);
-    assert_eq!(ctx.client.get_price_elasticity(), None);
 }
 
 #[test]
@@ -520,38 +511,6 @@ fn mode_mismatches_are_rejected() {
     );
 }
 
-/// Registers a Stellar asset token and configures it as the dispute bond.
-fn configure_bond<'a>(
-    ctx: &Ctx<'a>,
-    amount: i128,
-) -> (Address, TokenClient<'a>, StellarAssetClient<'a>) {
-    let token_admin = Address::generate(ctx.env);
-    let token_id = ctx
-        .env
-        .register_stellar_asset_contract_v2(token_admin)
-        .address();
-    ctx.client.set_dispute_bond(&ctx.admin, &token_id, &amount);
-    (
-        token_id.clone(),
-        TokenClient::new(ctx.env, &token_id),
-        StellarAssetClient::new(ctx.env, &token_id),
-    )
-}
-
-/// An awarded open auction: `cheap` wins at 1_000, `other` bid 1_500.
-fn awarded_auction(ctx: &Ctx) -> (u64, Address, Address) {
-    let id = ctx
-        .client
-        .create_auction(&ctx.admin, &open_params(ctx, WinnerCriterion::LowestPrice));
-    let cheap = engineer(ctx, CredentialStatus::Valid, 0);
-    let other = engineer(ctx, CredentialStatus::Valid, 0);
-    ctx.client.place_bid(&cheap, &id, &1_000);
-    ctx.client.place_bid(&other, &id, &1_500);
-    at(ctx.env, BID_END + 1);
-    ctx.client.finalize_auction(&id);
-    (id, cheap, other)
-}
-
 #[test]
 fn awarded_auction_can_be_disputed_and_admin_can_resolve() {
     let env = Env::default();
@@ -587,84 +546,6 @@ fn awarded_auction_can_be_disputed_and_admin_can_resolve() {
 }
 
 #[test]
-fn dispute_requires_a_configured_bond() {
-    let env = Env::default();
-    let ctx = setup(&env);
-    let (id, _cheap, other) = awarded_auction(&ctx);
-    assert_eq!(
-        ctx.client
-            .try_open_dispute(&other, &id, &String::from_str(&env, "x")),
-        Err(Ok(contract_err(ContractError::DisputeBondNotConfigured)))
-    );
-    assert_eq!(ctx.client.get_auction(&id).status, AuctionStatus::Awarded);
-}
-
-#[test]
-fn dispute_bond_must_be_positive() {
-    let env = Env::default();
-    let ctx = setup(&env);
-    let token_id = env
-        .register_stellar_asset_contract_v2(Address::generate(&env))
-        .address();
-    assert_eq!(
-        ctx.client.try_set_dispute_bond(&ctx.admin, &token_id, &0),
-        Err(Ok(contract_err(ContractError::InvalidDisputeBond)))
-    );
-}
-
-#[test]
-fn dispute_requires_the_bond_to_be_funded() {
-    let env = Env::default();
-    let ctx = setup(&env);
-    let _ = configure_bond(&ctx, 500);
-    let (id, _cheap, other) = awarded_auction(&ctx);
-    // `other` holds no bond tokens, so the escrow transfer fails and the
-    // dispute is not opened.
-    assert!(ctx
-        .client
-        .try_open_dispute(&other, &id, &String::from_str(&env, "x"))
-        .is_err());
-    assert_eq!(ctx.client.get_auction(&id).status, AuctionStatus::Awarded);
-}
-
-#[test]
-fn repeated_disputes_from_one_bidder_post_a_single_bond() {
-    let env = Env::default();
-    let ctx = setup(&env);
-    let (_token, token_client, minter) = configure_bond(&ctx, 500);
-    let (id, _cheap, other) = awarded_auction(&ctx);
-    minter.mint(&other, &1_000);
-    let reason = String::from_str(&env, "again");
-
-    ctx.client.open_dispute(&other, &id, &reason);
-    // The auction is now Disputed, so a second dispute is refused.
-    assert_eq!(
-        ctx.client.try_open_dispute(&other, &id, &reason),
-        Err(Ok(contract_err(ContractError::NotAwarded)))
-    );
-    // Only one bond was escrowed.
-    assert_eq!(token_client.balance(&other), 500);
-    assert_eq!(token_client.balance(&ctx.client.address), 500);
-}
-
-#[test]
-fn bond_is_forfeited_when_original_award_is_upheld() {
-    let env = Env::default();
-    let ctx = setup(&env);
-    let (_token, token_client, minter) = configure_bond(&ctx, 500);
-    let (id, cheap, other) = awarded_auction(&ctx);
-    minter.mint(&other, &500);
-    ctx.client
-        .open_dispute(&other, &id, &String::from_str(&env, "unfair"));
-
-    // Naming the original winner upholds the award, so the bond is not refunded.
-    ctx.client.resolve_dispute(&ctx.admin, &id, &cheap);
-    assert_eq!(ctx.client.get_auction(&id).winner, Some(cheap));
-    assert_eq!(token_client.balance(&other), 0);
-    assert_eq!(token_client.balance(&ctx.client.address), 500);
-}
-
-#[test]
 fn dispute_window_closes() {
     let env = Env::default();
     let ctx = setup(&env);
@@ -695,32 +576,185 @@ fn only_admin_can_create_auctions() {
     );
 }
 
-// ---------- Credential recheck at finalization (#1938) ----------
+// ---------- Commitment cap per auction (#1934) ----------
 
 #[test]
-fn lapsed_winner_falls_back_to_next_valid_bidder() {
+fn commit_bid_rejects_commitments_beyond_the_cap() {
     let env = Env::default();
     let ctx = setup(&env);
     let id = ctx
         .client
-        .create_auction(&ctx.admin, &open_params(&ctx, WinnerCriterion::LowestPrice));
-    let lapsed = engineer(&ctx, CredentialStatus::Valid, 0);
-    let backup = engineer(&ctx, CredentialStatus::Valid, 0);
-    ctx.client.place_bid(&lapsed, &id, &1_000);
-    ctx.client.place_bid(&backup, &id, &2_000);
+        .create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
+    let salt = BytesN::from_array(&env, &[3u8; 32]);
+    let filler = commitment(&env, id, &ctx.admin, 1_000, &salt);
+    for _ in 0..MAX_BIDS_PER_AUCTION {
+        let e = engineer(&ctx, CredentialStatus::Valid, 0);
+        ctx.client.commit_bid(&e, &id, &filler);
+    }
 
-    // The lowest bidder's credential lapses between bidding and finalization.
-    ctx.registry
-        .set_engineer(&lapsed, &CredentialStatus::Expired, &0);
+    let overflow = engineer(&ctx, CredentialStatus::Valid, 0);
+    assert_eq!(
+        ctx.client.try_commit_bid(&overflow, &id, &filler),
+        Err(Ok(contract_err(ContractError::BidLimitReached)))
+    );
+}
+
+// ---------- Refundable commitment deposit (#1935) ----------
+
+#[test]
+fn commit_locks_deposit_and_reveal_refunds_it() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let token = TokenClient::new(&env, &ctx.token);
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
+    let a = engineer(&ctx, CredentialStatus::Valid, 0);
+    let salt = BytesN::from_array(&env, &[4u8; 32]);
+
+    ctx.client
+        .commit_bid(&a, &id, &commitment(&env, id, &a, 2_000, &salt));
+    assert_eq!(token.balance(&a), 0);
+    assert_eq!(token.balance(&ctx.client.address), DEPOSIT);
 
     at(&env, BID_END + 1);
-    ctx.client.finalize_auction(&id);
-
-    let auction = ctx.client.get_auction(&id);
-    assert_eq!(auction.status, AuctionStatus::Awarded);
-    assert_eq!(auction.winner, Some(backup));
-    assert_eq!(auction.winning_price, 2_000);
+    ctx.client.reveal_bid(&a, &id, &2_000, &salt);
+    assert_eq!(token.balance(&a), DEPOSIT);
+    assert_eq!(token.balance(&ctx.client.address), 0);
 }
+
+#[test]
+fn unrevealed_deposit_is_forfeited_and_only_claimable_after_reveal_window() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let token = TokenClient::new(&env, &ctx.token);
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
+    let a = engineer(&ctx, CredentialStatus::Valid, 0);
+    let b = engineer(&ctx, CredentialStatus::Valid, 0);
+    let salt = BytesN::from_array(&env, &[6u8; 32]);
+    ctx.client
+        .commit_bid(&a, &id, &commitment(&env, id, &a, 2_000, &salt));
+    ctx.client
+        .commit_bid(&b, &id, &commitment(&env, id, &b, 1_500, &salt));
+
+    at(&env, BID_END + 1);
+    ctx.client.reveal_bid(&a, &id, &2_000, &salt);
+    // b never reveals.
+    let treasury = Address::generate(&env);
+    assert_eq!(
+        ctx.client
+            .try_claim_forfeited_deposits(&ctx.admin, &id, &treasury),
+        Err(Ok(contract_err(ContractError::ForfeitWindowOpen)))
+    );
+
+    at(&env, REVEAL_END + 1);
+    let forfeited = ctx
+        .client
+        .claim_forfeited_deposits(&ctx.admin, &id, &treasury);
+    assert_eq!(forfeited, DEPOSIT);
+    assert_eq!(token.balance(&treasury), DEPOSIT);
+    assert_eq!(token.balance(&b), 0);
+    assert_eq!(token.balance(&a), DEPOSIT);
+    assert_eq!(token.balance(&ctx.client.address), 0);
+}
+
+#[test]
+fn commit_requires_a_configured_deposit() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
+    let a = engineer(&ctx, CredentialStatus::Valid, 0);
+    let salt = BytesN::from_array(&env, &[7u8; 32]);
+    let c = commitment(&env, id, &a, 2_000, &salt);
+
+    // A marketplace that never set a deposit must reject commitments.
+    let fresh = env.register(Marketplace, ());
+    let fresh_client = MarketplaceClient::new(&env, &fresh);
+    fresh_client.initialize(&ctx.admin, &ctx.registry.address, &pricing());
+    let fresh_id =
+        fresh_client.create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
+    assert_eq!(
+        fresh_client.try_commit_bid(&a, &fresh_id, &c),
+        Err(Ok(contract_err(ContractError::DepositNotConfigured)))
+    );
+    assert_eq!(
+        ctx.client.try_set_bid_deposit(&ctx.admin, &ctx.token, &0),
+        Err(Ok(contract_err(ContractError::InvalidDepositConfig)))
+    );
+}
+
+// ---------- Reveal at the bid cap (#1936) ----------
+
+#[test]
+fn reveal_at_bid_cap_is_rejected_with_event_and_settled() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let token = TokenClient::new(&env, &ctx.token);
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
+    let a = engineer(&ctx, CredentialStatus::Valid, 0);
+    let salt = BytesN::from_array(&env, &[8u8; 32]);
+    ctx.client
+        .commit_bid(&a, &id, &commitment(&env, id, &a, 2_000, &salt));
+
+    // Fill the stored bid list to the cap without going through reveals.
+    let filler = Address::generate(&env);
+    let mut full: Vec<Bid> = Vec::new(&env);
+    for _ in 0..MAX_BIDS_PER_AUCTION {
+        full.push_back(Bid {
+            engineer: filler.clone(),
+            price: 4_000,
+            reputation: 0,
+            placed_at: T0,
+        });
+    }
+    env.as_contract(&ctx.client.address, || {
+        env.storage().persistent().set(&DataKey::Bids(id), &full);
+    });
+
+    at(&env, BID_END + 1);
+    ctx.client.reveal_bid(&a, &id, &2_000, &salt);
+
+    // Not recorded, but no revert: the bid list is unchanged and the deposit is returned.
+    assert_eq!(ctx.client.get_bids(&id).len(), MAX_BIDS_PER_AUCTION);
+    assert_eq!(token.balance(&a), DEPOSIT);
+    assert_eq!(
+        ctx.client.try_reveal_bid(&a, &id, &2_000, &salt),
+        Err(Ok(contract_err(ContractError::NoCommitment)))
+    );
+}
+
+// ---------- Credential recheck on reveal (#1937) ----------
+
+#[test]
+fn revoked_engineer_cannot_reveal_after_committing() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
+    let a = engineer(&ctx, CredentialStatus::Valid, 0);
+    let salt = BytesN::from_array(&env, &[10u8; 32]);
+    ctx.client
+        .commit_bid(&a, &id, &commitment(&env, id, &a, 1_000, &salt));
+
+    // Credential is revoked between commit and reveal.
+    ctx.registry
+        .set_engineer(&a, &CredentialStatus::Revoked, &0);
+    at(&env, BID_END + 1);
+    assert_eq!(
+        ctx.client.try_reveal_bid(&a, &id, &1_000, &salt),
+        Err(Ok(contract_err(ContractError::NotCredentialed)))
+    );
+    assert!(ctx.client.get_bids(&id).is_empty());
+}
+
+// ── Main-branch marketplace tests (dispute bonds, elasticity, tie-breaks) ──
 
 #[test]
 fn auction_is_unawarded_when_every_bidder_has_lapsed() {
@@ -742,7 +776,113 @@ fn auction_is_unawarded_when_every_bidder_has_lapsed() {
     assert_eq!(auction.winner, None);
 }
 
-// ---------- Unrevealed commitment cleanup (#1939) ----------
+fn awarded_auction(ctx: &Ctx) -> (u64, Address, Address) {
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &open_params(ctx, WinnerCriterion::LowestPrice));
+    let cheap = engineer(ctx, CredentialStatus::Valid, 0);
+    let other = engineer(ctx, CredentialStatus::Valid, 0);
+    ctx.client.place_bid(&cheap, &id, &1_000);
+    ctx.client.place_bid(&other, &id, &1_500);
+    at(ctx.env, BID_END + 1);
+    ctx.client.finalize_auction(&id);
+    (id, cheap, other)
+}
+
+#[test]
+fn bond_is_forfeited_when_original_award_is_upheld() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let (_token, token_client, minter) = configure_bond(&ctx, 500);
+    let (id, cheap, other) = awarded_auction(&ctx);
+    minter.mint(&other, &500);
+    ctx.client
+        .open_dispute(&other, &id, &String::from_str(&env, "unfair"));
+
+    // Naming the original winner upholds the award, so the bond is not refunded.
+    ctx.client.resolve_dispute(&ctx.admin, &id, &cheap);
+    assert_eq!(ctx.client.get_auction(&id).winner, Some(cheap));
+    assert_eq!(token_client.balance(&other), 0);
+    assert_eq!(token_client.balance(&ctx.client.address), 500);
+}
+
+fn configure_bond<'a>(
+    ctx: &Ctx<'a>,
+    amount: i128,
+) -> (Address, TokenClient<'a>, StellarAssetClient<'a>) {
+    let token_admin = Address::generate(ctx.env);
+    let token_id = ctx
+        .env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    ctx.client.set_dispute_bond(&ctx.admin, &token_id, &amount);
+    (
+        token_id.clone(),
+        TokenClient::new(ctx.env, &token_id),
+        StellarAssetClient::new(ctx.env, &token_id),
+    )
+}
+
+#[test]
+fn dispute_bond_must_be_positive() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    assert_eq!(
+        ctx.client.try_set_dispute_bond(&ctx.admin, &token_id, &0),
+        Err(Ok(contract_err(ContractError::InvalidDisputeBond)))
+    );
+}
+
+#[test]
+fn dispute_requires_a_configured_bond() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let (id, _cheap, other) = awarded_auction(&ctx);
+    assert_eq!(
+        ctx.client
+            .try_open_dispute(&other, &id, &String::from_str(&env, "x")),
+        Err(Ok(contract_err(ContractError::DisputeBondNotConfigured)))
+    );
+    assert_eq!(ctx.client.get_auction(&id).status, AuctionStatus::Awarded);
+}
+
+#[test]
+fn dispute_requires_the_bond_to_be_funded() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let _ = configure_bond(&ctx, 500);
+    let (id, _cheap, other) = awarded_auction(&ctx);
+    // `other` holds no bond tokens, so the escrow transfer fails and the
+    // dispute is not opened.
+    assert!(ctx
+        .client
+        .try_open_dispute(&other, &id, &String::from_str(&env, "x"))
+        .is_err());
+    assert_eq!(ctx.client.get_auction(&id).status, AuctionStatus::Awarded);
+}
+
+#[test]
+fn elasticity_is_none_when_prior_demand_is_zero() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    // Zero prior demand: elasticity is undefined, not a neutral zero.
+    ctx.client.record_market_state(&ctx.admin, &10, &0);
+    at(&env, T0 + 61);
+    ctx.client.record_market_state(&ctx.admin, &10, &5);
+    assert_eq!(ctx.client.get_price_elasticity(), None);
+}
+
+#[test]
+fn elasticity_is_none_with_fewer_than_two_observations() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    assert_eq!(ctx.client.get_price_elasticity(), None);
+    ctx.client.record_market_state(&ctx.admin, &10, &10);
+    assert_eq!(ctx.client.get_price_elasticity(), None);
+}
 
 #[test]
 fn finalize_clears_unrevealed_commitments_from_storage() {
@@ -792,33 +932,66 @@ fn finalize_clears_unrevealed_commitments_from_storage() {
     assert_eq!(ctx.client.get_auction(&id).winner, Some(revealer));
 }
 
-// ---------- Deterministic tie-breaking (#1940) ----------
-
 #[test]
-fn sealed_tie_goes_to_earliest_commitment_not_earliest_reveal() {
+fn lapsed_winner_falls_back_to_next_valid_bidder() {
     let env = Env::default();
     let ctx = setup(&env);
     let id = ctx
         .client
-        .create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
+        .create_auction(&ctx.admin, &open_params(&ctx, WinnerCriterion::LowestPrice));
+    let lapsed = engineer(&ctx, CredentialStatus::Valid, 0);
+    let backup = engineer(&ctx, CredentialStatus::Valid, 0);
+    ctx.client.place_bid(&lapsed, &id, &1_000);
+    ctx.client.place_bid(&backup, &id, &2_000);
+
+    // The lowest bidder's credential lapses between bidding and finalization.
+    ctx.registry
+        .set_engineer(&lapsed, &CredentialStatus::Expired, &0);
+
+    at(&env, BID_END + 1);
+    ctx.client.finalize_auction(&id);
+
+    let auction = ctx.client.get_auction(&id);
+    assert_eq!(auction.status, AuctionStatus::Awarded);
+    assert_eq!(auction.winner, Some(backup));
+    assert_eq!(auction.winning_price, 2_000);
+}
+
+#[test]
+fn open_auction_tie_goes_to_first_placed_bid() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &open_params(&ctx, WinnerCriterion::LowestPrice));
     let first = engineer(&ctx, CredentialStatus::Valid, 0);
     let second = engineer(&ctx, CredentialStatus::Valid, 0);
-    let salt_1 = BytesN::from_array(&env, &[4u8; 32]);
-    let salt_2 = BytesN::from_array(&env, &[5u8; 32]);
+    ctx.client.place_bid(&first, &id, &1_200);
+    ctx.client.place_bid(&second, &id, &1_200);
 
-    ctx.client
-        .commit_bid(&first, &id, &commitment(&env, id, &first, 1_500, &salt_1));
-    ctx.client
-        .commit_bid(&second, &id, &commitment(&env, id, &second, 1_500, &salt_2));
-
-    // The later committer reveals first, trying to take the tie by timing.
     at(&env, BID_END + 1);
-    ctx.client.reveal_bid(&second, &id, &1_500, &salt_2);
-    ctx.client.reveal_bid(&first, &id, &1_500, &salt_1);
-
-    at(&env, REVEAL_END + 1);
     ctx.client.finalize_auction(&id);
     assert_eq!(ctx.client.get_auction(&id).winner, Some(first));
+}
+
+#[test]
+fn repeated_disputes_from_one_bidder_post_a_single_bond() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let (_token, token_client, minter) = configure_bond(&ctx, 500);
+    let (id, _cheap, other) = awarded_auction(&ctx);
+    minter.mint(&other, &1_000);
+    let reason = String::from_str(&env, "again");
+
+    ctx.client.open_dispute(&other, &id, &reason);
+    // The auction is now Disputed, so a second dispute is refused.
+    assert_eq!(
+        ctx.client.try_open_dispute(&other, &id, &reason),
+        Err(Ok(contract_err(ContractError::NotAwarded)))
+    );
+    // Only one bond was escrowed.
+    assert_eq!(token_client.balance(&other), 500);
+    assert_eq!(token_client.balance(&ctx.client.address), 500);
 }
 
 #[test]
@@ -849,23 +1022,31 @@ fn sealed_reputation_tie_goes_to_earliest_commitment() {
 }
 
 #[test]
-fn open_auction_tie_goes_to_first_placed_bid() {
+fn sealed_tie_goes_to_earliest_commitment_not_earliest_reveal() {
     let env = Env::default();
     let ctx = setup(&env);
     let id = ctx
         .client
-        .create_auction(&ctx.admin, &open_params(&ctx, WinnerCriterion::LowestPrice));
+        .create_auction(&ctx.admin, &sealed_params(WinnerCriterion::LowestPrice));
     let first = engineer(&ctx, CredentialStatus::Valid, 0);
     let second = engineer(&ctx, CredentialStatus::Valid, 0);
-    ctx.client.place_bid(&first, &id, &1_200);
-    ctx.client.place_bid(&second, &id, &1_200);
+    let salt_1 = BytesN::from_array(&env, &[4u8; 32]);
+    let salt_2 = BytesN::from_array(&env, &[5u8; 32]);
 
+    ctx.client
+        .commit_bid(&first, &id, &commitment(&env, id, &first, 1_500, &salt_1));
+    ctx.client
+        .commit_bid(&second, &id, &commitment(&env, id, &second, 1_500, &salt_2));
+
+    // The later committer reveals first, trying to take the tie by timing.
     at(&env, BID_END + 1);
+    ctx.client.reveal_bid(&second, &id, &1_500, &salt_2);
+    ctx.client.reveal_bid(&first, &id, &1_500, &salt_1);
+
+    at(&env, REVEAL_END + 1);
     ctx.client.finalize_auction(&id);
     assert_eq!(ctx.client.get_auction(&id).winner, Some(first));
 }
-
-// ---------- Pricing configuration event (#1941) ----------
 
 #[test]
 fn update_pricing_config_emits_old_and_new_config() {
