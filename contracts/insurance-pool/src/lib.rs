@@ -23,6 +23,12 @@ use soroban_sdk::{
 /// Basis points denominator (10_000 = 100%).
 pub const BPS_DENOMINATOR: i128 = 10_000;
 
+/// Shortest policy term accepted by `set_term_secs`: one hour.
+pub const MIN_TERM_SECS: u64 = 3_600;
+
+/// Longest policy term accepted by `set_term_secs`: 365 days.
+pub const MAX_TERM_SECS: u64 = 365 * 24 * 3_600;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -55,6 +61,10 @@ pub enum ContractError {
     ClaimNotPending = 13,
     /// Arithmetic overflowed.
     MathOverflow = 14,
+    /// The pool is paused. Filing, purchases and withdrawals are blocked.
+    Paused = 15,
+    /// Policy term must be between MIN_TERM_SECS and MAX_TERM_SECS.
+    InvalidTerm = 16,
 }
 
 #[contracttype]
@@ -113,11 +123,14 @@ pub enum DataKey {
     Token,
     PremiumBps,
     TermSecs,
+    Paused,
     Stats,
     NextPolicyId,
     NextClaimId,
     Shares(Address),
     Policy(u64),
+    /// Sum of pending claim amounts against a policy.
+    PolicyReserved(u64),
     Claim(u64),
 }
 
@@ -144,6 +157,19 @@ fn token_client(env: &Env) -> token::Client<'_> {
         .get(&DataKey::Token)
         .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized));
     token::Client::new(env, &addr)
+}
+
+fn is_paused(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false)
+}
+
+fn ensure_not_paused(env: &Env) {
+    if is_paused(env) {
+        panic_with_error!(env, ContractError::Paused);
+    }
 }
 
 fn load_stats(env: &Env) -> PoolStats {
@@ -176,6 +202,19 @@ fn load_policy(env: &Env, id: u64) -> Policy {
 fn save_policy(env: &Env, policy: &Policy) {
     let key = DataKey::Policy(policy.id);
     env.storage().persistent().set(&key, policy);
+    extend_persistent_ttl(env, key);
+}
+
+fn policy_reserved(env: &Env, policy_id: u64) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::PolicyReserved(policy_id))
+        .unwrap_or(0)
+}
+
+fn set_policy_reserved(env: &Env, policy_id: u64, amount: i128) {
+    let key = DataKey::PolicyReserved(policy_id);
+    env.storage().persistent().set(&key, &amount);
     extend_persistent_ttl(env, key);
 }
 
@@ -225,6 +264,7 @@ impl InsurancePool {
 
     /// Deposits `amount` tokens and returns the shares minted for the provider.
     pub fn provide_capital(env: Env, provider: Address, amount: i128) -> i128 {
+        ensure_not_paused(&env);
         provider.require_auth();
         if amount <= 0 {
             panic_with_error!(&env, ContractError::InvalidAmount);
@@ -258,6 +298,7 @@ impl InsurancePool {
     /// Burns `shares` and pays the provider their pro-rata value from unreserved assets.
     /// Returns the amount paid out.
     pub fn withdraw_capital(env: Env, provider: Address, shares: i128) -> i128 {
+        ensure_not_paused(&env);
         provider.require_auth();
         if shares <= 0 {
             panic_with_error!(&env, ContractError::InvalidAmount);
@@ -290,6 +331,7 @@ impl InsurancePool {
     /// Buys coverage for `asset_id` up to `coverage`. The premium is paid to the pool.
     /// Returns the policy id.
     pub fn buy_policy(env: Env, lender: Address, asset_id: u64, coverage: i128) -> u64 {
+        ensure_not_paused(&env);
         lender.require_auth();
         if coverage <= 0 {
             panic_with_error!(&env, ContractError::InvalidAmount);
@@ -333,6 +375,7 @@ impl InsurancePool {
 
     /// Files a claim against a policy. Only the policy holder can file, and only before expiry.
     pub fn file_claim(env: Env, lender: Address, policy_id: u64, amount: i128) -> u64 {
+        ensure_not_paused(&env);
         lender.require_auth();
         if amount <= 0 {
             panic_with_error!(&env, ContractError::InvalidAmount);
@@ -344,9 +387,15 @@ impl InsurancePool {
         if env.ledger().timestamp() > policy.expires_at {
             panic_with_error!(&env, ContractError::PolicyExpired);
         }
-        if amount > policy.remaining_coverage {
+        // Pending claims on the same policy share its coverage, so count them all.
+        let reserved = policy_reserved(&env, policy_id);
+        let exposure = reserved
+            .checked_add(amount)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::MathOverflow));
+        if exposure > policy.remaining_coverage {
             panic_with_error!(&env, ContractError::ExceedsCoverage);
         }
+        set_policy_reserved(&env, policy_id, exposure);
 
         let id = next_id(&env, DataKey::NextClaimId);
         save_claim(
@@ -374,6 +423,10 @@ impl InsurancePool {
 
     /// Approves or rejects a pending claim. Admin only.
     ///
+    /// Settlement rule: a claim filed on or before `expires_at` may be settled at any later
+    /// time. There is no settlement deadline. A claim filed after expiry cannot exist, so
+    /// settlement rejects any claim whose `filed_at` falls outside the policy term.
+    ///
     /// Approval pays `min(claim amount, pool assets)`. The payout comes off the policy's
     /// remaining coverage, and the claim's reservation is released.
     pub fn settle_claim(env: Env, admin: Address, claim_id: u64, approve: bool) -> i128 {
@@ -382,9 +435,18 @@ impl InsurancePool {
         if claim.status != ClaimStatus::Pending {
             panic_with_error!(&env, ContractError::ClaimNotPending);
         }
+        let policy = load_policy(&env, claim.policy_id);
+        if claim.filed_at > policy.expires_at {
+            panic_with_error!(&env, ContractError::PolicyExpired);
+        }
 
         let mut stats = load_stats(&env);
         stats.reserved -= claim.amount;
+        set_policy_reserved(
+            &env,
+            claim.policy_id,
+            policy_reserved(&env, claim.policy_id) - claim.amount,
+        );
 
         if !approve {
             claim.status = ClaimStatus::Rejected;
@@ -401,7 +463,7 @@ impl InsurancePool {
         stats.claims_paid += 1;
         save_stats(&env, &stats);
 
-        let mut policy = load_policy(&env, claim.policy_id);
+        let mut policy = policy;
         policy.remaining_coverage -= payout;
         save_policy(&env, &policy);
 
@@ -415,6 +477,68 @@ impl InsurancePool {
         env.events()
             .publish((symbol_short!("ins_pay"),), (claim_id, payout));
         payout
+    }
+
+    /// Sets the premium rate in basis points for future policies. Admin only. Existing
+    /// policies keep the premium they were bought with.
+    pub fn set_premium_bps(env: Env, admin: Address, premium_bps: u32) {
+        require_stored_admin(&env, &admin);
+        if i128::from(premium_bps) > BPS_DENOMINATOR {
+            panic_with_error!(&env, ContractError::InvalidPremiumRate);
+        }
+        let old: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PremiumBps)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::PremiumBps, &premium_bps);
+        env.events()
+            .publish((symbol_short!("ins_prm"),), (admin, old, premium_bps));
+    }
+
+    /// Sets the policy term in seconds for future policies. Admin only. Must be between
+    /// MIN_TERM_SECS and MAX_TERM_SECS. Existing policies keep their stored `expires_at`.
+    pub fn set_term_secs(env: Env, admin: Address, term_secs: u64) {
+        require_stored_admin(&env, &admin);
+        if !(MIN_TERM_SECS..=MAX_TERM_SECS).contains(&term_secs) {
+            panic_with_error!(&env, ContractError::InvalidTerm);
+        }
+        let old: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TermSecs)
+            .unwrap_or(0);
+        env.storage().instance().set(&DataKey::TermSecs, &term_secs);
+        env.events()
+            .publish((symbol_short!("ins_trm"),), (admin, old, term_secs));
+    }
+
+    /// Halts filing, policy purchases and withdrawals. Settlement stays open so the admin can
+    /// still resolve pending claims during an incident. Admin only.
+    pub fn pause(env: Env, admin: Address) {
+        require_stored_admin(&env, &admin);
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish(
+            (symbol_short!("ins_pau"),),
+            (admin, env.ledger().timestamp()),
+        );
+    }
+
+    /// Resumes filing, policy purchases and withdrawals. Admin only.
+    pub fn unpause(env: Env, admin: Address) {
+        require_stored_admin(&env, &admin);
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish(
+            (symbol_short!("ins_unp"),),
+            (admin, env.ledger().timestamp()),
+        );
+    }
+
+    /// Returns whether the pool is paused.
+    pub fn is_paused(env: Env) -> bool {
+        is_paused(&env)
     }
 
     /// Returns a provider's share balance.
