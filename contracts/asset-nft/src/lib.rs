@@ -43,6 +43,10 @@ pub enum ContractError {
     NotListed = 9,
     /// The owner cannot buy their own NFT.
     CannotBuyOwnToken = 10,
+    /// An NFT cannot be transferred to its current owner.
+    SelfTransfer = 11,
+    /// Royalty must be between 0 and 10,000 basis points.
+    InvalidRoyalty = 12,
 }
 
 #[contracttype]
@@ -97,6 +101,10 @@ pub enum DataKey {
     TokenByAsset(u64),
     Listing(u64),
     History(u64),
+    /// Original minter of a token, paid royalties on resales.
+    Creator(u64),
+    /// Royalty on resales, in basis points. Stored in instance storage.
+    RoyaltyBps,
 }
 
 #[contract]
@@ -164,6 +172,16 @@ impl AssetNft {
         env.storage().instance().set(&DataKey::NextId, &1u64);
     }
 
+    /// Sets the creator royalty charged on resales, in basis points (10,000 = 100%).
+    /// Admin only. Zero disables royalties.
+    pub fn set_royalty_bps(env: Env, admin: Address, bps: u32) {
+        require_stored_admin(&env, &admin);
+        if bps > 10_000 {
+            panic_with_error!(&env, ContractError::InvalidRoyalty);
+        }
+        env.storage().instance().set(&DataKey::RoyaltyBps, &bps);
+    }
+
     /// Mints the NFT for an asset to `owner`. Admin only. One NFT per asset. Returns the token id.
     pub fn mint(env: Env, admin: Address, asset_id: u64, owner: Address, uri: String) -> u64 {
         require_stored_admin(&env, &admin);
@@ -187,6 +205,10 @@ impl AssetNft {
             synced_at: now,
         };
         save_token(&env, &token);
+
+        let creator_key = DataKey::Creator(id);
+        env.storage().persistent().set(&creator_key, &owner);
+        extend_persistent_ttl(&env, creator_key);
 
         let asset_key = DataKey::TokenByAsset(asset_id);
         env.storage().persistent().set(&asset_key, &id);
@@ -215,6 +237,9 @@ impl AssetNft {
         let mut token = load_token(&env, token_id);
         if token.owner != from {
             panic_with_error!(&env, ContractError::NotTokenOwner);
+        }
+        if from == to {
+            panic_with_error!(&env, ContractError::SelfTransfer);
         }
         if env.storage().persistent().has(&DataKey::Listing(token_id)) {
             panic_with_error!(&env, ContractError::TokenListed);
@@ -273,11 +298,13 @@ impl AssetNft {
             &key,
             &Listing {
                 token_id,
-                seller: owner,
+                seller: owner.clone(),
                 price,
             },
         );
         extend_persistent_ttl(&env, key);
+        env.events()
+            .publish((symbol_short!("nft_list"),), (token_id, owner, price));
     }
 
     /// Removes an active listing. Owner only.
@@ -291,9 +318,12 @@ impl AssetNft {
         env.storage()
             .persistent()
             .remove(&DataKey::Listing(token_id));
+        env.events()
+            .publish((symbol_short!("nft_unlst"),), (token_id, owner));
     }
 
-    /// Buys a listed NFT. The price is paid to the seller and ownership transfers to the buyer.
+    /// Buys a listed NFT. The seller receives the price less any creator royalty, which goes
+    /// to the original minter. Ownership transfers to the buyer.
     pub fn buy(env: Env, buyer: Address, token_id: u64) {
         buyer.require_auth();
         let listing = Self::get_listing(env.clone(), token_id)
@@ -307,7 +337,33 @@ impl AssetNft {
             .instance()
             .get(&DataKey::PaymentToken)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        token::Client::new(&env, &payment).transfer(&buyer, &listing.seller, &listing.price);
+        let token_client = token::Client::new(&env, &payment);
+        let royalty_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RoyaltyBps)
+            .unwrap_or(0);
+        let creator: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Creator(token_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::TokenNotFound));
+        // The creator only earns a royalty on resales; a creator selling their own NFT is paid in full.
+        let royalty = if creator != listing.seller && royalty_bps > 0 {
+            listing
+                .price
+                .checked_mul(royalty_bps as i128)
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::InvalidPrice))
+                / 10_000
+        } else {
+            0
+        };
+        if royalty > 0 {
+            token_client.transfer(&buyer, &creator, &royalty);
+        }
+        if listing.price - royalty > 0 {
+            token_client.transfer(&buyer, &listing.seller, &(listing.price - royalty));
+        }
 
         env.storage()
             .persistent()
