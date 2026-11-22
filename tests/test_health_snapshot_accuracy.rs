@@ -89,7 +89,7 @@ fn test_take_health_snapshot_stores_correct_maintenance_count_and_last_service_d
 
     // 2. Call take_health_snapshot.
     let current_score = lifecycle.get_collateral_score(&asset_id);
-    let snapshot = lifecycle.take_health_snapshot(&asset_id);
+    let snapshot = lifecycle.take_health_snapshot(&owner, &asset_id);
 
     // 3. Assert the snapshot accurately reflects the asset's current state.
     assert_eq!(snapshot.maintenance_count, 3, "snapshot must count all 3 submitted records");
