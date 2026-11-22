@@ -587,6 +587,26 @@ pub(crate) fn require_admin(env: &Env, admin: &Address) {
     }
 }
 
+/// Allows the configured admin, or an attestor authorized for `asset_id`.
+pub(crate) fn require_admin_or_attestor(env: &Env, asset_id: u64, caller: &Address) {
+    let config: Config = env
+        .storage()
+        .persistent()
+        .get(&CONFIG)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized));
+    if config.admin == *caller {
+        return;
+    }
+    let authorized = env
+        .storage()
+        .persistent()
+        .get::<_, bool>(&attestor_auth_key(asset_id, caller))
+        .unwrap_or(false);
+    if !authorized {
+        panic_with_error!(env, ContractError::UnauthorizedAttestor);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FrequencyWeights {
     low: u32,
@@ -8402,7 +8422,13 @@ impl Lifecycle {
     }
 
     /// Record baseline score for anomaly detection.
-    pub fn record_score_baseline(env: Env, asset_id: u64, score: u32) {
+    ///
+    /// Restricted to the admin or an attestor the asset owner authorized for
+    /// this asset. Anomaly detection compares new scores against this history,
+    /// so an unauthenticated writer could otherwise seed the baseline.
+    pub fn record_score_baseline(env: Env, caller: Address, asset_id: u64, score: u32) {
+        caller.require_auth();
+        require_admin_or_attestor(&env, asset_id, &caller);
         let baseline_key = score_baseline_key(asset_id);
         let mut baseline_scores: Vec<u64> = env
             .storage()
@@ -9160,6 +9186,7 @@ mod tests {
     mod score_provider_event_tests;
     mod external_score_event_tests;
     mod degradation_curve_event_tests;
+    mod score_baseline_auth_tests;
 
     fn setup<'a>(
         env: &'a Env,
