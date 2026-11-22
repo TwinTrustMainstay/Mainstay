@@ -66,8 +66,11 @@ by the contract.
   then `finalize_collateral_proof`.
 - **Ownership is not checked here.** `begin_collateral_proof` requires the owner's
   auth, and the attestation records `owner`. This contract cannot check the asset
-  registry. Lenders must compare `CollateralAttestation.owner` with the registry
-  owner before relying on an attestation.
+  registry. Instead, `is_collateral_adequate` takes the owner as an argument and
+  returns false unless the attestation was made by that account. Lenders pass the
+  owner recorded in the asset registry.
+- **Maintenance submissions are allowlisted.** `submit_maintenance_proof` requires the
+  submitter's auth and an entry added by the admin with `set_maintenance_submitter`.
 - **Value binding.** A collateral proof shows that the committed value meets the
   threshold. It does not show that the committed value is the asset's real
   valuation. That needs a signed valuation from an oracle or appraiser, checked
@@ -94,8 +97,9 @@ by the contract.
    `prove_adequacy(a, v, r, threshold, seed)`, then calls
    `begin_collateral_proof`, `submit_collateral_bits` (x8), and
    `finalize_collateral_proof`.
-4. Lender calls `is_collateral_adequate(a, min_threshold)` and checks the owner
-   against the asset registry.
+4. Lender looks up the owner of asset `a` in the asset registry and calls
+   `is_collateral_adequate(a, owner, min_threshold)`. The call returns false if the
+   attestation was made by any other account.
 
 ## Errors
 

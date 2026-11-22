@@ -1,7 +1,10 @@
 #![cfg(test)]
 
 use crate::{IncidentManagement, IncidentManagementClient, Severity, Status};
-use soroban_sdk::{testutils::Address as _, Address, Env, String};
+use soroban_sdk::{
+    symbol_short, testutils::Address as _, testutils::Events, vec, Address, Env, IntoVal, String,
+    TryFromVal,
+};
 
 fn setup(env: &Env) -> (IncidentManagementClient<'_>, Address) {
     env.mock_all_auths();
@@ -154,4 +157,104 @@ fn unknown_action_item_is_rejected() {
     let id = open(&env, &client, Severity::Sev2);
     let owner = Address::generate(&env);
     client.complete_action_item(&owner, &id, &99);
+}
+
+#[test]
+fn reopened_incident_keeps_postmortem_and_can_resolve_again() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let id = open(&env, &client, Severity::Sev2);
+    client.update_status(&admin, &id, &Status::Resolved);
+    client.record_postmortem(&admin, &id, &String::from_str(&env, "Pump seal failed"));
+
+    client.reopen_incident(
+        &admin,
+        &id,
+        &String::from_str(&env, "Seal leaked again after restart"),
+    );
+    let reopened = client.get_incident(&id);
+    assert_eq!(reopened.status, Status::Open);
+    assert_eq!(reopened.resolved_at, 0);
+    assert_eq!(reopened.reopen_count, 1);
+    assert_eq!(
+        reopened.root_cause,
+        String::from_str(&env, "Pump seal failed")
+    );
+
+    client.update_status(&admin, &id, &Status::Resolved);
+    client.update_status(&admin, &id, &Status::Closed);
+    let closed = client.get_incident(&id);
+    assert_eq!(closed.status, Status::Closed);
+    assert_eq!(
+        closed.root_cause,
+        String::from_str(&env, "Pump seal failed")
+    );
+    assert_eq!(closed.reopen_count, 1);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #8)")]
+fn reopen_requires_a_reason() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let id = open(&env, &client, Severity::Sev3);
+    client.update_status(&admin, &id, &Status::Resolved);
+    client.reopen_incident(&admin, &id, &String::from_str(&env, ""));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn reopen_rejected_for_unresolved_incident() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let id = open(&env, &client, Severity::Sev3);
+    client.update_status(&admin, &id, &Status::Mitigated);
+    client.reopen_incident(&admin, &id, &String::from_str(&env, "Not resolved yet"));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn closed_incident_cannot_be_reopened() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let id = open(&env, &client, Severity::Sev3);
+    client.update_status(&admin, &id, &Status::Resolved);
+    client.update_status(&admin, &id, &Status::Closed);
+    client.reopen_incident(&admin, &id, &String::from_str(&env, "Too late"));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn non_admin_cannot_reopen_incident() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let id = open(&env, &client, Severity::Sev3);
+    client.update_status(&admin, &id, &Status::Resolved);
+    let intruder = Address::generate(&env);
+    client.reopen_incident(&intruder, &id, &String::from_str(&env, "Regression"));
+}
+
+#[test]
+fn add_action_item_emits_event() {
+    let env = Env::default();
+    let (client, admin) = setup(&env);
+    let id = open(&env, &client, Severity::Sev3);
+    let owner = Address::generate(&env);
+
+    let item_id = client.add_action_item(
+        &admin,
+        &id,
+        &String::from_str(&env, "Add generator alert"),
+        &owner,
+    );
+
+    let events = env.events().all();
+    let last = events.last().unwrap();
+    assert_eq!(last.0, client.address);
+    assert_eq!(
+        last.1,
+        vec![&env, symbol_short!("inc_actn").into_val(&env)]
+    );
+    let data = <(u64, u32, Address)>::try_from_val(&env, &last.2).unwrap();
+    assert_eq!(data, (id, item_id, owner));
 }

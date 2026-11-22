@@ -76,10 +76,24 @@ pub enum ContractError {
     RelayerAlreadyExists = 23,
     /// Relayer list contains duplicates or is empty.
     InvalidRelayerSet = 24,
+    /// Destination address length or encoding does not match the destination chain.
+    InvalidDestinationAddress = 25,
+    /// The swap's expiry is further in the future than the configured maximum duration.
+    SwapDurationTooLong = 26,
+    /// The attestation window for this release has closed (#1921).
+    ReleaseExpired = 27,
+    /// No pending release exists for this `(source_chain, nonce)` (#1921).
+    ReleaseNotFound = 28,
+    /// The release's attestation window has not closed yet, so it cannot be expired (#1921).
+    ReleaseNotExpired = 29,
 }
 
 /// Maximum number of relayers in the set.
 const MAX_RELAYERS: u32 = 20;
+
+/// Default cap on how far in the future a swap expiry may be (30 days).
+/// Used until the admin sets `max_swap_duration_secs`.
+const DEFAULT_MAX_SWAP_DURATION_SECS: u64 = 30 * 24 * 60 * 60;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -101,6 +115,13 @@ pub struct ChainConfig {
     /// Window outflow level at which a `BR_ALERT` event is emitted.
     /// Must be > 0 and ≤ `window_cap`.
     pub alert_threshold: i128,
+    /// Seconds after a release is first attested within which the remaining
+    /// attestations are accepted. Must be > 0. Releases still short of the
+    /// threshold after this window can no longer be attested and may be expired (#1921).
+    pub attestation_window_secs: u64,
+    /// Exact length in bytes of a valid destination address on this chain.
+    /// Must be > 0. Addresses must also be ASCII alphanumeric.
+    pub address_len: u32,
 }
 
 #[contracttype]
@@ -131,8 +152,14 @@ pub struct PendingRelease {
     pub amount: i128,
     /// Relayers that have attested, in the order they attested.
     pub approvals: Vec<Address>,
+    /// Source-chain confirmations each relayer observed. Entry `i` belongs to
+    /// `approvals[i]`. Relayers may disagree, so the release is gated on the
+    /// lowest value (see `attest_release`).
+    pub confirmations: Vec<u32>,
     /// `true` once the release has been paid out. Doubles as the replay guard.
     pub executed: bool,
+    /// Ledger timestamp of the first attestation. Starts the attestation window (#1921).
+    pub created_at: u64,
 }
 
 #[contracttype]
@@ -170,6 +197,7 @@ pub enum DataKey {
     Pending(u32, u64),
     Window(u32),
     Swap(u64),
+    MaxSwapDuration,
 }
 
 fn validate_chain_config(env: &Env, cfg: &ChainConfig) {
@@ -179,12 +207,36 @@ fn validate_chain_config(env: &Env, cfg: &ChainConfig) {
         || cfg.window_cap <= 0
         || cfg.alert_threshold <= 0
         || cfg.alert_threshold > cfg.window_cap
+        || cfg.attestation_window_secs == 0
+        || cfg.address_len == 0
     {
         panic_with_error!(env, ContractError::InvalidConfig);
     }
 }
 
+/// Reject destination addresses that are empty, have the wrong length for the
+/// destination chain, or contain non-alphanumeric bytes.
+fn validate_dest_address(env: &Env, cfg: &ChainConfig, dest_address: &Bytes) {
+    if dest_address.is_empty() {
+        panic_with_error!(env, ContractError::InvalidDestination);
+    }
+    if dest_address.len() != cfg.address_len {
+        panic_with_error!(env, ContractError::InvalidDestinationAddress);
+    }
+    for byte in dest_address.iter() {
+        if !byte.is_ascii_alphanumeric() {
+            panic_with_error!(env, ContractError::InvalidDestinationAddress);
+        }
+    }
+}
+
 /// Extend the TTL of a persistent entry so active bridge state is not archived.
+/// `true` once `now` is past `created_at + window_secs`. A release is still
+/// attestable at exactly that deadline (#1921).
+fn attestation_window_closed(now: u64, created_at: u64, window_secs: u64) -> bool {
+    now > created_at.saturating_add(window_secs)
+}
+
 fn bump(env: &Env, key: &DataKey) {
     env.storage()
         .persistent()
@@ -276,9 +328,13 @@ pub struct Bridge;
 impl Bridge {
     /// Initialize the bridge with an admin. Can be called only once.
     ///
+    /// The proposed admin must authorize the call, so an arbitrary caller cannot
+    /// front-run deployment and install itself as admin.
+    ///
     /// # Panics
     /// - [`ContractError::AlreadyInitialized`] if the admin is already set
     pub fn initialize(env: Env, admin: Address) {
+        admin.require_auth();
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, ContractError::AlreadyInitialized);
         }
@@ -289,15 +345,20 @@ impl Bridge {
 
     /// Pause new transfers (`bridge_out`, `attest_release`, `create_swap`).
     /// Claims and refunds stay available so users can always reclaim funds.
+    /// Emits `BR_PAUSE` with `(admin)`.
     pub fn pause(env: Env, admin: Address) {
         require_admin(&env, &admin);
         env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish((symbol_short!("BR_PAUSE"),), (admin,));
     }
 
     /// Resume transfers after a pause.
+    /// Emits `BR_RESUME` with `(admin)`.
     pub fn unpause(env: Env, admin: Address) {
         require_admin(&env, &admin);
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.events()
+            .publish((symbol_short!("BR_RESUME"),), (admin,));
     }
 
     /// Replace the relayer set and the number of attestations required per release.
@@ -305,6 +366,8 @@ impl Bridge {
     /// # Panics
     /// - [`ContractError::InvalidRelayerSet`] if the list is empty, too large, or has duplicates
     /// - [`ContractError::InvalidThreshold`] if `threshold` is 0 or exceeds the relayer count
+    ///
+    /// Emits `BR_RELAYS` with `(admin, threshold, relayers)`.
     pub fn set_relayers(env: Env, admin: Address, relayers: Vec<Address>, threshold: u32) {
         require_admin(&env, &admin);
         let count = relayers.len();
@@ -325,6 +388,8 @@ impl Bridge {
         env.storage()
             .instance()
             .set(&DataKey::Threshold, &threshold);
+        env.events()
+            .publish((symbol_short!("BR_RELAYS"),), (admin, threshold, relayers));
     }
 
     /// Register a supported chain.
@@ -341,6 +406,8 @@ impl Bridge {
         }
         env.storage().persistent().set(&key, &config);
         bump(&env, &key);
+        env.events()
+            .publish((symbol_short!("BR_CH_ADD"),), (admin, chain_id, config));
     }
 
     /// Replace the constraints of a registered chain.
@@ -355,6 +422,30 @@ impl Bridge {
         let key = DataKey::Chain(chain_id);
         env.storage().persistent().set(&key, &config);
         bump(&env, &key);
+        env.events()
+            .publish((symbol_short!("BR_CH_UPD"),), (admin, chain_id, config));
+    }
+
+    /// Set the maximum number of seconds a swap's expiry may lie beyond the current ledger time.
+    ///
+    /// # Panics
+    /// - [`ContractError::InvalidConfig`] if `max_swap_duration_secs` is 0
+    pub fn set_max_swap_duration(env: Env, admin: Address, max_swap_duration_secs: u64) {
+        require_admin(&env, &admin);
+        if max_swap_duration_secs == 0 {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxSwapDuration, &max_swap_duration_secs);
+    }
+
+    /// Maximum allowed swap timelock in seconds (`max_swap_duration_secs`).
+    pub fn get_max_swap_duration(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxSwapDuration)
+            .unwrap_or(DEFAULT_MAX_SWAP_DURATION_SECS)
     }
 
     /// Enable or disable a chain without changing its other constraints.
@@ -365,6 +456,8 @@ impl Bridge {
         let key = DataKey::Chain(chain_id);
         env.storage().persistent().set(&key, &cfg);
         bump(&env, &key);
+        env.events()
+            .publish((symbol_short!("BR_CH_ENB"),), (admin, chain_id, enabled));
     }
 
     /// Get a chain's current configuration.
@@ -384,6 +477,7 @@ impl Bridge {
     /// - [`ContractError::ChainNotFound`] / [`ContractError::ChainDisabled`] for an unusable destination
     /// - [`ContractError::AmountOutOfRange`] if `amount` is outside the chain's limits
     /// - [`ContractError::InvalidDestination`] if `dest_address` is empty
+    /// - [`ContractError::InvalidDestinationAddress`] if `dest_address` has the wrong length or encoding for `dest_chain`
     pub fn bridge_out(
         env: Env,
         sender: Address,
@@ -399,9 +493,7 @@ impl Bridge {
             panic_with_error!(&env, ContractError::ChainDisabled);
         }
         ensure_amount_in_range(&env, &cfg, amount);
-        if dest_address.is_empty() {
-            panic_with_error!(&env, ContractError::InvalidDestination);
-        }
+        validate_dest_address(&env, &cfg, &dest_address);
 
         token::Client::new(&env, &token).transfer(
             &sender,
@@ -424,9 +516,12 @@ impl Bridge {
     /// Relayer attestation for an inbound transfer from `source_chain`.
     ///
     /// Each relayer attests once per `(source_chain, nonce)`. All attestations must
-    /// agree on `token`, `recipient` and `amount`. When the approval count reaches
-    /// the threshold the tokens are released, and the release is marked executed
-    /// so it cannot be replayed.
+    /// agree on `token`, `recipient` and `amount`. Each relayer's observed
+    /// `confirmations` is stored with its approval. Relayers may report different
+    /// counts. Release happens only when the approval count reaches the threshold
+    /// and the lowest stored confirmation count meets the chain's
+    /// `required_confirmations`. The release is then marked executed so it cannot
+    /// be replayed.
     ///
     /// # Panics
     /// - [`ContractError::Paused`] if the bridge is paused
@@ -435,9 +530,13 @@ impl Bridge {
     /// - [`ContractError::InsufficientConfirmations`] if `confirmations` is below the chain requirement
     /// - [`ContractError::AmountOutOfRange`] if `amount` is outside the chain's limits
     /// - [`ContractError::AlreadyProcessed`] if this release already executed
+    /// - [`ContractError::ReleaseExpired`] if the attestation window has closed (#1921)
     /// - [`ContractError::AttestationMismatch`] if parameters differ from earlier attestations
     /// - [`ContractError::AlreadyAttested`] if this relayer already attested
     /// - [`ContractError::WindowCapExceeded`] if the release would breach the outflow cap
+    /// - [`ContractError::InsufficientConfirmations`] also if the lowest stored confirmation count is below the requirement at release time
+    ///
+    /// On execution, emits `BR_REL` with the approving relayers in attestation order.
     pub fn attest_release(
         env: Env,
         relayer: Address,
@@ -479,6 +578,14 @@ impl Bridge {
                     if existing.executed {
                         panic_with_error!(&env, ContractError::AlreadyProcessed);
                     }
+                    // #1921: a partially attested release cannot be completed after its window.
+                    if attestation_window_closed(
+                        env.ledger().timestamp(),
+                        existing.created_at,
+                        cfg.attestation_window_secs,
+                    ) {
+                        panic_with_error!(&env, ContractError::ReleaseExpired);
+                    }
                     if existing.token != token
                         || existing.recipient != recipient
                         || existing.amount != amount
@@ -492,14 +599,27 @@ impl Bridge {
                     recipient: recipient.clone(),
                     amount,
                     approvals: Vec::new(&env),
+                    confirmations: Vec::new(&env),
                     executed: false,
+                    created_at: env.ledger().timestamp(),
                 },
             };
+
+        // #1920: approvals from relayers removed by `set_relayers` no longer count.
+        // Recount against the current relayer set before checking the threshold.
+        let mut current_approvals: Vec<Address> = Vec::new(&env);
+        for approver in pending.approvals.iter() {
+            if relayers.contains(&approver) {
+                current_approvals.push_back(approver);
+            }
+        }
+        pending.approvals = current_approvals;
 
         if pending.approvals.contains(&relayer) {
             panic_with_error!(&env, ContractError::AlreadyAttested);
         }
         pending.approvals.push_back(relayer.clone());
+        pending.confirmations.push_back(confirmations);
 
         let threshold: u32 = env
             .storage()
@@ -507,6 +627,14 @@ impl Bridge {
             .get(&DataKey::Threshold)
             .unwrap_or(0);
         if pending.approvals.len() >= threshold {
+            // Gate on the most conservative count any approving relayer observed.
+            let mut lowest = u32::MAX;
+            for observed in pending.confirmations.iter() {
+                lowest = lowest.min(observed);
+            }
+            if lowest < cfg.required_confirmations {
+                panic_with_error!(&env, ContractError::InsufficientConfirmations);
+            }
             account_window_outflow(&env, source_chain, &cfg, amount);
             pending.executed = true;
             token::Client::new(&env, &token).transfer(
@@ -522,6 +650,7 @@ impl Bridge {
                     recipient.clone(),
                     token.clone(),
                     amount,
+                    pending.approvals.clone(),
                 ),
             );
         }
@@ -536,6 +665,36 @@ impl Bridge {
         env.storage()
             .persistent()
             .get(&DataKey::Pending(source_chain, nonce))
+    }
+
+    /// Remove a pending release whose attestation window has closed (#1921).
+    ///
+    /// Callable by anyone. Executed releases are never removed, because their
+    /// record is the replay guard.
+    ///
+    /// # Panics
+    /// - [`ContractError::ReleaseNotFound`] if no pending release exists
+    /// - [`ContractError::AlreadyProcessed`] if the release already executed
+    /// - [`ContractError::ReleaseNotExpired`] if the window is still open
+    pub fn expire_release(env: Env, source_chain: u32, nonce: u64) {
+        let key = DataKey::Pending(source_chain, nonce);
+        let pending: PendingRelease = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ReleaseNotFound));
+        if pending.executed {
+            panic_with_error!(&env, ContractError::AlreadyProcessed);
+        }
+        let cfg = load_chain(&env, source_chain);
+        if !attestation_window_closed(
+            env.ledger().timestamp(),
+            pending.created_at,
+            cfg.attestation_window_secs,
+        ) {
+            panic_with_error!(&env, ContractError::ReleaseNotExpired);
+        }
+        env.storage().persistent().remove(&key);
     }
 
     /// Current rolling outflow window for a source chain. Returns zeroed state if none.
@@ -564,6 +723,7 @@ impl Bridge {
     /// - [`ContractError::Paused`] if the bridge is paused
     /// - [`ContractError::AmountOutOfRange`] if `amount` is not positive
     /// - [`ContractError::SwapExpired`] if `expiry` is not in the future
+    /// - [`ContractError::SwapDurationTooLong`] if `expiry` is more than `max_swap_duration_secs` ahead
     pub fn create_swap(
         env: Env,
         sender: Address,
@@ -578,8 +738,13 @@ impl Bridge {
         if amount <= 0 {
             panic_with_error!(&env, ContractError::AmountOutOfRange);
         }
-        if expiry <= env.ledger().timestamp() {
+        let now = env.ledger().timestamp();
+        if expiry <= now {
             panic_with_error!(&env, ContractError::SwapExpired);
+        }
+        let max_duration = Self::get_max_swap_duration(env.clone());
+        if expiry - now > max_duration {
+            panic_with_error!(&env, ContractError::SwapDurationTooLong);
         }
 
         token::Client::new(&env, &token).transfer(
@@ -658,6 +823,7 @@ impl Bridge {
 
     /// Refund an open swap to its sender after the timelock has passed.
     /// Anyone may trigger the refund; funds always go back to the sender.
+    /// Emits `BR_SWP_R` with `(swap_id, sender, token, amount)`.
     ///
     /// # Panics
     /// - [`ContractError::SwapNotFound`] if the swap does not exist
@@ -686,8 +852,15 @@ impl Bridge {
             &swap.sender,
             &swap.amount,
         );
-        env.events()
-            .publish((symbol_short!("BR_SWP_R"),), (swap_id,));
+        env.events().publish(
+            (symbol_short!("BR_SWP_R"),),
+            (
+                swap_id,
+                swap.sender.clone(),
+                swap.token.clone(),
+                swap.amount,
+            ),
+        );
     }
 
     /// Get a swap by ID.
