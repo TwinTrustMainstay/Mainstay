@@ -17,7 +17,7 @@ pub fn score_history_push(env: &Env, asset_id: u64, entry: ScoreEntry, max_histo
     // inflating history length and skewing trend analysis.
     let last_idx = history.len().saturating_sub(1);
     if !history.is_empty() {
-        let last = history.get(last_idx).unwrap();
+        let last = history.get(last_idx).unwrap_or_else(|| panic_with_error!(env, ContractError::IndexOutOfBounds));
         if last.timestamp == entry.timestamp {
             history.set(last_idx, entry);
             env.storage().persistent().set(&key, &history);
@@ -41,7 +41,7 @@ pub fn valuation_history_push(env: &Env, asset_id: u64, timestamp: u64, value: u
 
     let last_idx = history.len().saturating_sub(1);
     if !history.is_empty() {
-        let last = history.get(last_idx).unwrap();
+        let last = history.get(last_idx).unwrap_or_else(|| panic_with_error!(env, ContractError::IndexOutOfBounds));
         if last.0 == timestamp {
             history.set(last_idx, (timestamp, value));
             env.storage().persistent().set(&key, &history);
@@ -135,7 +135,7 @@ pub fn compute_decay(env: &Env, asset_id: u64) -> u32 {
         // Skip records marked as duplicates
         let mut is_duplicate = false;
         for d in 0..duplicates.len() {
-            if duplicates.get(d).unwrap() == record.timestamp {
+            if duplicates.get(d).unwrap_or_else(|| panic_with_error!(env, ContractError::IndexOutOfBounds)) == record.timestamp {
                 is_duplicate = true;
                 break;
             }

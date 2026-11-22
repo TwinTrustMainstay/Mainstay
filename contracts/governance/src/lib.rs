@@ -6,16 +6,22 @@
 //!   transfer them. Voting weight equals the voter's share balance.
 //! * **Proposals**: any holder with at least `min_proposal_shares` can propose a
 //!   parameter change or a treasury funding grant.
-//! * **Voting**: one vote per holder per proposal. A holder's balance is locked
-//!   until that proposal's voting period ends, so shares cannot be voted, moved,
-//!   and voted again.
+//! * **Voting**: one vote per holder per proposal. Vote weight is the holder's
+//!   balance *at proposal creation*, the same point the quorum base is taken, so
+//!   shares received after a proposal is created carry no weight on it (issue
+//!   #1945). A holder's balance is locked until that proposal's voting period
+//!   ends, so shares cannot be voted, moved, and voted again.
 //! * **Outcome**: a proposal passes when turnout meets `quorum_bps` of the share
 //!   supply at creation and `approval_threshold_bps` of votes cast are in favour.
-//! * **Execution**: a passed proposal can be executed once. Parameter changes are
+//! * **Execution**: a passed proposal can be executed once, and only after
+//!   `execution_delay_secs` has elapsed since it was finalized. Parameter changes are
 //!   written to the on-chain parameter store. Funding grants are debited from the
-//!   treasury budget ledger.
+//!   treasury budget ledger and emit a `GOV_FUND` event carrying the recipient and
+//!   amount.
 //!
-//! The treasury is an accounting ledger. Actual token movement is out of scope.
+//! The treasury is an accounting ledger. This contract does not move tokens to a
+//! funding recipient. Payout is performed off-chain by whatever service consumes
+//! the `GOV_FUND` event. This is the accounting-only behaviour for issue #1946.
 
 use shared::require_admin;
 use soroban_sdk::{
@@ -27,7 +33,39 @@ use soroban_sdk::{
 pub const MAX_VOTES_PER_PROPOSAL: u32 = 500;
 /// Maximum proposal title length in bytes.
 pub const MAX_TITLE_LEN: u32 = 128;
+/// Maximum proposals an address may have open for voting at once. A slot frees
+/// when the proposal is finalized. Bounds spam in persistent storage (issue #1952).
+pub const MAX_ACTIVE_PROPOSALS_PER_ADDRESS: u32 = 5;
 const BPS: u64 = 10_000;
+
+/// Schema of governable platform parameters: `(name, min, max)`, inclusive bounds.
+/// Only these names can be set by a parameter proposal. All values are `u64`.
+pub const GOVERNABLE_PARAMS: [(&str, u64, u64); 3] = [
+    ("FEE_BPS", 0, 1_000),
+    ("SLASH_BPS", 0, 5_000),
+    ("HEARTBEAT", 60, 86_400),
+];
+
+/// Returns the inclusive `(min, max)` bounds for a governable parameter, or `None`
+/// if the name is not in [`GOVERNABLE_PARAMS`].
+pub fn param_bounds(env: &Env, name: &Symbol) -> Option<(u64, u64)> {
+    GOVERNABLE_PARAMS.iter().find_map(|(key, min, max)| {
+        if *name == Symbol::new(env, key) {
+            Some((*min, *max))
+        } else {
+            None
+        }
+    })
+}
+
+/// Rejects parameter changes whose name is unknown or whose value is out of range.
+fn validate_parameter(env: &Env, name: &Symbol, value: u64) {
+    let (min, max) = param_bounds(env, name)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::UnknownParameter));
+    if value < min || value > max {
+        panic_with_error!(env, ContractError::ParameterOutOfRange);
+    }
+}
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -63,6 +101,27 @@ pub enum ContractError {
     InsufficientBudget = 16,
     /// Proposal has reached `MAX_VOTES_PER_PROPOSAL`.
     TooManyVotes = 17,
+    /// Parameter name is not in the governable schema.
+    UnknownParameter = 19,
+    /// Parameter value is outside the bounds defined in the schema.
+    ParameterOutOfRange = 20,
+    /// The execution delay after finalization has not elapsed.
+    ExecutionDelayActive = 21,
+    /// Proposer already has `MAX_ACTIVE_PROPOSALS_PER_ADDRESS` open proposals.
+    ProposalLimitReached = 18,
+}
+
+/// Rejects governance settings that are out of range. Shared by `initialize`,
+/// proposal creation and execution of a `ProposalKind::Config` proposal.
+fn validate_config(env: &Env, config: &GovernanceConfig) {
+    if config.voting_period_secs == 0
+        || config.quorum_bps == 0
+        || config.quorum_bps as u64 > BPS
+        || config.approval_threshold_bps == 0
+        || config.approval_threshold_bps as u64 > BPS
+    {
+        panic_with_error!(env, ContractError::InvalidConfig);
+    }
 }
 
 #[contracttype]
@@ -76,6 +135,9 @@ pub struct GovernanceConfig {
     pub approval_threshold_bps: u32,
     /// Minimum shares a holder must own to create a proposal.
     pub min_proposal_shares: u64,
+    /// Seconds between a proposal being finalized as `Passed` and when it may be
+    /// executed. `0` disables the delay. Gives holders a window to react.
+    pub execution_delay_secs: u64,
 }
 
 #[contracttype]
@@ -83,7 +145,12 @@ pub struct GovernanceConfig {
 pub enum ProposalKind {
     /// Set a platform parameter to a new value.
     Parameter(Symbol, u64),
-    /// Grant `amount` from the treasury budget to `recipient`.
+    /// Replace the governance configuration (voting period, quorum, approval
+    /// threshold, proposal minimum, execution delay). Passed by vote like any other proposal.
+    Config(GovernanceConfig),
+    /// Grant `amount` from the treasury budget to `recipient`. Accounting only: the
+    /// budget ledger is debited and a `GOV_FUND` event is emitted. No tokens move
+    /// on-chain.
     Funding(Address, u64),
 }
 
@@ -110,11 +177,16 @@ pub struct Proposal {
     pub voting_ends_at: u64,
     /// Total share supply when the proposal was created. Quorum is measured against this.
     pub total_shares_snapshot: u64,
+    /// Share-change sequence number at creation. Vote weight is each voter's
+    /// balance as of this point.
+    pub snapshot_seq: u64,
     pub votes_for: u64,
     pub votes_against: u64,
     pub status: ProposalStatus,
     /// Timestamp at which the proposal was executed. `0` if not yet executed.
     pub executed_at: u64,
+    /// Timestamp at which the outcome was recorded by `finalize_proposal`. `0` until finalized.
+    pub finalized_at: u64,
 }
 
 #[contracttype]
@@ -133,11 +205,23 @@ enum DataKey {
     Config,
     TotalShares,
     Shares(Address),
+    /// Global counter incremented on every share balance change.
+    ShareSeq,
+    /// Sequence number of the most recent share change for a holder.
+    LastChange(Address),
+    /// `(change_seq, balance_before_change)` entries for a holder, ascending.
+    /// Only kept when a proposal was created between the previous change and
+    /// this one, since only those entries can answer a snapshot lookup.
+    Checkpoints(Address),
+    /// Snapshot sequence of the most recently created proposal, if any.
+    LatestSnapshot,
     /// Ledger timestamp until which the holder's shares are locked by a vote.
     LockedUntil(Address),
     Treasury,
     NextProposalId,
     Proposal(u64),
+    /// Number of the holder's proposals that have not yet been finalized.
+    ActiveProposals(Address),
     Votes(u64),
     Voted(u64, Address),
     Param(Symbol),
@@ -148,6 +232,8 @@ const VOTE_TOPIC: Symbol = symbol_short!("GOV_VOTE");
 const FINALIZE_TOPIC: Symbol = symbol_short!("GOV_FIN");
 const EXECUTE_TOPIC: Symbol = symbol_short!("GOV_EXEC");
 const MINT_TOPIC: Symbol = symbol_short!("GOV_MINT");
+const TRANSFER_TOPIC: Symbol = symbol_short!("GOV_XFER");
+const FUND_TOPIC: Symbol = symbol_short!("GOV_FUND");
 
 fn require_admin_auth(env: &Env, admin: &Address) {
     let stored: Address = env
@@ -174,7 +260,76 @@ fn balance_of(env: &Env, holder: &Address) -> u64 {
         .unwrap_or(0)
 }
 
+/// Advances the share-change sequence and returns the new value.
+fn next_share_seq(env: &Env) -> u64 {
+    let seq = env
+        .storage()
+        .instance()
+        .get(&DataKey::ShareSeq)
+        .unwrap_or(0u64)
+        + 1;
+    env.storage().instance().set(&DataKey::ShareSeq, &seq);
+    seq
+}
+
+/// Records the balance a holder had before a change at `seq`, when a proposal
+/// created since the holder's previous change needs it for a snapshot lookup.
+fn record_checkpoint(env: &Env, holder: &Address, balance_before: u64, seq: u64) {
+    let last_change: u64 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::LastChange(holder.clone()))
+        .unwrap_or(0);
+    let latest_snapshot: Option<u64> = env.storage().instance().get(&DataKey::LatestSnapshot);
+    if let Some(snapshot) = latest_snapshot {
+        if snapshot >= last_change {
+            let key = DataKey::Checkpoints(holder.clone());
+            let mut checkpoints: Vec<(u64, u64)> = env
+                .storage()
+                .persistent()
+                .get(&key)
+                .unwrap_or_else(|| Vec::new(env));
+            checkpoints.push_back((seq, balance_before));
+            env.storage().persistent().set(&key, &checkpoints);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, shared::TTL_THRESHOLD, shared::TTL_TARGET);
+        }
+    }
+    let change_key = DataKey::LastChange(holder.clone());
+    env.storage().persistent().set(&change_key, &seq);
+    env.storage()
+        .persistent()
+        .extend_ttl(&change_key, shared::TTL_THRESHOLD, shared::TTL_TARGET);
+}
+
+/// A holder's share balance as it stood at `snapshot_seq`.
+fn balance_at(env: &Env, holder: &Address, snapshot_seq: u64) -> u64 {
+    let last_change: u64 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::LastChange(holder.clone()))
+        .unwrap_or(0);
+    if last_change <= snapshot_seq {
+        return balance_of(env, holder);
+    }
+    // The first change after the snapshot recorded the balance it replaced.
+    let checkpoints: Vec<(u64, u64)> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Checkpoints(holder.clone()))
+        .unwrap_or_else(|| Vec::new(env));
+    for (seq, balance_before) in checkpoints.iter() {
+        if seq > snapshot_seq {
+            return balance_before;
+        }
+    }
+    0
+}
+
 fn set_balance(env: &Env, holder: &Address, amount: u64) {
+    let seq = next_share_seq(env);
+    record_checkpoint(env, holder, balance_of(env, holder), seq);
     let key = DataKey::Shares(holder.clone());
     if amount == 0 {
         env.storage().persistent().remove(&key);
@@ -249,14 +404,7 @@ impl Governance {
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, ContractError::AlreadyInitialized);
         }
-        if config.voting_period_secs == 0
-            || config.quorum_bps == 0
-            || config.quorum_bps as u64 > BPS
-            || config.approval_threshold_bps == 0
-            || config.approval_threshold_bps as u64 > BPS
-        {
-            panic_with_error!(&env, ContractError::InvalidConfig);
-        }
+        validate_config(&env, &config);
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().set(&DataKey::TotalShares, &0u64);
@@ -312,6 +460,7 @@ impl Governance {
         }
         set_balance(&env, &from, from_balance - amount);
         set_balance(&env, &to, balance_of(&env, &to) + amount);
+        env.events().publish((TRANSFER_TOPIC,), (from, to, amount));
     }
 
     /// Create a proposal. The proposer must hold at least `min_proposal_shares`.
@@ -323,6 +472,11 @@ impl Governance {
     /// - [`ContractError::InsufficientShares`] if the proposer is below the minimum (or holds none)
     /// - [`ContractError::InvalidProposal`] if the title is empty or longer than [`MAX_TITLE_LEN`],
     ///   or a funding amount is zero
+    /// - [`ContractError::InvalidConfig`] if a `Config` proposal carries an out-of-range setting
+    /// - [`ContractError::UnknownParameter`] if a parameter name is not in [`GOVERNABLE_PARAMS`]
+    /// - [`ContractError::ParameterOutOfRange`] if a parameter value is outside its bounds
+    /// - [`ContractError::ProposalLimitReached`] if the proposer already has
+    ///   [`MAX_ACTIVE_PROPOSALS_PER_ADDRESS`] unfinalized proposals
     pub fn create_proposal(env: Env, proposer: Address, title: String, kind: ProposalKind) -> u64 {
         proposer.require_auth();
         let config = load_config(&env);
@@ -333,9 +487,25 @@ impl Governance {
         if title.is_empty() || title.len() > MAX_TITLE_LEN {
             panic_with_error!(&env, ContractError::InvalidProposal);
         }
-        if let ProposalKind::Funding(_, 0) = kind {
-            panic_with_error!(&env, ContractError::InvalidProposal);
+        match &kind {
+            ProposalKind::Config(new_config) => validate_config(&env, new_config),
+            ProposalKind::Funding(_, 0) => {
+                panic_with_error!(&env, ContractError::InvalidProposal);
+            }
+            ProposalKind::Parameter(name, value) => validate_parameter(&env, name, *value),
+            _ => {}
         }
+        let active_key = DataKey::ActiveProposals(proposer.clone());
+        let active: u32 = env.storage().persistent().get(&active_key).unwrap_or(0);
+        if active >= MAX_ACTIVE_PROPOSALS_PER_ADDRESS {
+            panic_with_error!(&env, ContractError::ProposalLimitReached);
+        }
+        env.storage().persistent().set(&active_key, &(active + 1));
+        env.storage().persistent().extend_ttl(
+            &active_key,
+            shared::TTL_THRESHOLD,
+            shared::TTL_TARGET,
+        );
 
         let id: u64 = env
             .storage()
@@ -347,6 +517,14 @@ impl Governance {
             .set(&DataKey::NextProposalId, &(id + 1));
 
         let now = env.ledger().timestamp();
+        let snapshot_seq: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ShareSeq)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::LatestSnapshot, &Some(snapshot_seq));
         let proposal = Proposal {
             id,
             proposer: proposer.clone(),
@@ -355,10 +533,12 @@ impl Governance {
             created_at: now,
             voting_ends_at: now + config.voting_period_secs,
             total_shares_snapshot: total_shares(&env),
+            snapshot_seq,
             votes_for: 0,
             votes_against: 0,
             status: ProposalStatus::Active,
             executed_at: 0,
+            finalized_at: 0,
         };
         store_proposal(&env, &proposal);
         env.events()
@@ -366,13 +546,14 @@ impl Governance {
         id
     }
 
-    /// Cast a vote. Weight is the voter's current share balance. The balance is
-    /// locked until the voting period ends.
+    /// Cast a vote. Weight is the voter's share balance at proposal creation, so
+    /// shares received after creation add no weight. The live balance is locked
+    /// until the voting period ends.
     ///
     /// # Panics
     /// - [`ContractError::ProposalNotFound`] if the proposal does not exist
     /// - [`ContractError::VotingClosed`] if the proposal is not active or the period has ended
-    /// - [`ContractError::InsufficientShares`] if the voter holds no shares
+    /// - [`ContractError::InsufficientShares`] if the voter held no shares at proposal creation
     /// - [`ContractError::AlreadyVoted`] if the voter already voted on this proposal
     /// - [`ContractError::TooManyVotes`] if the proposal has reached its vote cap
     pub fn vote(env: Env, voter: Address, proposal_id: u64, support: bool) {
@@ -382,7 +563,7 @@ impl Governance {
         if proposal.status != ProposalStatus::Active || now >= proposal.voting_ends_at {
             panic_with_error!(&env, ContractError::VotingClosed);
         }
-        let weight = balance_of(&env, &voter);
+        let weight = balance_at(&env, &voter, proposal.snapshot_seq);
         if weight == 0 {
             panic_with_error!(&env, ContractError::InsufficientShares);
         }
@@ -461,7 +642,13 @@ impl Governance {
             config.quorum_bps,
             config.approval_threshold_bps,
         );
+        proposal.finalized_at = env.ledger().timestamp();
         store_proposal(&env, &proposal);
+        let active_key = DataKey::ActiveProposals(proposal.proposer.clone());
+        let active: u32 = env.storage().persistent().get(&active_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&active_key, &active.saturating_sub(1));
         env.events()
             .publish((FINALIZE_TOPIC, proposal_id), (proposal.status,));
         proposal.status
@@ -473,7 +660,13 @@ impl Governance {
     /// - [`ContractError::ProposalNotFound`] if the proposal does not exist
     /// - [`ContractError::AlreadyExecuted`] if already executed
     /// - [`ContractError::ProposalNotPassed`] if the proposal has not passed
+    /// - [`ContractError::ExecutionDelayActive`] if `execution_delay_secs` has not elapsed since finalization
     /// - [`ContractError::InsufficientBudget`] if a funding grant exceeds the treasury balance
+    /// - [`ContractError::UnknownParameter`] / [`ContractError::ParameterOutOfRange`] if a
+    ///   parameter change fails schema validation (re-checked at execution)
+    ///
+    /// For a funding grant this debits the treasury ledger and emits a `GOV_FUND`
+    /// event with `(recipient, amount)`. It does not transfer tokens.
     pub fn execute_proposal(env: Env, proposal_id: u64) {
         let mut proposal = load_proposal(&env, proposal_id);
         if proposal.status == ProposalStatus::Executed {
@@ -482,13 +675,25 @@ impl Governance {
         if proposal.status != ProposalStatus::Passed {
             panic_with_error!(&env, ContractError::ProposalNotPassed);
         }
+        let config = load_config(&env);
+        let earliest = proposal
+            .finalized_at
+            .saturating_add(config.execution_delay_secs);
+        if env.ledger().timestamp() < earliest {
+            panic_with_error!(&env, ContractError::ExecutionDelayActive);
+        }
         match proposal.kind.clone() {
+            ProposalKind::Config(new_config) => {
+                validate_config(&env, &new_config);
+                env.storage().instance().set(&DataKey::Config, &new_config);
+            }
             ProposalKind::Parameter(name, value) => {
+                validate_parameter(&env, &name, value);
                 env.storage()
                     .persistent()
                     .set(&DataKey::Param(name), &value);
             }
-            ProposalKind::Funding(_, amount) => {
+            ProposalKind::Funding(recipient, amount) => {
                 let treasury: u64 = env
                     .storage()
                     .instance()
@@ -500,6 +705,8 @@ impl Governance {
                 env.storage()
                     .instance()
                     .set(&DataKey::Treasury, &(treasury - amount));
+                env.events()
+                    .publish((FUND_TOPIC, proposal_id), (recipient, amount));
             }
         }
         let now = env.ledger().timestamp();
@@ -527,6 +734,7 @@ impl Governance {
         env.storage()
             .instance()
             .set(&DataKey::Treasury, &(treasury + amount));
+        env.events().publish((FUND_TOPIC,), (admin, amount));
     }
 
     /// Get a proposal by id.
