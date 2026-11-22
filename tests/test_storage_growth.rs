@@ -35,7 +35,7 @@ fn repeated_health_snapshots_do_not_grow_storage_past_configured_cap() {
     lifecycle.update_max_snapshots(&admin, &3);
     for _ in 0..100 {
         env.ledger().set_timestamp(env.ledger().timestamp() + 1);
-        lifecycle.take_health_snapshot(&asset_id);
+        lifecycle.take_health_snapshot(&owner, &asset_id);
     }
 
     let snapshots = lifecycle.get_health_snapshots(&asset_id);
