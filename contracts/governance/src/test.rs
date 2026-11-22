@@ -1,5 +1,8 @@
 use super::*;
-use soroban_sdk::{symbol_short, testutils::Address as _, testutils::Ledger, Address, Env, String};
+use soroban_sdk::{
+    symbol_short, testutils::Address as _, testutils::Events, testutils::Ledger, Address, Env,
+    IntoVal, String,
+};
 
 const T0: u64 = 10_000;
 const PERIOD: u64 = 1_000;
@@ -81,6 +84,77 @@ fn non_admin_cannot_mint_or_fund() {
     assert_eq!(
         ctx.client.try_fund_treasury(&other, &5),
         Err(Ok(contract_err(ContractError::UnauthorizedAdmin)))
+    );
+}
+
+#[test]
+fn transfer_emits_from_to_amount_event() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let a = holder(&ctx, 100);
+    let b = Address::generate(&env);
+
+    ctx.client.transfer_shares(&a, &b, &40);
+
+    let events = env.events().all();
+    let (_contract, topics, data) = events.last().unwrap();
+    assert_eq!(
+        topics,
+        soroban_sdk::Vec::from_array(&env, [TRANSFER_TOPIC.into_val(&env)])
+    );
+    let payload: (Address, Address, u64) = data.into_val(&env);
+    assert_eq!(payload, (a, b, 40u64));
+}
+
+#[test]
+fn fund_treasury_emits_funder_and_amount_event() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    ctx.client.fund_treasury(&ctx.admin, &500);
+
+    let events = env.events().all();
+    let (_contract, topics, data) = events.last().unwrap();
+    assert_eq!(
+        topics,
+        soroban_sdk::Vec::from_array(&env, [FUND_TOPIC.into_val(&env)])
+    );
+    let payload: (Address, u64) = data.into_val(&env);
+    assert_eq!(payload, (ctx.admin.clone(), 500u64));
+}
+
+#[test]
+fn active_proposals_per_address_are_capped() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let proposer = holder(&ctx, 50);
+    let other = holder(&ctx, 50);
+
+    let mut ids = Vec::new(&env);
+    for _ in 0..MAX_ACTIVE_PROPOSALS_PER_ADDRESS {
+        ids.push_back(
+            ctx.client
+                .create_proposal(&proposer, &title(&env), &param_kind(1)),
+        );
+    }
+    assert_eq!(
+        ctx.client
+            .try_create_proposal(&proposer, &title(&env), &param_kind(1)),
+        Err(Ok(contract_err(ContractError::ProposalLimitReached)))
+    );
+    // The cap is per address: another holder is unaffected.
+    ctx.client
+        .create_proposal(&other, &title(&env), &param_kind(1));
+
+    // Finalizing one of the proposer's proposals frees a slot.
+    at(&env, T0 + PERIOD);
+    ctx.client.finalize_proposal(&ids.get(0).unwrap());
+    ctx.client
+        .create_proposal(&proposer, &title(&env), &param_kind(1));
+    assert_eq!(
+        ctx.client
+            .try_create_proposal(&proposer, &title(&env), &param_kind(1)),
+        Err(Ok(contract_err(ContractError::ProposalLimitReached)))
     );
 }
 
@@ -358,4 +432,81 @@ fn execute_requires_finalized_pass() {
         ctx.client.try_execute_proposal(&id),
         Err(Ok(contract_err(ContractError::ProposalNotPassed)))
     );
+}
+
+mod outcome_properties {
+    use super::*;
+    use proptest::prelude::*;
+
+    const MAX_COUNT: u64 = u32::MAX as u64;
+
+    fn bps() -> impl Strategy<Value = u32> {
+        1u32..=10_000
+    }
+
+    proptest! {
+        /// Additional yes votes never turn a Passed proposal into Rejected (or NoQuorum).
+        #[test]
+        fn extra_yes_votes_never_unpass(
+            votes_for in 0..=MAX_COUNT,
+            votes_against in 0..=MAX_COUNT,
+            extra_yes in 0..=MAX_COUNT,
+            total in 0..=MAX_COUNT,
+            quorum_bps in bps(),
+            approval_bps in bps(),
+        ) {
+            let before = outcome(votes_for, votes_against, total, quorum_bps, approval_bps);
+            if before == ProposalStatus::Passed {
+                let after = outcome(
+                    votes_for + extra_yes,
+                    votes_against,
+                    total,
+                    quorum_bps,
+                    approval_bps,
+                );
+                prop_assert_eq!(after, ProposalStatus::Passed);
+            }
+        }
+
+        /// Turnout exactly at `ceil(total * quorum / 10_000)` meets quorum; one vote fewer does not.
+        #[test]
+        fn quorum_holds_exactly_at_boundary(
+            total in 0..=MAX_COUNT,
+            quorum_bps in bps(),
+            approval_bps in bps(),
+        ) {
+            let bps_total = BPS as u128;
+            let needed = ((total as u128) * (quorum_bps as u128)).div_ceil(bps_total).max(1) as u64;
+
+            // All votes in favour, so approval is never the reason for the result.
+            prop_assert_ne!(
+                outcome(needed, 0, total, quorum_bps, approval_bps),
+                ProposalStatus::NoQuorum
+            );
+            if needed > 1 {
+                prop_assert_eq!(
+                    outcome(needed - 1, 0, total, quorum_bps, approval_bps),
+                    ProposalStatus::NoQuorum
+                );
+            }
+        }
+
+        /// With zero total shares, quorum is met by any vote at all and never by none.
+        #[test]
+        fn zero_total_shares(
+            votes_for in 0..=MAX_COUNT,
+            votes_against in 0..=MAX_COUNT,
+            quorum_bps in bps(),
+            approval_bps in bps(),
+        ) {
+            let status = outcome(votes_for, votes_against, 0, quorum_bps, approval_bps);
+            if votes_for + votes_against == 0 {
+                prop_assert_eq!(status, ProposalStatus::NoQuorum);
+            } else {
+                prop_assert!(
+                    status == ProposalStatus::Passed || status == ProposalStatus::Rejected
+                );
+            }
+        }
+    }
 }

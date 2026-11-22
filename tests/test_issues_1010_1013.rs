@@ -371,7 +371,7 @@ fn test_1010_paginated_zero_limit() {
     let s = Setup::new(&env);
 
     // Take a snapshot so there is data.
-    s.lifecycle.take_health_snapshot(&s.asset_id);
+    s.lifecycle.take_health_snapshot(&s.owner, &s.asset_id);
 
     let page = s
         .lifecycle
@@ -385,8 +385,8 @@ fn test_1010_paginated_offset_beyond_end() {
     let env = Env::default();
     let s = Setup::new(&env);
 
-    s.lifecycle.take_health_snapshot(&s.asset_id);
-    s.lifecycle.take_health_snapshot(&s.asset_id);
+    s.lifecycle.take_health_snapshot(&s.owner, &s.asset_id);
+    s.lifecycle.take_health_snapshot(&s.owner, &s.asset_id);
 
     let page = s
         .lifecycle
@@ -404,7 +404,7 @@ fn test_1010_paginated_first_page() {
     for _ in 0..5u32 {
         // Advance ledger so each snapshot has a distinct timestamp.
         env.ledger().with_mut(|li| li.timestamp += 60);
-        s.lifecycle.take_health_snapshot(&s.asset_id);
+        s.lifecycle.take_health_snapshot(&s.owner, &s.asset_id);
     }
 
     let page = s
@@ -421,7 +421,7 @@ fn test_1010_paginated_second_page() {
 
     for _ in 0..5u32 {
         env.ledger().with_mut(|li| li.timestamp += 60);
-        s.lifecycle.take_health_snapshot(&s.asset_id);
+        s.lifecycle.take_health_snapshot(&s.owner, &s.asset_id);
     }
 
     let page1 = s
@@ -452,7 +452,7 @@ fn test_1010_paginated_limit_larger_than_remaining() {
 
     for _ in 0..3u32 {
         env.ledger().with_mut(|li| li.timestamp += 60);
-        s.lifecycle.take_health_snapshot(&s.asset_id);
+        s.lifecycle.take_health_snapshot(&s.owner, &s.asset_id);
     }
 
     let page = s

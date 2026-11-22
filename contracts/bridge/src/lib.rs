@@ -142,6 +142,10 @@ pub struct PendingRelease {
     pub amount: i128,
     /// Relayers that have attested, in the order they attested.
     pub approvals: Vec<Address>,
+    /// Source-chain confirmations each relayer observed. Entry `i` belongs to
+    /// `approvals[i]`. Relayers may disagree, so the release is gated on the
+    /// lowest value (see `attest_release`).
+    pub confirmations: Vec<u32>,
     /// `true` once the release has been paid out. Doubles as the replay guard.
     pub executed: bool,
 }
@@ -305,9 +309,13 @@ pub struct Bridge;
 impl Bridge {
     /// Initialize the bridge with an admin. Can be called only once.
     ///
+    /// The proposed admin must authorize the call, so an arbitrary caller cannot
+    /// front-run deployment and install itself as admin.
+    ///
     /// # Panics
     /// - [`ContractError::AlreadyInitialized`] if the admin is already set
     pub fn initialize(env: Env, admin: Address) {
+        admin.require_auth();
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, ContractError::AlreadyInitialized);
         }
@@ -318,15 +326,20 @@ impl Bridge {
 
     /// Pause new transfers (`bridge_out`, `attest_release`, `create_swap`).
     /// Claims and refunds stay available so users can always reclaim funds.
+    /// Emits `BR_PAUSE` with `(admin)`.
     pub fn pause(env: Env, admin: Address) {
         require_admin(&env, &admin);
         env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish((symbol_short!("BR_PAUSE"),), (admin,));
     }
 
     /// Resume transfers after a pause.
+    /// Emits `BR_RESUME` with `(admin)`.
     pub fn unpause(env: Env, admin: Address) {
         require_admin(&env, &admin);
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.events()
+            .publish((symbol_short!("BR_RESUME"),), (admin,));
     }
 
     /// Replace the relayer set and the number of attestations required per release.
@@ -334,6 +347,8 @@ impl Bridge {
     /// # Panics
     /// - [`ContractError::InvalidRelayerSet`] if the list is empty, too large, or has duplicates
     /// - [`ContractError::InvalidThreshold`] if `threshold` is 0 or exceeds the relayer count
+    ///
+    /// Emits `BR_RELAYS` with `(admin, threshold, relayers)`.
     pub fn set_relayers(env: Env, admin: Address, relayers: Vec<Address>, threshold: u32) {
         require_admin(&env, &admin);
         let count = relayers.len();
@@ -354,6 +369,8 @@ impl Bridge {
         env.storage()
             .instance()
             .set(&DataKey::Threshold, &threshold);
+        env.events()
+            .publish((symbol_short!("BR_RELAYS"),), (admin, threshold, relayers));
     }
 
     /// Register a supported chain.
@@ -370,6 +387,8 @@ impl Bridge {
         }
         env.storage().persistent().set(&key, &config);
         bump(&env, &key);
+        env.events()
+            .publish((symbol_short!("BR_CH_ADD"),), (admin, chain_id, config));
     }
 
     /// Replace the constraints of a registered chain.
@@ -384,6 +403,8 @@ impl Bridge {
         let key = DataKey::Chain(chain_id);
         env.storage().persistent().set(&key, &config);
         bump(&env, &key);
+        env.events()
+            .publish((symbol_short!("BR_CH_UPD"),), (admin, chain_id, config));
     }
 
     /// Set the maximum number of seconds a swap's expiry may lie beyond the current ledger time.
@@ -416,6 +437,8 @@ impl Bridge {
         let key = DataKey::Chain(chain_id);
         env.storage().persistent().set(&key, &cfg);
         bump(&env, &key);
+        env.events()
+            .publish((symbol_short!("BR_CH_ENB"),), (admin, chain_id, enabled));
     }
 
     /// Get a chain's current configuration.
@@ -474,9 +497,12 @@ impl Bridge {
     /// Relayer attestation for an inbound transfer from `source_chain`.
     ///
     /// Each relayer attests once per `(source_chain, nonce)`. All attestations must
-    /// agree on `token`, `recipient` and `amount`. When the approval count reaches
-    /// the threshold the tokens are released, and the release is marked executed
-    /// so it cannot be replayed.
+    /// agree on `token`, `recipient` and `amount`. Each relayer's observed
+    /// `confirmations` is stored with its approval. Relayers may report different
+    /// counts. Release happens only when the approval count reaches the threshold
+    /// and the lowest stored confirmation count meets the chain's
+    /// `required_confirmations`. The release is then marked executed so it cannot
+    /// be replayed.
     ///
     /// # Panics
     /// - [`ContractError::Paused`] if the bridge is paused
@@ -488,6 +514,7 @@ impl Bridge {
     /// - [`ContractError::AttestationMismatch`] if parameters differ from earlier attestations
     /// - [`ContractError::AlreadyAttested`] if this relayer already attested
     /// - [`ContractError::WindowCapExceeded`] if the release would breach the outflow cap
+    /// - [`ContractError::InsufficientConfirmations`] also if the lowest stored confirmation count is below the requirement at release time
     ///
     /// On execution, emits `BR_REL` with the approving relayers in attestation order.
     pub fn attest_release(
@@ -544,6 +571,7 @@ impl Bridge {
                     recipient: recipient.clone(),
                     amount,
                     approvals: Vec::new(&env),
+                    confirmations: Vec::new(&env),
                     executed: false,
                 },
             };
@@ -552,6 +580,7 @@ impl Bridge {
             panic_with_error!(&env, ContractError::AlreadyAttested);
         }
         pending.approvals.push_back(relayer.clone());
+        pending.confirmations.push_back(confirmations);
 
         let threshold: u32 = env
             .storage()
@@ -559,6 +588,14 @@ impl Bridge {
             .get(&DataKey::Threshold)
             .unwrap_or(0);
         if pending.approvals.len() >= threshold {
+            // Gate on the most conservative count any approving relayer observed.
+            let mut lowest = u32::MAX;
+            for observed in pending.confirmations.iter() {
+                lowest = lowest.min(observed);
+            }
+            if lowest < cfg.required_confirmations {
+                panic_with_error!(&env, ContractError::InsufficientConfirmations);
+            }
             account_window_outflow(&env, source_chain, &cfg, amount);
             pending.executed = true;
             token::Client::new(&env, &token).transfer(
@@ -717,6 +754,7 @@ impl Bridge {
 
     /// Refund an open swap to its sender after the timelock has passed.
     /// Anyone may trigger the refund; funds always go back to the sender.
+    /// Emits `BR_SWP_R` with `(swap_id, sender, token, amount)`.
     ///
     /// # Panics
     /// - [`ContractError::SwapNotFound`] if the swap does not exist
@@ -745,8 +783,15 @@ impl Bridge {
             &swap.sender,
             &swap.amount,
         );
-        env.events()
-            .publish((symbol_short!("BR_SWP_R"),), (swap_id,));
+        env.events().publish(
+            (symbol_short!("BR_SWP_R"),),
+            (
+                swap_id,
+                swap.sender.clone(),
+                swap.token.clone(),
+                swap.amount,
+            ),
+        );
     }
 
     /// Get a swap by ID.

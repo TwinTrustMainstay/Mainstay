@@ -1465,6 +1465,22 @@ impl AssetRegistry {
         asset
     }
 
+    /// Returns whether the asset is currently locked as collateral under a lien.
+    ///
+    /// Read-only lookup for other contracts (for example the asset NFT contract, issue #1972)
+    /// that must refuse to sell or transfer a pledged asset.
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    pub fn is_asset_locked(env: Env, asset_id: u64) -> bool {
+        let asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+        asset.is_locked
+    }
+
     /// Return all registered assets from `asset_ids` in one invocation.
     ///
     /// Missing IDs are omitted, matching the tolerant behavior of the other
