@@ -1,12 +1,19 @@
 //! Tests for the cross-chain bridge contract (#1743, #1744).
 
-use bridge::{Bridge, BridgeClient, ChainConfig, ReleaseParams, SwapStatus};
+use bridge::{Bridge, BridgeClient, ChainConfig, ContractError, ReleaseParams, SwapStatus};
 use soroban_sdk::{
+    testutils::{Address as _, Events as _, Ledger},
     symbol_short,
-    testutils::{Address as _, Events, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    vec, Address, Bytes, BytesN, Env, IntoVal, Symbol, Val, Vec,
+    vec, Address, Bytes, BytesN, Env, Error, IntoVal, Symbol, Val, Vec,
 };
+
+fn is_contract_error<T, C, I>(
+    res: Result<Result<T, C>, Result<Error, I>>,
+    err: ContractError,
+) -> bool {
+    matches!(res, Err(Ok(e)) if e == Error::from_contract_error(err as u32))
+}
 
 const ETH: u32 = 1;
 
@@ -28,6 +35,22 @@ fn eth_config(env: &Env) -> ChainConfig {
         window_secs: 3_600,
         window_cap: 5_000,
         alert_threshold: 4_000,
+        address_len: 42,
+    }
+}
+
+/// A 56-character alphanumeric destination chain with a different address format.
+fn xlm_config(env: &Env) -> ChainConfig {
+    ChainConfig {
+        name: Symbol::new(env, "XLM"),
+        enabled: true,
+        min_amount: 10,
+        max_amount: 1_000,
+        required_confirmations: 1,
+        window_secs: 3_600,
+        window_cap: 5_000,
+        alert_threshold: 4_000,
+        address_len: 56,
     }
 }
 
@@ -100,7 +123,7 @@ fn release(ctx: &Ctx, nonce: u64, recipient: &Address, amount: i128) {
 }
 
 fn dest(ctx: &Ctx) -> Bytes {
-    Bytes::from_slice(&ctx.env, b"0xdeadbeef")
+    Bytes::from_slice(&ctx.env, b"0x00000000000000000000000000000000deadbeef")
 }
 
 // ── Outbound transfers ───────────────────────────────────────
@@ -170,6 +193,78 @@ fn test_bridge_out_rejects_empty_destination() {
 }
 
 #[test]
+fn test_bridge_out_rejects_wrong_length_destination_address() {
+    let ctx = setup();
+    let user = Address::generate(&ctx.env);
+    mint(&ctx, &user, 500);
+
+    // One byte short of the 42-byte ETH address format.
+    let short = Bytes::from_slice(&ctx.env, b"0x00000000000000000000000000000000deadbee");
+    let res = ctx
+        .client
+        .try_bridge_out(&user, &ctx.token, &100, &ETH, &short);
+    assert!(is_contract_error(
+        res,
+        ContractError::InvalidDestinationAddress
+    ));
+    assert_eq!(balance(&ctx, &user), 500);
+}
+
+#[test]
+fn test_bridge_out_rejects_non_alphanumeric_destination_address() {
+    let ctx = setup();
+    let user = Address::generate(&ctx.env);
+    mint(&ctx, &user, 500);
+
+    // Right length, but contains a space.
+    let bad = Bytes::from_slice(&ctx.env, b"0x0000000000000000000000000000000 deadbeef");
+    let res = ctx
+        .client
+        .try_bridge_out(&user, &ctx.token, &100, &ETH, &bad);
+    assert!(is_contract_error(
+        res,
+        ContractError::InvalidDestinationAddress
+    ));
+    assert_eq!(balance(&ctx, &user), 500);
+}
+
+#[test]
+fn test_bridge_out_validates_address_per_destination_chain() {
+    let ctx = setup();
+    ctx.client.add_chain(&ctx.admin, &2, &xlm_config(&ctx.env));
+    let user = Address::generate(&ctx.env);
+    mint(&ctx, &user, 500);
+
+    // The ETH 42-byte format is invalid for the 56-byte XLM chain.
+    let eth_style = Bytes::from_slice(&ctx.env, b"0x00000000000000000000000000000000deadbeef");
+    let res = ctx
+        .client
+        .try_bridge_out(&user, &ctx.token, &100, &2, &eth_style);
+    assert!(is_contract_error(
+        res,
+        ContractError::InvalidDestinationAddress
+    ));
+
+    // A 56-byte alphanumeric address is valid on XLM and rejected on ETH.
+    let xlm_style = Bytes::from_slice(
+        &ctx.env,
+        b"GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7",
+    );
+    assert_eq!(
+        ctx.client
+            .bridge_out(&user, &ctx.token, &100, &2, &xlm_style),
+        1
+    );
+    let res = ctx
+        .client
+        .try_bridge_out(&user, &ctx.token, &100, &ETH, &xlm_style);
+    assert!(is_contract_error(
+        res,
+        ContractError::InvalidDestinationAddress
+    ));
+}
+
+#[test]
 fn test_bridge_out_rejects_unknown_chain() {
     let ctx = setup();
     let user = Address::generate(&ctx.env);
@@ -199,6 +294,39 @@ fn test_release_executes_only_at_threshold() {
     let pending = ctx.client.get_release(&ETH, &1).unwrap();
     assert!(pending.executed);
     assert_eq!(balance(&ctx, &recipient), 300);
+}
+
+#[test]
+fn test_release_event_lists_approving_relayers() {
+    use soroban_sdk::{IntoVal, TryFromVal};
+
+    let ctx = setup();
+    let recipient = Address::generate(&ctx.env);
+    mint(&ctx, &ctx.client.address, 1_000);
+    release(&ctx, 7, &recipient, 300);
+
+    let br_rel = Symbol::new(&ctx.env, "BR_REL");
+    let events = ctx.env.events().all();
+    let (_, _, data) = events
+        .iter()
+        .find(|(_, topics, _)| {
+            topics
+                .get(0)
+                .and_then(|t| Symbol::try_from_val(&ctx.env, &t).ok())
+                == Some(br_rel.clone())
+        })
+        .expect("BR_REL event emitted on execution");
+
+    let payload: (u32, u64, Address, Address, i128, soroban_sdk::Vec<Address>) =
+        data.into_val(&ctx.env);
+    assert_eq!(payload.0, ETH);
+    assert_eq!(payload.1, 7);
+    assert_eq!(payload.2, recipient);
+    assert_eq!(payload.4, 300);
+    assert_eq!(
+        payload.5,
+        vec![&ctx.env, ctx.relayers[0].clone(), ctx.relayers[1].clone()]
+    );
 }
 
 #[test]
@@ -487,6 +615,62 @@ fn test_swap_cannot_be_opened_with_past_expiry() {
 }
 
 #[test]
+fn test_swap_expiry_capped_by_max_duration() {
+    let ctx = setup();
+    ctx.env.ledger().set_timestamp(1_000);
+    ctx.client.set_max_swap_duration(&ctx.admin, &3_600);
+    assert_eq!(ctx.client.get_max_swap_duration(), 3_600);
+
+    let sender = Address::generate(&ctx.env);
+    mint(&ctx, &sender, 500);
+    let hashlock = BytesN::from_array(&ctx.env, &[9u8; 32]);
+    let recipient = Address::generate(&ctx.env);
+
+    // Exactly at the boundary is accepted.
+    ctx.client.create_swap(
+        &sender,
+        &recipient,
+        &ctx.token,
+        &100,
+        &hashlock,
+        &(1_000 + 3_600),
+    );
+    // One second beyond the boundary is rejected.
+    assert!(ctx
+        .client
+        .try_create_swap(
+            &sender,
+            &recipient,
+            &ctx.token,
+            &100,
+            &hashlock,
+            &(1_000 + 3_601)
+        )
+        .is_err());
+}
+
+#[test]
+fn test_default_max_swap_duration_is_30_days() {
+    let ctx = setup();
+    assert_eq!(ctx.client.get_max_swap_duration(), 30 * 24 * 60 * 60);
+}
+
+#[test]
+fn test_set_max_swap_duration_is_admin_only_and_nonzero() {
+    let ctx = setup();
+    let impostor = Address::generate(&ctx.env);
+    assert!(ctx
+        .client
+        .try_set_max_swap_duration(&impostor, &3_600)
+        .is_err());
+    assert!(ctx
+        .client
+        .try_set_max_swap_duration(&ctx.admin, &0)
+        .is_err());
+    assert_eq!(ctx.client.get_max_swap_duration(), 30 * 24 * 60 * 60);
+}
+
+#[test]
 fn test_unknown_swap_is_not_found() {
     let ctx = setup();
     assert!(ctx.client.try_get_swap(&42).is_err());
@@ -566,6 +750,10 @@ fn test_add_chain_rejects_duplicate_and_invalid_config() {
         .client
         .try_add_chain(&ctx.admin, &3, &bad_alert)
         .is_err());
+
+    let mut zero_len = eth_config(&ctx.env);
+    zero_len.address_len = 0;
+    assert!(ctx.client.try_add_chain(&ctx.admin, &4, &zero_len).is_err());
 }
 
 #[test]
