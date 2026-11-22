@@ -86,11 +86,24 @@ pub enum ContractError {
     ReleaseNotFound = 28,
     /// The release's attestation window has not closed yet, so it cannot be expired (#1921).
     ReleaseNotExpired = 29,
+    /// The release has fewer approvals than the current threshold.
+    InsufficientApprovals = 30,
+    /// The token is not on the allowlist for this chain.
+    TokenNotAllowed = 31,
 }
 
 /// Maximum number of relayers in the set.
 const MAX_RELAYERS: u32 = 20;
 
+/// Allowlist scope used by atomic swaps. Swaps have no destination chain, so
+/// they use this reserved scope. Chain ID 0 cannot be registered.
+pub const SWAP_SCOPE: u32 = 0;
+
+/// Approximate seconds per ledger, used to convert swap expiry into TTL ledgers.
+const LEDGER_SECS: u64 = 5;
+
+/// Ledgers a swap stays readable after its expiry, so the sender can still refund.
+const SWAP_GRACE_LEDGERS: u32 = TTL_TARGET;
 /// Default cap on how far in the future a swap expiry may be (30 days).
 /// Used until the admin sets `max_swap_duration_secs`.
 const DEFAULT_MAX_SWAP_DURATION_SECS: u64 = 30 * 24 * 60 * 60;
@@ -193,6 +206,9 @@ pub enum DataKey {
     Relayers,
     Threshold,
     Chain(u32),
+    /// `(scope, token)` is allowed. A scope is a destination chain ID for
+    /// `bridge_out`.
+    AllowedToken(u32, Address),
     OutNonce(u32),
     Pending(u32, u64),
     Window(u32),
@@ -243,6 +259,25 @@ fn bump(env: &Env, key: &DataKey) {
         .extend_ttl(key, TTL_THRESHOLD, TTL_TARGET);
 }
 
+/// TTL target for an open swap: enough ledgers to cover the time left until
+/// `expiry` plus a grace period for refunding, capped at the network maximum.
+fn swap_ttl_target(env: &Env, expiry: u64) -> u32 {
+    let remaining_secs = expiry.saturating_sub(env.ledger().timestamp());
+    let ledgers = remaining_secs / LEDGER_SECS + SWAP_GRACE_LEDGERS as u64;
+    ledgers.min(env.storage().max_ttl() as u64) as u32
+}
+
+/// Extend a swap entry's TTL to cover its expiry plus the grace period. The
+/// contract instance (admin, relayers, pause flag) is extended to the same
+/// target, since swap calls cannot run if the instance has been archived.
+fn bump_swap_entry(env: &Env, key: &DataKey, expiry: u64) {
+    let target = swap_ttl_target(env, expiry);
+    env.storage()
+        .persistent()
+        .extend_ttl(key, TTL_THRESHOLD, target);
+    env.storage().instance().extend_ttl(TTL_THRESHOLD, target);
+}
+
 fn is_paused(env: &Env) -> bool {
     env.storage()
         .instance()
@@ -279,6 +314,65 @@ fn load_chain(env: &Env, chain_id: u32) -> ChainConfig {
         .unwrap_or_else(|| panic_with_error!(env, ContractError::ChainNotFound));
     bump(env, &key);
     cfg
+}
+
+fn threshold(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::Threshold)
+        .unwrap_or(0)
+}
+
+/// Pay out a release and mark it executed. The caller must have checked that the
+/// approval count meets the threshold and that the release has not executed.
+fn execute_release(
+    env: &Env,
+    source_chain: u32,
+    nonce: u64,
+    cfg: &ChainConfig,
+    pending: &mut PendingRelease,
+) {
+    // Gate on the most conservative count any approving relayer observed.
+    let mut lowest = u32::MAX;
+    for observed in pending.confirmations.iter() {
+        lowest = lowest.min(observed);
+    }
+    if lowest < cfg.required_confirmations {
+        panic_with_error!(env, ContractError::InsufficientConfirmations);
+    }
+    account_window_outflow(env, source_chain, cfg, pending.amount);
+    pending.executed = true;
+    token::Client::new(env, &pending.token).transfer(
+        &env.current_contract_address(),
+        &pending.recipient,
+        &pending.amount,
+    );
+    env.events().publish(
+        (symbol_short!("BR_REL"),),
+        (
+            source_chain,
+            nonce,
+            pending.recipient.clone(),
+            pending.token.clone(),
+            pending.amount,
+            pending.approvals.clone(),
+        ),
+    );
+}
+
+fn ensure_token_allowed(env: &Env, scope: u32, token: &Address) {
+    if !is_token_allowed_in(env, scope, token) {
+        panic_with_error!(env, ContractError::TokenNotAllowed);
+    }
+}
+
+fn is_token_allowed_in(env: &Env, scope: u32, token: &Address) -> bool {
+    let key = DataKey::AllowedToken(scope, token.clone());
+    let allowed: bool = env.storage().persistent().get(&key).unwrap_or(false);
+    if env.storage().persistent().has(&key) {
+        bump(env, &key);
+    }
+    allowed
 }
 
 fn ensure_amount_in_range(env: &Env, cfg: &ChainConfig, amount: i128) {
@@ -399,6 +493,9 @@ impl Bridge {
     /// - [`ContractError::InvalidConfig`] if the config fails validation
     pub fn add_chain(env: Env, admin: Address, chain_id: u32, config: ChainConfig) {
         require_admin(&env, &admin);
+        if chain_id == SWAP_SCOPE {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
         validate_chain_config(&env, &config);
         let key = DataKey::Chain(chain_id);
         if env.storage().persistent().has(&key) {
@@ -460,6 +557,28 @@ impl Bridge {
             .publish((symbol_short!("BR_CH_ENB"),), (admin, chain_id, enabled));
     }
 
+    /// Allow or disallow a token for `bridge_out` to `chain_id`.
+    ///
+    /// The allowlist is independent of chain registration, so a token can be
+    /// listed before its chain is added.
+    pub fn set_token_allowed(
+        env: Env,
+        admin: Address,
+        chain_id: u32,
+        token: Address,
+        allowed: bool,
+    ) {
+        require_admin(&env, &admin);
+        let key = DataKey::AllowedToken(chain_id, token);
+        env.storage().persistent().set(&key, &allowed);
+        bump(&env, &key);
+    }
+
+    /// Whether `token` may be bridged to `chain_id`.
+    pub fn is_token_allowed(env: Env, chain_id: u32, token: Address) -> bool {
+        is_token_allowed_in(&env, chain_id, &token)
+    }
+
     /// Get a chain's current configuration.
     ///
     /// # Panics
@@ -477,6 +596,7 @@ impl Bridge {
     /// - [`ContractError::ChainNotFound`] / [`ContractError::ChainDisabled`] for an unusable destination
     /// - [`ContractError::AmountOutOfRange`] if `amount` is outside the chain's limits
     /// - [`ContractError::InvalidDestination`] if `dest_address` is empty
+    /// - [`ContractError::TokenNotAllowed`] if `token` is not allowlisted for `dest_chain`
     /// - [`ContractError::InvalidDestinationAddress`] if `dest_address` has the wrong length or encoding for `dest_chain`
     pub fn bridge_out(
         env: Env,
@@ -493,6 +613,10 @@ impl Bridge {
             panic_with_error!(&env, ContractError::ChainDisabled);
         }
         ensure_amount_in_range(&env, &cfg, amount);
+        if dest_address.is_empty() {
+            panic_with_error!(&env, ContractError::InvalidDestination);
+        }
+        ensure_token_allowed(&env, dest_chain, &token);
         validate_dest_address(&env, &cfg, &dest_address);
 
         token::Client::new(&env, &token).transfer(
@@ -621,39 +745,44 @@ impl Bridge {
         pending.approvals.push_back(relayer.clone());
         pending.confirmations.push_back(confirmations);
 
-        let threshold: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Threshold)
-            .unwrap_or(0);
-        if pending.approvals.len() >= threshold {
-            // Gate on the most conservative count any approving relayer observed.
-            let mut lowest = u32::MAX;
-            for observed in pending.confirmations.iter() {
-                lowest = lowest.min(observed);
-            }
-            if lowest < cfg.required_confirmations {
-                panic_with_error!(&env, ContractError::InsufficientConfirmations);
-            }
-            account_window_outflow(&env, source_chain, &cfg, amount);
-            pending.executed = true;
-            token::Client::new(&env, &token).transfer(
-                &env.current_contract_address(),
-                &recipient,
-                &amount,
-            );
-            env.events().publish(
-                (symbol_short!("BR_REL"),),
-                (
-                    source_chain,
-                    nonce,
-                    recipient.clone(),
-                    token.clone(),
-                    amount,
-                    pending.approvals.clone(),
-                ),
-            );
+        if pending.approvals.len() >= threshold(&env) {
+            execute_release(&env, source_chain, nonce, &cfg, &mut pending);
         }
+
+        env.storage().persistent().set(&key, &pending);
+        bump(&env, &key);
+    }
+
+    /// Execute a release that already has enough approvals under the current
+    /// threshold. Anyone may call this, so a release that qualifies after
+    /// `set_relayers` lowers the threshold does not wait for another attestation.
+    ///
+    /// # Panics
+    /// - [`ContractError::Paused`] if the bridge is paused
+    /// - [`ContractError::ReleaseNotFound`] if no relayer has attested to this release
+    /// - [`ContractError::ChainNotFound`] / [`ContractError::ChainDisabled`] for an unusable source chain
+    /// - [`ContractError::AlreadyProcessed`] if this release already executed
+    /// - [`ContractError::InsufficientApprovals`] if the approval count is below the threshold
+    /// - [`ContractError::WindowCapExceeded`] if the release would breach the outflow cap
+    pub fn execute_release(env: Env, source_chain: u32, nonce: u64) {
+        ensure_not_paused(&env);
+        let key = DataKey::Pending(source_chain, nonce);
+        let mut pending: PendingRelease = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ReleaseNotFound));
+        if pending.executed {
+            panic_with_error!(&env, ContractError::AlreadyProcessed);
+        }
+        if pending.approvals.len() < threshold(&env) {
+            panic_with_error!(&env, ContractError::InsufficientApprovals);
+        }
+        let cfg = load_chain(&env, source_chain);
+        if !cfg.enabled {
+            panic_with_error!(&env, ContractError::ChainDisabled);
+        }
+        execute_release(&env, source_chain, nonce, &cfg, &mut pending);
 
         env.storage().persistent().set(&key, &pending);
         bump(&env, &key);
@@ -723,6 +852,7 @@ impl Bridge {
     /// - [`ContractError::Paused`] if the bridge is paused
     /// - [`ContractError::AmountOutOfRange`] if `amount` is not positive
     /// - [`ContractError::SwapExpired`] if `expiry` is not in the future
+    /// - [`ContractError::TokenNotAllowed`] if `token` is not allowlisted for swaps
     /// - [`ContractError::SwapDurationTooLong`] if `expiry` is more than `max_swap_duration_secs` ahead
     pub fn create_swap(
         env: Env,
@@ -742,6 +872,7 @@ impl Bridge {
         if expiry <= now {
             panic_with_error!(&env, ContractError::SwapExpired);
         }
+        ensure_token_allowed(&env, SWAP_SCOPE, &token);
         let max_duration = Self::get_max_swap_duration(env.clone());
         if expiry - now > max_duration {
             panic_with_error!(&env, ContractError::SwapDurationTooLong);
@@ -773,7 +904,7 @@ impl Bridge {
         };
         let key = DataKey::Swap(id);
         env.storage().persistent().set(&key, &swap);
-        bump(&env, &key);
+        bump_swap_entry(&env, &key, expiry);
 
         env.events().publish(
             (symbol_short!("BR_SWP_N"),),
@@ -810,7 +941,7 @@ impl Bridge {
 
         swap.status = SwapStatus::Claimed;
         env.storage().persistent().set(&key, &swap);
-        bump(&env, &key);
+        bump_swap_entry(&env, &key, swap.expiry);
 
         token::Client::new(&env, &swap.token).transfer(
             &env.current_contract_address(),
@@ -845,7 +976,7 @@ impl Bridge {
 
         swap.status = SwapStatus::Refunded;
         env.storage().persistent().set(&key, &swap);
-        bump(&env, &key);
+        bump_swap_entry(&env, &key, swap.expiry);
 
         token::Client::new(&env, &swap.token).transfer(
             &env.current_contract_address(),
@@ -861,6 +992,26 @@ impl Bridge {
                 swap.amount,
             ),
         );
+    }
+
+    /// Extend the TTL of an open swap so it stays readable until its expiry and
+    /// grace period. Anyone may call this. It only extends the entry and does not
+    /// change the swap.
+    ///
+    /// # Panics
+    /// - [`ContractError::SwapNotFound`] if the swap does not exist
+    /// - [`ContractError::SwapNotOpen`] if the swap was already claimed or refunded
+    pub fn bump_swap(env: Env, swap_id: u64) {
+        let key = DataKey::Swap(swap_id);
+        let swap: Swap = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::SwapNotFound));
+        if swap.status != SwapStatus::Open {
+            panic_with_error!(&env, ContractError::SwapNotOpen);
+        }
+        bump_swap_entry(&env, &key, swap.expiry);
     }
 
     /// Get a swap by ID.
