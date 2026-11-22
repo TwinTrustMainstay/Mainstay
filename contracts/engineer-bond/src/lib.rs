@@ -10,7 +10,9 @@
 //! - A poor outcome resets the engineer's good-job streak to zero.
 //! - Once an engineer has been slashed, withdrawals are blocked until the streak reaches
 //!   [`RECOVERY_STREAK`]. Good performance is what restores withdrawal rights.
-//! - An open dispute blocks withdrawal and makes the engineer not bonded.
+//! - An open dispute blocks withdrawal and makes the engineer not bonded. A dispute lapses
+//!   after [`DISPUTE_TIMEOUT_SECS`] so an unresolved dispute cannot lock the stake forever.
+//! - Slashing is refused while a dispute is open. A slash may be linked to a resolved dispute.
 
 #[cfg(test)]
 mod test;
@@ -18,11 +20,14 @@ mod test;
 use shared::{extend_persistent_ttl, require_admin};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
-    Address, Env, Vec,
+    Address, BytesN, Env, String, Vec,
 };
 
 /// Consecutive good-job outcomes an engineer must reach after a slash before withdrawing.
 pub const RECOVERY_STREAK: u32 = 3;
+
+/// Seconds an open dispute blocks withdrawal before it lapses (30 days).
+pub const DISPUTE_TIMEOUT_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// Retention limit: maximum history entries kept per engineer.
 ///
@@ -41,13 +46,13 @@ pub enum ContractError {
     AlreadyInitialized = 2,
     /// Caller is not the admin.
     UnauthorizedAdmin = 3,
-    /// Amount must be greater than zero.
+    /// Amount must be positive.
     InvalidAmount = 4,
-    /// Requested amount exceeds the engineer's bonded balance.
+    /// Slash or withdrawal exceeds the staked bond.
     InsufficientBond = 5,
-    /// Withdrawal would leave a non-zero bond below the minimum.
+    /// Remaining bond would fall below the minimum (withdraw all of it instead).
     BelowMinimumBond = 6,
-    /// Withdrawal is blocked while a dispute is open.
+    /// A dispute is open; withdrawal and slashing are blocked until it is resolved.
     DisputeOpen = 7,
     /// Engineer was slashed and has not yet recovered (good-job streak too short).
     RecoveryIncomplete = 8,
@@ -57,6 +62,10 @@ pub enum ContractError {
     NoOpenDispute = 10,
     /// No dispute with the given identifier exists for this engineer.
     DisputeNotFound = 11,
+    /// No bond record exists for this engineer; they never staked.
+    BondNotFound = 12,
+    /// Dispute reason must not be empty; an empty reason cannot be audited.
+    EmptyReason = 13,
 }
 
 /// Outcome recorded when a dispute is resolved.
@@ -92,11 +101,16 @@ pub struct Bond {
     pub slashed_total: i128,
     pub good_streak: u32,
     pub dispute_open: bool,
+    /// Ledger timestamp when the current dispute was opened; 0 when no dispute is open.
+    pub dispute_opened_at: u64,
     /// Identifier of the most recently opened dispute; `0` if none has ever been opened.
     pub dispute_count: u32,
 }
 
 /// A dispute against an engineer. `outcome` is `Pending` until it is resolved.
+///
+/// The reason, evidence hash and acting admin are kept as the audit record and are not
+/// cleared when the dispute is resolved.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Dispute {
@@ -104,6 +118,12 @@ pub struct Dispute {
     pub outcome: DisputeOutcome,
     /// Total amount slashed and linked to this dispute.
     pub slashed_total: i128,
+    /// Admin address that opened the dispute.
+    pub opened_by: Address,
+    /// Human-readable reason for the dispute.
+    pub reason: String,
+    /// Hash of the off-chain evidence supporting the dispute.
+    pub evidence_hash: BytesN<32>,
 }
 
 #[contracttype]
@@ -161,8 +181,18 @@ fn load_bond(env: &Env, engineer: &Address) -> Bond {
             slashed_total: 0,
             good_streak: 0,
             dispute_open: false,
+            dispute_opened_at: 0,
             dispute_count: 0,
         })
+}
+
+/// Loads a bond that must already exist. Admin actions use this so they never create a
+/// bond record for an engineer who never staked.
+fn load_existing_bond(env: &Env, engineer: &Address) -> Bond {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Bond(engineer.clone()))
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::BondNotFound))
 }
 
 fn save_bond(env: &Env, engineer: &Address, bond: &Bond) {
@@ -249,9 +279,10 @@ impl EngineerBond {
     }
 
     /// Records the outcome of a job. A good job extends the streak, a poor one resets it.
+    /// The engineer must already have a bond.
     pub fn record_performance(env: Env, admin: Address, engineer: Address, good: bool) {
         require_stored_admin(&env, &admin);
-        let mut bond = load_bond(&env, &engineer);
+        let mut bond = load_existing_bond(&env, &engineer);
         if good {
             bond.good_streak = bond.good_streak.saturating_add(1);
             record(&env, &engineer, EventKind::GoodJob, 0);
@@ -263,15 +294,28 @@ impl EngineerBond {
     }
 
     /// Opens a dispute against the engineer and returns its identifier.
-    /// Blocks withdrawal until resolved.
-    pub fn open_dispute(env: Env, admin: Address, engineer: Address) -> u32 {
+    ///
+    /// Blocks withdrawal until it is resolved or lapses after [`DISPUTE_TIMEOUT_SECS`]. The
+    /// reason, evidence hash and acting admin are stored with the dispute and emitted. The
+    /// engineer must already have a bond.
+    pub fn open_dispute(
+        env: Env,
+        admin: Address,
+        engineer: Address,
+        reason: String,
+        evidence_hash: BytesN<32>,
+    ) -> u32 {
         require_stored_admin(&env, &admin);
-        let mut bond = load_bond(&env, &engineer);
+        if reason.is_empty() {
+            panic_with_error!(&env, ContractError::EmptyReason);
+        }
+        let mut bond = load_existing_bond(&env, &engineer);
         if bond.dispute_open {
             panic_with_error!(&env, ContractError::DisputeAlreadyOpen);
         }
         bond.dispute_count += 1;
         bond.dispute_open = true;
+        bond.dispute_opened_at = env.ledger().timestamp();
         save_bond(&env, &engineer, &bond);
         save_dispute(
             &env,
@@ -280,9 +324,17 @@ impl EngineerBond {
                 id: bond.dispute_count,
                 outcome: DisputeOutcome::Pending,
                 slashed_total: 0,
+                opened_by: admin.clone(),
+                reason: reason.clone(),
+                evidence_hash: evidence_hash.clone(),
             },
         );
         record(&env, &engineer, EventKind::DisputeOpened, 0);
+
+        env.events().publish(
+            (symbol_short!("disp_opn"),),
+            (engineer, bond.dispute_count, admin, reason, evidence_hash),
+        );
         bond.dispute_count
     }
 
@@ -298,6 +350,7 @@ impl EngineerBond {
         save_dispute(&env, &engineer, &dispute);
 
         bond.dispute_open = false;
+        bond.dispute_opened_at = 0;
         save_bond(&env, &engineer, &bond);
         record(&env, &engineer, EventKind::DisputeResolved, 0);
 
@@ -315,8 +368,9 @@ impl EngineerBond {
     /// Slashes `amount` from the engineer's bond and transfers it to the treasury.
     /// A slash resets the good-job streak, so recovery must be earned again.
     ///
-    /// When `dispute_id` is given, the slash is linked to that dispute and added to its
-    /// `slashed_total`. The dispute must exist for this engineer.
+    /// Blocked while a dispute is open; the dispute must be resolved first. When `dispute_id`
+    /// is given, the slash is linked to that dispute and added to its `slashed_total`. The
+    /// dispute must exist for this engineer.
     pub fn slash(
         env: Env,
         admin: Address,
@@ -329,6 +383,9 @@ impl EngineerBond {
             panic_with_error!(&env, ContractError::InvalidAmount);
         }
         let mut bond = load_bond(&env, &engineer);
+        if bond.dispute_open {
+            panic_with_error!(&env, ContractError::DisputeOpen);
+        }
         if amount > bond.staked {
             panic_with_error!(&env, ContractError::InsufficientBond);
         }
@@ -357,8 +414,10 @@ impl EngineerBond {
 
     /// Withdraws `amount` of the engineer's bond.
     ///
-    /// Blocked while a dispute is open. After any slash, requires a good-job streak of at
-    /// least [`RECOVERY_STREAK`]. A non-zero remaining bond must stay at or above the minimum.
+    /// Blocked while a dispute is open, until [`DISPUTE_TIMEOUT_SECS`] has passed since it was
+    /// opened. After that deadline the dispute lapses and withdrawal is allowed; its outcome
+    /// stays `Pending`. After any slash, requires a good-job streak of at least
+    /// [`RECOVERY_STREAK`]. A non-zero remaining bond must stay at or above the minimum.
     pub fn withdraw_bond(env: Env, engineer: Address, amount: i128) {
         engineer.require_auth();
         if amount <= 0 {
@@ -366,7 +425,13 @@ impl EngineerBond {
         }
         let mut bond = load_bond(&env, &engineer);
         if bond.dispute_open {
-            panic_with_error!(&env, ContractError::DisputeOpen);
+            let deadline = bond.dispute_opened_at.saturating_add(DISPUTE_TIMEOUT_SECS);
+            if env.ledger().timestamp() < deadline {
+                panic_with_error!(&env, ContractError::DisputeOpen);
+            }
+            bond.dispute_open = false;
+            bond.dispute_opened_at = 0;
+            record(&env, &engineer, EventKind::DisputeResolved, 0);
         }
         if amount > bond.staked {
             panic_with_error!(&env, ContractError::InsufficientBond);

@@ -1,12 +1,13 @@
 #![cfg(test)]
 
 use crate::{
-    DisputeOutcome, EngineerBond, EngineerBondClient, EventKind, MAX_HISTORY, RECOVERY_STREAK,
+    DisputeOutcome, EngineerBond, EngineerBondClient, EventKind, DISPUTE_TIMEOUT_SECS, MAX_HISTORY,
+    RECOVERY_STREAK,
 };
 use soroban_sdk::{
-    testutils::Address as _,
+    testutils::{Address as _, Ledger as _},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env,
+    Address, BytesN, Env, String,
 };
 
 struct Ctx<'a> {
@@ -48,6 +49,23 @@ fn funded_engineer(ctx: &Ctx, amount: i128) -> Address {
     let engineer = Address::generate(ctx.env);
     ctx.minter.mint(&engineer, &amount);
     engineer
+}
+
+fn test_reason(env: &Env) -> String {
+    String::from_str(env, "missed milestone")
+}
+
+fn test_evidence(env: &Env) -> BytesN<32> {
+    BytesN::from_array(env, &[7u8; 32])
+}
+
+fn open_test_dispute(ctx: &Ctx, eng: &Address) -> u32 {
+    ctx.client.open_dispute(
+        &ctx.admin,
+        eng,
+        &test_reason(ctx.env),
+        &test_evidence(ctx.env),
+    )
 }
 
 #[test]
@@ -140,7 +158,7 @@ fn dispute_blocks_withdrawal() {
     let ctx = setup(&env, 0);
     let eng = funded_engineer(&ctx, 1_000);
     ctx.client.post_bond(&eng, &500);
-    ctx.client.open_dispute(&ctx.admin, &eng);
+    open_test_dispute(&ctx, &eng);
     assert!(!ctx.client.is_bonded(&eng));
     ctx.client.withdraw_bond(&eng, &100);
 }
@@ -152,8 +170,8 @@ fn cannot_open_two_disputes() {
     let ctx = setup(&env, 0);
     let eng = funded_engineer(&ctx, 1_000);
     ctx.client.post_bond(&eng, &500);
-    ctx.client.open_dispute(&ctx.admin, &eng);
-    ctx.client.open_dispute(&ctx.admin, &eng);
+    open_test_dispute(&ctx, &eng);
+    open_test_dispute(&ctx, &eng);
 }
 
 #[test]
@@ -162,7 +180,7 @@ fn resolving_dispute_restores_bonded_status() {
     let ctx = setup(&env, 100);
     let eng = funded_engineer(&ctx, 1_000);
     ctx.client.post_bond(&eng, &500);
-    ctx.client.open_dispute(&ctx.admin, &eng);
+    open_test_dispute(&ctx, &eng);
     ctx.client
         .resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Dismissed);
     assert!(ctx.client.is_bonded(&eng));
@@ -239,16 +257,17 @@ fn upheld_dispute_records_outcome_and_links_slash() {
     let eng = funded_engineer(&ctx, 1_000);
     ctx.client.post_bond(&eng, &500);
 
-    let id = ctx.client.open_dispute(&ctx.admin, &eng);
+    let id = open_test_dispute(&ctx, &eng);
     assert_eq!(id, 1);
     let open = ctx.client.get_dispute(&eng, &id);
     assert_eq!(open.outcome, DisputeOutcome::Pending);
     assert_eq!(open.slashed_total, 0);
 
-    ctx.client.slash(&ctx.admin, &eng, &120, &Some(id));
-    ctx.client.slash(&ctx.admin, &eng, &30, &None);
+    // Slashing is refused while the dispute is open, so resolve it before slashing.
     ctx.client
         .resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Upheld);
+    ctx.client.slash(&ctx.admin, &eng, &120, &Some(id));
+    ctx.client.slash(&ctx.admin, &eng, &30, &None);
 
     let resolved = ctx.client.get_dispute(&eng, &id);
     assert_eq!(resolved.outcome, DisputeOutcome::Upheld);
@@ -265,7 +284,7 @@ fn dismissed_dispute_records_outcome_without_slash() {
     let eng = funded_engineer(&ctx, 1_000);
     ctx.client.post_bond(&eng, &500);
 
-    let id = ctx.client.open_dispute(&ctx.admin, &eng);
+    let id = open_test_dispute(&ctx, &eng);
     ctx.client
         .resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Dismissed);
 
@@ -283,10 +302,10 @@ fn each_dispute_gets_its_own_identifier_and_slash_link() {
     let eng = funded_engineer(&ctx, 1_000);
     ctx.client.post_bond(&eng, &500);
 
-    let first = ctx.client.open_dispute(&ctx.admin, &eng);
+    let first = open_test_dispute(&ctx, &eng);
     ctx.client
         .resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Dismissed);
-    let second = ctx.client.open_dispute(&ctx.admin, &eng);
+    let second = open_test_dispute(&ctx, &eng);
     ctx.client
         .resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Upheld);
     assert_eq!((first, second), (1, 2));
@@ -410,7 +429,7 @@ fn run_random_sequence(seed: u64, steps: u32) {
                 let _ = ctx.client.try_record_performance(&ctx.admin, eng, &good);
             }
             4 => {
-                let _ = ctx.client.try_open_dispute(&ctx.admin, eng);
+                let _ = ctx.client.try_open_dispute(&ctx.admin, eng, &String::from_str(&env, "random"), &BytesN::from_array(&env, &[1u8; 32]));
             }
             _ => {
                 let outcome = if rng.below(2) == 0 {
@@ -472,5 +491,159 @@ fn assert_accounting(
         total_held_by_engineers + total_staked + total_slashed,
         minted,
         "supply is conserved (seed {seed}, step {step})"
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn slash_is_blocked_while_dispute_is_open() {
+    let env = Env::default();
+    let ctx = setup(&env, 0);
+    let eng = funded_engineer(&ctx, 1_000);
+    ctx.client.post_bond(&eng, &500);
+    open_test_dispute(&ctx, &eng);
+    ctx.client.slash(&ctx.admin, &eng, &100, &None);
+}
+
+#[test]
+fn slash_succeeds_after_dispute_is_resolved() {
+    let env = Env::default();
+    let ctx = setup(&env, 0);
+    let eng = funded_engineer(&ctx, 1_000);
+    ctx.client.post_bond(&eng, &500);
+    open_test_dispute(&ctx, &eng);
+    ctx.client
+        .resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Dismissed);
+    ctx.client.slash(&ctx.admin, &eng, &100, &None);
+    assert_eq!(ctx.client.get_bond(&eng).staked, 400);
+    assert_eq!(ctx.token.balance(&ctx.treasury), 100);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #7)")]
+fn withdrawal_blocked_just_before_dispute_deadline() {
+    let env = Env::default();
+    let ctx = setup(&env, 0);
+    let eng = funded_engineer(&ctx, 1_000);
+    ctx.client.post_bond(&eng, &500);
+    env.ledger().set_timestamp(1_000);
+    open_test_dispute(&ctx, &eng);
+    env.ledger().set_timestamp(1_000 + DISPUTE_TIMEOUT_SECS - 1);
+    ctx.client.withdraw_bond(&eng, &100);
+}
+
+#[test]
+fn withdrawal_allowed_after_dispute_deadline() {
+    let env = Env::default();
+    let ctx = setup(&env, 0);
+    let eng = funded_engineer(&ctx, 1_000);
+    ctx.client.post_bond(&eng, &500);
+    env.ledger().set_timestamp(1_000);
+    open_test_dispute(&ctx, &eng);
+    env.ledger().set_timestamp(1_000 + DISPUTE_TIMEOUT_SECS);
+
+    ctx.client.withdraw_bond(&eng, &500);
+
+    let bond = ctx.client.get_bond(&eng);
+    assert_eq!(bond.staked, 0);
+    assert!(!bond.dispute_open);
+    assert_eq!(bond.dispute_opened_at, 0);
+    assert_eq!(ctx.token.balance(&eng), 1_000);
+}
+
+#[test]
+fn record_performance_rejects_engineer_without_bond() {
+    let env = Env::default();
+    let ctx = setup(&env, 0);
+    let eng = Address::generate(&env);
+    assert!(ctx
+        .client
+        .try_record_performance(&ctx.admin, &eng, &true)
+        .is_err());
+    let exists = env.as_contract(&ctx.contract_id, || {
+        env.storage()
+            .persistent()
+            .has(&crate::DataKey::Bond(eng.clone()))
+    });
+    assert!(!exists, "no bond record may be created");
+}
+
+#[test]
+fn open_dispute_rejects_engineer_without_bond() {
+    let env = Env::default();
+    let ctx = setup(&env, 0);
+    let eng = Address::generate(&env);
+    assert!(ctx
+        .client
+        .try_open_dispute(&ctx.admin, &eng, &test_reason(&env), &test_evidence(&env))
+        .is_err());
+    let exists = env.as_contract(&ctx.contract_id, || {
+        env.storage()
+            .persistent()
+            .has(&crate::DataKey::Bond(eng.clone()))
+    });
+    assert!(!exists, "no bond record may be created");
+}
+
+#[test]
+fn open_dispute_stores_reason_evidence_and_actor() {
+    let env = Env::default();
+    let ctx = setup(&env, 0);
+    let eng = funded_engineer(&ctx, 1_000);
+    ctx.client.post_bond(&eng, &500);
+    let reason = String::from_str(&env, "delivered wrong artifact");
+    let evidence = BytesN::from_array(&env, &[9u8; 32]);
+    let id = ctx
+        .client
+        .open_dispute(&ctx.admin, &eng, &reason, &evidence);
+
+    let record = ctx.client.get_dispute(&eng, &id);
+    assert_eq!(record.opened_by, ctx.admin);
+    assert_eq!(record.reason, reason);
+    assert_eq!(record.evidence_hash, evidence);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn get_dispute_unknown_id_is_rejected() {
+    let env = Env::default();
+    let ctx = setup(&env, 0);
+    let eng = funded_engineer(&ctx, 1_000);
+    ctx.client.post_bond(&eng, &500);
+    ctx.client.get_dispute(&eng, &1);
+}
+
+#[test]
+fn dispute_record_survives_resolution() {
+    let env = Env::default();
+    let ctx = setup(&env, 0);
+    let eng = funded_engineer(&ctx, 1_000);
+    ctx.client.post_bond(&eng, &500);
+    let reason = String::from_str(&env, "audit trail");
+    let evidence = BytesN::from_array(&env, &[3u8; 32]);
+    let id = ctx
+        .client
+        .open_dispute(&ctx.admin, &eng, &reason, &evidence);
+    ctx.client
+        .resolve_dispute(&ctx.admin, &eng, &DisputeOutcome::Upheld);
+
+    let record = ctx.client.get_dispute(&eng, &id);
+    assert_eq!(record.outcome, DisputeOutcome::Upheld);
+    assert_eq!(record.reason, reason);
+    assert_eq!(record.evidence_hash, evidence);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")]
+fn open_dispute_rejects_empty_reason() {
+    let env = Env::default();
+    let ctx = setup(&env, 0);
+    let eng = funded_engineer(&ctx, 1_000);
+    ctx.client.post_bond(&eng, &500);
+    ctx.client.open_dispute(
+        &ctx.admin,
+        &eng,
+        &String::from_str(&env, ""),
+        &test_evidence(&env),
     );
 }
