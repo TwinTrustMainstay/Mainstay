@@ -47,3 +47,12 @@ pub(crate) const EVENT_RECONSTR: Symbol = symbol_short!("RECONSTR");
 
 /// Emitted when a recurring task is approaching its due date.
 pub(crate) const EVENT_TASK_DUE_SOON: Symbol = symbol_short!("TASK_SOON");
+
+/// Emitted when an admin records a score anomaly via `record_score_anomaly`.
+pub(crate) const EVENT_ANOMALY: Symbol = symbol_short!("ANOMALY");
+
+/// Emitted when an anomaly's investigation status is changed via `update_anomaly_status`.
+pub(crate) const EVENT_ANOMALY_STS: Symbol = symbol_short!("ANOM_STS");
+
+/// Emitted when a peer group is registered or updated via `register_peer_group`.
+pub(crate) const EVENT_PEER_GROUP: Symbol = symbol_short!("PEER_GRP");
