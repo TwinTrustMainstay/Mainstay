@@ -3,7 +3,9 @@
 //! Incident tracking and postmortem register (issue #1734).
 //!
 //! Incidents move through a fixed lifecycle (`Open` → `Mitigated` → `Resolved` → `Closed`).
-//! Sev1 and Sev2 incidents cannot be closed until a root-cause postmortem is recorded.
+//! A `Resolved` incident can be reopened with a reason if a regression is found. It keeps its
+//! id and postmortem. Sev1 and Sev2 incidents cannot be closed until a root-cause postmortem
+//! is recorded.
 //! Each incident carries action items, which the owner marks complete to track lessons learned.
 
 #[cfg(test)]
@@ -78,6 +80,8 @@ pub struct Incident {
     pub resolved_at: u64,
     /// Root cause from the postmortem; empty until recorded.
     pub root_cause: String,
+    /// Number of times a resolved incident has been reopened.
+    pub reopen_count: u32,
 }
 
 #[contracttype]
@@ -166,6 +170,7 @@ impl IncidentManagement {
             opened_at: env.ledger().timestamp(),
             resolved_at: 0,
             root_cause: String::from_str(&env, ""),
+            reopen_count: 0,
         };
         save_incident(&env, &incident);
         env.storage().instance().set(&DataKey::NextId, &(id + 1));
@@ -207,6 +212,29 @@ impl IncidentManagement {
 
         env.events()
             .publish((symbol_short!("inc_stat"),), (id, status));
+    }
+
+    /// Reopens a `Resolved` incident after a regression. Admin only. A non-empty `reason`
+    /// is required. The incident keeps its id, its recorded postmortem and its history, so
+    /// the link to the original postmortem is not lost. `resolved_at` is cleared until the
+    /// incident is resolved again.
+    pub fn reopen_incident(env: Env, admin: Address, id: u64, reason: String) {
+        require_stored_admin(&env, &admin);
+        if reason.is_empty() {
+            panic_with_error!(&env, ContractError::EmptyField);
+        }
+        let mut incident = load_incident(&env, id);
+        if incident.status != Status::Resolved {
+            panic_with_error!(&env, ContractError::InvalidTransition);
+        }
+
+        incident.status = Status::Open;
+        incident.resolved_at = 0;
+        incident.reopen_count += 1;
+        save_incident(&env, &incident);
+
+        env.events()
+            .publish((symbol_short!("inc_reop"),), (id, incident.reopen_count));
     }
 
     /// Records the root cause for an incident. Admin only. The incident must be `Resolved`
