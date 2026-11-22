@@ -1,7 +1,7 @@
 use super::*;
 use soroban_sdk::{
-    symbol_short, testutils::Address as _, testutils::Events, testutils::Ledger, Address, Env,
-    IntoVal, String,
+    symbol_short, testutils::Address as _, testutils::Events as _, testutils::Ledger, Address, Env,
+    IntoVal, String, Symbol, TryFromVal,
 };
 
 const T0: u64 = 10_000;
@@ -13,6 +13,7 @@ fn config() -> GovernanceConfig {
         quorum_bps: 2_000,
         approval_threshold_bps: 5_000,
         min_proposal_shares: 10,
+        execution_delay_secs: 0,
     }
 }
 
@@ -201,6 +202,48 @@ fn invalid_proposals_are_rejected() {
             .try_create_proposal(&p, &title(&env), &ProposalKind::Funding(recipient, 0)),
         Err(Ok(contract_err(ContractError::InvalidProposal)))
     );
+}
+
+#[test]
+fn parameter_proposals_must_match_schema() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let p = holder(&ctx, 100);
+
+    // Unknown name is rejected at creation.
+    assert_eq!(
+        ctx.client.try_create_proposal(
+            &p,
+            &title(&env),
+            &ProposalKind::Parameter(symbol_short!("NOPE"), 1),
+        ),
+        Err(Ok(contract_err(ContractError::UnknownParameter)))
+    );
+    // Values outside the FEE_BPS bounds (0..=1_000) are rejected at creation.
+    assert_eq!(
+        ctx.client
+            .try_create_proposal(&p, &title(&env), &param_kind(1_001)),
+        Err(Ok(contract_err(ContractError::ParameterOutOfRange)))
+    );
+    // Boundary values are accepted.
+    ctx.client.create_proposal(&p, &title(&env), &param_kind(0));
+    ctx.client
+        .create_proposal(&p, &title(&env), &param_kind(1_000));
+    assert_eq!(ctx.client.get_proposal_count(), 2);
+}
+
+#[test]
+fn parameter_schema_bounds_are_looked_up_by_name() {
+    let env = Env::default();
+    assert_eq!(
+        param_bounds(&env, &symbol_short!("FEE_BPS")),
+        Some((0, 1_000))
+    );
+    assert_eq!(
+        param_bounds(&env, &symbol_short!("HEARTBEAT")),
+        Some((60, 86_400))
+    );
+    assert_eq!(param_bounds(&env, &symbol_short!("NOPE")), None);
 }
 
 #[test]
@@ -424,6 +467,158 @@ fn funding_grant_debits_treasury_and_checks_budget_at_execution() {
         Err(Ok(contract_err(ContractError::InsufficientBudget)))
     );
     assert_eq!(ctx.client.get_treasury_balance(), 200);
+}
+
+#[test]
+fn funding_execution_debits_treasury_ledger_and_emits_recipient() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    ctx.client.fund_treasury(&ctx.admin, &500);
+    let a = holder(&ctx, 100);
+    let recipient = Address::generate(&env);
+    let id = ctx.client.create_proposal(
+        &a,
+        &title(&env),
+        &ProposalKind::Funding(recipient.clone(), 120),
+    );
+    ctx.client.vote(&a, &id, &true);
+    at(&env, T0 + PERIOD);
+    assert_eq!(ctx.client.finalize_proposal(&id), ProposalStatus::Passed);
+
+    // Balances before execution: nothing has been debited yet.
+    assert_eq!(ctx.client.get_treasury_balance(), 500);
+    assert_eq!(ctx.client.get_shares(&recipient), 0);
+
+    ctx.client.execute_proposal(&id);
+
+    // The GOV_FUND event carries the recipient and amount for off-chain payout.
+    let fund_event = env
+        .events()
+        .all()
+        .iter()
+        .find(|(c, _, _)| *c == ctx.client.address);
+    let (_, topics, data) = fund_event.expect("GOV_FUND event emitted");
+    assert_eq!(topics.len(), 2);
+    assert_eq!(
+        Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap(),
+        symbol_short!("GOV_FUND")
+    );
+    assert_eq!(
+        u64::try_from_val(&env, &topics.get(1).unwrap()).unwrap(),
+        id
+    );
+    assert_eq!(
+        <(Address, u64)>::try_from_val(&env, &data).unwrap(),
+        (recipient.clone(), 120u64)
+    );
+
+    // Ledger is debited by exactly the grant amount.
+    assert_eq!(ctx.client.get_treasury_balance(), 380);
+    // Accounting-only: the recipient's voting shares are untouched.
+    assert_eq!(ctx.client.get_shares(&recipient), 0);
+    assert_eq!(ctx.client.get_total_shares(), 100);
+    // The grant is recorded in the proposal as executed.
+    assert_eq!(
+        ctx.client.get_proposal(&id).status,
+        ProposalStatus::Executed
+    );
+}
+
+#[test]
+fn execution_waits_for_delay_after_finalization() {
+    const DELAY: u64 = 500;
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = T0);
+    let admin = Address::generate(&env);
+    let id_contract = env.register(Governance, ());
+    let client = GovernanceClient::new(&env, &id_contract);
+    let mut cfg = config();
+    cfg.execution_delay_secs = DELAY;
+    client.initialize(&admin, &cfg);
+    let ctx = Ctx {
+        env: &env,
+        client,
+        admin,
+    };
+
+    let a = holder(&ctx, 100);
+    let id = ctx
+        .client
+        .create_proposal(&a, &title(&env), &param_kind(25));
+    ctx.client.vote(&a, &id, &true);
+    at(&env, T0 + PERIOD);
+    assert_eq!(ctx.client.finalize_proposal(&id), ProposalStatus::Passed);
+    assert_eq!(ctx.client.get_proposal(&id).finalized_at, T0 + PERIOD);
+
+    // Early execution is rejected and leaves the parameter untouched.
+    assert_eq!(
+        ctx.client.try_execute_proposal(&id),
+        Err(Ok(contract_err(ContractError::ExecutionDelayActive)))
+    );
+    at(&env, T0 + PERIOD + DELAY - 1);
+    assert_eq!(
+        ctx.client.try_execute_proposal(&id),
+        Err(Ok(contract_err(ContractError::ExecutionDelayActive)))
+    );
+    assert_eq!(ctx.client.get_parameter(&symbol_short!("FEE_BPS")), None);
+
+    // Once the delay has elapsed, execution succeeds.
+    at(&env, T0 + PERIOD + DELAY);
+    ctx.client.execute_proposal(&id);
+    assert_eq!(
+        ctx.client.get_parameter(&symbol_short!("FEE_BPS")),
+        Some(25)
+    );
+}
+
+#[test]
+fn config_proposal_updates_governance_settings() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let a = holder(&ctx, 100);
+    let mut next = config();
+    next.voting_period_secs = 2 * PERIOD;
+    next.quorum_bps = 5_000;
+    next.approval_threshold_bps = 6_000;
+    next.execution_delay_secs = 77;
+
+    let id = ctx
+        .client
+        .create_proposal(&a, &title(&env), &ProposalKind::Config(next.clone()));
+    ctx.client.vote(&a, &id, &true);
+    at(&env, T0 + PERIOD);
+    assert_eq!(ctx.client.finalize_proposal(&id), ProposalStatus::Passed);
+    ctx.client.execute_proposal(&id);
+
+    assert_eq!(ctx.client.get_config(), next);
+}
+
+#[test]
+fn config_proposal_rejects_invalid_settings() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let a = holder(&ctx, 100);
+
+    let mut zero_period = config();
+    zero_period.voting_period_secs = 0;
+    assert_eq!(
+        ctx.client
+            .try_create_proposal(&a, &title(&env), &ProposalKind::Config(zero_period)),
+        Err(Ok(contract_err(ContractError::InvalidConfig)))
+    );
+
+    let mut over_quorum = config();
+    over_quorum.quorum_bps = 10_001;
+    assert_eq!(
+        ctx.client
+            .try_create_proposal(&a, &title(&env), &ProposalKind::Config(over_quorum)),
+        Err(Ok(contract_err(ContractError::InvalidConfig)))
+    );
+
+    // Rejected proposals do not change the stored configuration.
+    assert_eq!(ctx.client.get_config(), config());
+    assert_eq!(ctx.client.get_proposal_count(), 0);
 }
 
 #[test]
