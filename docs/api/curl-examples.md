@@ -4377,10 +4377,13 @@ curl -X POST "${MAINSTAY_API_URL}/lifecycle/record_score_baseline" \
   -H "Content-Type: application/json" \
   -H "X-API-Key: ${MAINSTAY_API_KEY}" \
   -d '{
+    "caller": "<admin or authorized attestor address>",
     "asset_id": 1,
     "score": 1
   }'
 ```
+
+The caller must authenticate and be the admin or an attestor authorized for the asset.
 
 ### `get_score_providers`
 

@@ -344,12 +344,17 @@ impl MobileApi {
         let negotiated = api_version.min(CURRENT_API_VERSION);
         let key = DataKey::Client(client.clone());
         let info = ClientInfo {
-            address: client,
+            address: client.clone(),
             api_version: negotiated,
             registered_at: env.ledger().timestamp(),
         };
         env.storage().persistent().set(&key, &info);
         extend_persistent_ttl(&env, key);
+        // Audit trail: lets operators see when each client was onboarded.
+        env.events().publish(
+            (soroban_sdk::symbol_short!("CLI_REG"), client),
+            negotiated,
+        );
         Ok(negotiated)
     }
 
@@ -372,12 +377,23 @@ impl MobileApi {
         {
             return Err(ContractError::InvalidRateLimitConfig);
         }
+        let previous = rate_limit_config(&env);
         env.storage().instance().set(
             &DataKey::RateLimit,
             &RateLimitConfig {
                 max_requests,
                 window_secs,
             },
+        );
+        // Audit trail: reconstructs the limit history from events alone.
+        env.events().publish(
+            (soroban_sdk::symbol_short!("RATE_SET"),),
+            (
+                previous.max_requests,
+                previous.window_secs,
+                max_requests,
+                window_secs,
+            ),
         );
         Ok(())
     }
@@ -465,9 +481,13 @@ impl MobileApi {
         if topics.is_empty() || topics.len() > MAX_SUBSCRIPTION_TOPICS {
             return Err(ContractError::InvalidTopics);
         }
-        let key = DataKey::Subscription(client);
+        let key = DataKey::Subscription(client.clone());
         env.storage().persistent().set(&key, &topics);
         extend_persistent_ttl(&env, key);
+        env.events().publish(
+            (soroban_sdk::symbol_short!("SUB"), client),
+            topics,
+        );
         Ok(())
     }
 
@@ -476,7 +496,9 @@ impl MobileApi {
         require_registered(&env, &client)?;
         env.storage()
             .persistent()
-            .remove(&DataKey::Subscription(client));
+            .remove(&DataKey::Subscription(client.clone()));
+        env.events()
+            .publish((soroban_sdk::symbol_short!("UNSUB"), client), ());
         Ok(())
     }
 

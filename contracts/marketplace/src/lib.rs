@@ -157,6 +157,8 @@ enum DataKey {
     Commit(u64, Address),
     DisputeBondTerms,
     DisputeBond(u64),
+    /// Engineers who committed to a sealed auction, in commit order.
+    Committers(u64),
 }
 
 /// Minimal client for the engineer registry. Only the methods used here are declared.
@@ -172,6 +174,7 @@ pub trait EngineerRegistry {
 }
 
 const PRICE_UPDATE_TOPIC: Symbol = symbol_short!("PRC_UPD");
+const PRICING_CONFIG_TOPIC: Symbol = symbol_short!("PRC_CFG");
 const AUCTION_NEW_TOPIC: Symbol = symbol_short!("AUC_NEW");
 const BID_TOPIC: Symbol = symbol_short!("AUC_BID");
 const COMMIT_TOPIC: Symbol = symbol_short!("AUC_COMM");
@@ -244,20 +247,40 @@ fn store_bids(env: &Env, auction_id: u64, bids: &Vec<Bid>) {
         .extend_ttl(&key, shared::TTL_THRESHOLD, shared::TTL_TARGET);
 }
 
-/// Panics unless `engineer` holds a valid or grace-period credential.
-fn ensure_credentialed(env: &Env, engineer: &Address) {
+/// Whether `engineer` currently holds a valid or grace-period credential.
+fn is_credentialed(env: &Env, engineer: &Address) -> bool {
     let registry: Address = env
         .storage()
         .instance()
         .get(&DataKey::Registry)
         .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized));
     let status = EngineerRegistryClient::new(env, &registry).verify_engineer(engineer, &None);
-    if !matches!(
+    matches!(
         status,
         CredentialStatus::Valid | CredentialStatus::GracePeriod
-    ) {
+    )
+}
+
+/// Panics unless `engineer` holds a valid or grace-period credential.
+fn ensure_credentialed(env: &Env, engineer: &Address) {
+    if !is_credentialed(env, engineer) {
         panic_with_error!(env, ContractError::NotCredentialed);
     }
+}
+
+fn load_committers(env: &Env, auction_id: u64) -> Vec<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Committers(auction_id))
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+fn store_committers(env: &Env, auction_id: u64, committers: &Vec<Address>) {
+    let key = DataKey::Committers(auction_id);
+    env.storage().persistent().set(&key, committers);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, shared::TTL_THRESHOLD, shared::TTL_TARGET);
 }
 
 fn reputation_of(env: &Env, engineer: &Address) -> u32 {
@@ -325,6 +348,9 @@ impl Marketplace {
 
     /// Admin-only: replace the pricing configuration. Existing history is kept.
     ///
+    /// Publishes a `PRC_CFG` event whose data is `(old, new)` so off-chain price
+    /// consumers can detect the change.
+    ///
     /// # Panics
     /// - [`ContractError::UnauthorizedAdmin`] if `admin` is not the stored admin
     /// - [`ContractError::InvalidPricingConfig`] if `pricing` is inconsistent
@@ -333,7 +359,10 @@ impl Marketplace {
         if !pricing::is_valid_config(&pricing) {
             panic_with_error!(&env, ContractError::InvalidPricingConfig);
         }
+        let old = load_pricing(&env);
         env.storage().instance().set(&DataKey::Pricing, &pricing);
+        env.events()
+            .publish((PRICING_CONFIG_TOPIC,), (old, pricing));
     }
 
     /// Admin-only: record the current supply (available engineers) and demand
@@ -570,6 +599,9 @@ impl Marketplace {
         env.storage()
             .persistent()
             .extend_ttl(&key, shared::TTL_THRESHOLD, shared::TTL_TARGET);
+        let mut committers = load_committers(&env, auction_id);
+        committers.push_back(engineer.clone());
+        store_committers(&env, auction_id, &committers);
         env.events()
             .publish((COMMIT_TOPIC, auction_id), (engineer,));
     }
@@ -652,11 +684,46 @@ impl Marketplace {
             panic_with_error!(&env, ContractError::AuctionStillOpen);
         }
 
+        // Only bids whose engineer still holds a valid credential at finalization
+        // are eligible. A lapsed winner falls through to the next valid bidder.
+        let committers = load_committers(&env, auction_id);
         let bids = load_bids(&env, auction_id);
+        let mut eligible: Vec<Bid> = Vec::new(&env);
+        if committers.is_empty() {
+            // Open auction: bids are already in placement order.
+            for bid in bids.iter() {
+                if is_credentialed(&env, &bid.engineer) {
+                    eligible.push_back(bid);
+                }
+            }
+        } else {
+            // Sealed auction: bids are stored in reveal order. Walk the committers
+            // in commit order so that ties resolve to the earliest commitment.
+            for engineer in committers.iter() {
+                if let Some(idx) = auction::find_bid(&bids, &engineer) {
+                    let bid = bids.get(idx).unwrap();
+                    if is_credentialed(&env, &bid.engineer) {
+                        eligible.push_back(bid);
+                    }
+                }
+            }
+        }
         auction.finalized_at = now;
-        match select_winner(&bids, auction.criterion) {
+
+        // Unrevealed commitments are forfeited. Remove them and the committer
+        // index now so no sealed-bid state outlives the auction.
+        for engineer in committers.iter() {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Commit(auction_id, engineer));
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Committers(auction_id));
+
+        match select_winner(&eligible, auction.criterion) {
             Some(idx) => {
-                let bid = bids.get(idx).unwrap();
+                let bid = eligible.get(idx).unwrap();
                 auction.status = AuctionStatus::Awarded;
                 auction.winner = Some(bid.engineer.clone());
                 auction.winning_price = bid.price;

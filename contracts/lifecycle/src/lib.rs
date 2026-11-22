@@ -25,7 +25,8 @@ pub(crate) use storage::{
 pub(crate) use events::{
     EVENT_ADMIN_SET, EVENT_DECAY, EVENT_INIT, EVENT_MAINT, EVENT_PROP_ADMIN, EVENT_PRUNED,
     EVENT_REG_AST, EVENT_REG_ENG, EVENT_RST_SCR, EVENT_XFER, EVENT_WEIGHT_PROP, EVENT_WEIGHT_EXEC,
-    EVENT_RECONSTR, EVENT_TASK_DUE_SOON,
+    EVENT_RECONSTR, EVENT_TASK_DUE_SOON, EVENT_MNT_SIG, EVENT_PROV_REG, EVENT_PROV_RM,
+    EVENT_EXT_SCR, EVENT_DEG_CRV,
 };
 
 use crate::errors::ContractError;
@@ -583,6 +584,26 @@ pub(crate) fn require_admin(env: &Env, admin: &Address) {
         .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized));
     if config.admin != *admin {
         panic_with_error!(env, ContractError::UnauthorizedAdmin);
+    }
+}
+
+/// Allows the configured admin, or an attestor authorized for `asset_id`.
+pub(crate) fn require_admin_or_attestor(env: &Env, asset_id: u64, caller: &Address) {
+    let config: Config = env
+        .storage()
+        .persistent()
+        .get(&CONFIG)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized));
+    if config.admin == *caller {
+        return;
+    }
+    let authorized = env
+        .storage()
+        .persistent()
+        .get::<_, bool>(&attestor_auth_key(asset_id, caller))
+        .unwrap_or(false);
+    if !authorized {
+        panic_with_error!(env, ContractError::UnauthorizedAttestor);
     }
 }
 
@@ -1178,6 +1199,8 @@ impl Lifecycle {
             let key = attestor_auth_key(asset_id, &attestor);
             env.storage().persistent().set(&key, &true);
             extend_persistent_ttl(&env, &key);
+            env.events()
+                .publish((symbol_short!("ATTST_ON"), asset_id), attestor);
         }
 
         /// Record an attestation from an owner-authorized independent party.
@@ -1277,12 +1300,16 @@ impl Lifecycle {
             signatures.push_back(MaintenanceSignature {
                 asset_id,
                 record_timestamp,
-                signer,
+                signer: signer.clone(),
                 public_key,
                 signature,
             });
             env.storage().persistent().set(&key, &signatures);
             extend_persistent_ttl(&env, &key);
+            env.events().publish(
+                (EVENT_MNT_SIG,),
+                (asset_id, record_timestamp, signer),
+            );
         }
 
         /// Returns whether a valid stored signature exists for a record.
@@ -3185,18 +3212,29 @@ impl Lifecycle {
     }
 
     /// Issue #1319: Dispute a maintenance record for an asset.
-    /// The asset owner can challenge the authenticity of a maintenance record signed by an engineer.
+    /// The asset owner or an authorized attestor can challenge the authenticity of a
+    /// maintenance record signed by an engineer. Unregistered callers are rejected.
     ///
     /// # Arguments
+    /// * `caller` - The party filing the dispute; must authenticate and be the asset
+    ///   owner or an attestor authorized for this asset
     /// * `asset_id` - The unique identifier of the asset
     /// * `maintenance_timestamp` - Timestamp of the disputed record
     /// * `reason` - Dispute reason (e.g., "No service was actually performed")
     ///
     /// # Panics
     /// - [`ContractError::AssetNotFound`] if asset doesn't exist
+    /// - [`ContractError::UnauthorizedAttestor`] if `caller` is neither the owner nor an authorized attestor
     /// - [`ContractError::MaintenanceRecordNotFound`] if record doesn't exist
-    pub fn dispute_record(env: Env, asset_id: u64, maintenance_timestamp: u64, reason: String) {
+    pub fn dispute_record(
+        env: Env,
+        caller: Address,
+        asset_id: u64,
+        maintenance_timestamp: u64,
+        reason: String,
+    ) {
         ensure_not_paused(&env);
+        caller.require_auth();
 
         // Verify asset exists (get current owner)
         let asset_registry: Address = env
@@ -3205,7 +3243,17 @@ impl Lifecycle {
             .get(&registry_key())
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
         let asset_registry_client = asset_registry::AssetRegistryClient::new(&env, &asset_registry);
-        let _asset = asset_registry_client.get_asset(&asset_id);
+        let asset = asset_registry_client.get_asset(&asset_id);
+
+        // Only registered parties (owner or authorized attestor) may dispute.
+        let is_attestor = env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&attestor_auth_key(asset_id, &caller))
+            .unwrap_or(false);
+        if asset.owner != caller && !is_attestor {
+            panic_with_error!(&env, ContractError::UnauthorizedAttestor);
+        }
 
         // Verify the maintenance record exists
         let history: Vec<MaintenanceRecord> = env
@@ -6867,19 +6915,27 @@ impl Lifecycle {
 
     /// Capture a point-in-time health snapshot for an asset.
     ///
-    /// Anyone may call this. The snapshot persists independently of maintenance
-    /// history so lenders can verify condition even after TTL-driven pruning.
+    /// Only the asset owner may call this. The snapshot persists independently of
+    /// maintenance history so lenders can verify condition even after TTL-driven pruning.
     ///
     /// # Arguments
+    /// * `caller` - Must authenticate and be the current owner of the asset
     /// * `asset_id` - The asset to snapshot
     ///
     /// # Panics
     /// - [`ContractError::NotInitialized`] if contract has not been initialized
     /// - [`ContractError::AssetNotFound`] if the asset does not exist
+    /// - [`ContractError::UnauthorizedOwner`] if `caller` is not the asset owner
     /// - [`ContractError::AssetDecommissioned`] if the asset has been decommissioned
-    pub fn take_health_snapshot(env: Env, asset_id: u64) -> HealthSnapshot {
+    pub fn take_health_snapshot(env: Env, caller: Address, asset_id: u64) -> HealthSnapshot {
+        caller.require_auth();
         let asset_registry = get_asset_registry_addr(&env);
         verify_asset_exists(&env, &asset_registry, &asset_id);
+        let owner_check = asset_registry::AssetRegistryClient::new(&env, &asset_registry)
+            .get_asset(&asset_id);
+        if owner_check.owner != caller {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
 
         // Reject snapshots for decommissioned assets: a decommissioned asset's
         // health data is no longer current and must not appear as a valid health
@@ -6957,6 +7013,12 @@ impl Lifecycle {
 
         env.storage().persistent().set(&key, &snapshots);
         extend_persistent_ttl(&env, &key);
+
+        // Publish so off-chain indexers can react without polling storage.
+        env.events().publish(
+            (symbol_short!("HLTH_SNP"), asset_id),
+            snapshot.snapshot_timestamp,
+        );
 
         snapshot
     }
@@ -7779,6 +7841,7 @@ impl Lifecycle {
         providers.push_back(provider.clone());
         env.storage().persistent().set(&providers_key, &providers);
         shared::extend_persistent_ttl(&env, &providers_key);
+        env.events().publish((EVENT_PROV_REG,), (provider,));
     }
 
     /// Remove a score provider from the registry.
@@ -7801,15 +7864,21 @@ impl Lifecycle {
             .unwrap_or_else(|| Vec::new(&env));
 
         let mut new_providers: Vec<Address> = Vec::new(&env);
+        let mut removed = false;
         for p in 0..providers.len() {
             let addr = providers.get(p).unwrap();
             if addr != provider {
                 new_providers.push_back(addr);
+            } else {
+                removed = true;
             }
         }
 
         env.storage().persistent().set(&providers_key, &new_providers);
         shared::extend_persistent_ttl(&env, &providers_key);
+        if removed {
+            env.events().publish((EVENT_PROV_RM,), (provider,));
+        }
     }
 
     /// Submit an external score from a provider for consensus scoring.
@@ -7870,6 +7939,8 @@ impl Lifecycle {
         scores.push_back(entry);
         env.storage().persistent().set(&ext_scores_key, &scores);
         shared::extend_persistent_ttl(&env, &ext_scores_key);
+        env.events()
+            .publish((EVENT_EXT_SCR,), (asset_id, provider, score));
     }
 
     /// Get consensus score using median of external provider scores.
@@ -8004,6 +8075,7 @@ impl Lifecycle {
         let curve_key = degradation_curve_key(&category);
         env.storage().persistent().set(&curve_key, &curve);
         shared::extend_persistent_ttl(&env, &curve_key);
+        env.events().publish((EVENT_DEG_CRV,), (category, version));
     }
 
     /// Get degradation curve for an asset category.
@@ -8350,7 +8422,13 @@ impl Lifecycle {
     }
 
     /// Record baseline score for anomaly detection.
-    pub fn record_score_baseline(env: Env, asset_id: u64, score: u32) {
+    ///
+    /// Restricted to the admin or an attestor the asset owner authorized for
+    /// this asset. Anomaly detection compares new scores against this history,
+    /// so an unauthenticated writer could otherwise seed the baseline.
+    pub fn record_score_baseline(env: Env, caller: Address, asset_id: u64, score: u32) {
+        caller.require_auth();
+        require_admin_or_attestor(&env, asset_id, &caller);
         let baseline_key = score_baseline_key(asset_id);
         let mut baseline_scores: Vec<u64> = env
             .storage()
@@ -9100,6 +9178,15 @@ mod tests {
     mod lifecycle_score_tests;
     mod maintenance_fuzz_tests;
     mod maintenance_ttl_tests;
+    mod dispute_auth_tests;
+    mod snapshot_auth_tests;
+    mod snapshot_event_tests;
+    mod attestor_event_tests;
+    mod maintenance_signature_event_tests;
+    mod score_provider_event_tests;
+    mod external_score_event_tests;
+    mod degradation_curve_event_tests;
+    mod score_baseline_auth_tests;
 
     fn setup<'a>(
         env: &'a Env,
@@ -11183,14 +11270,14 @@ mod tests {
                 &None,
             );
         }
-        let score_before = client.take_health_snapshot(&asset_id).score;
+        let score_before = client.take_health_snapshot(&asset_owner, &asset_id).score;
         assert_eq!(score_before, 50);
 
         // Shrink max_history and prune — most of the scoring history is dropped.
         client.update_max_history(&admin, &2);
         client.prune_asset_history(&admin, &asset_id);
 
-        let score_after = client.take_health_snapshot(&asset_id).score;
+        let score_after = client.take_health_snapshot(&asset_owner, &asset_id).score;
         assert!(
             score_after < score_before,
             "collateral score must be recalculated immediately after pruning, got {} (was {})",
@@ -17613,9 +17700,9 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, _, _) = setup(&env, 0);
-        let (asset_id, _) = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
 
-        let snapshot = client.take_health_snapshot(&asset_id);
+        let snapshot = client.take_health_snapshot(&asset_owner, &asset_id);
 
         assert_eq!(snapshot.score, 0);
         assert_eq!(snapshot.maintenance_count, 0);
@@ -17663,7 +17750,7 @@ mod tests {
             &engineer,
             &None,
         );
-        client.take_health_snapshot(&asset_id);
+        client.take_health_snapshot(&asset_owner, &asset_id);
 
         env.ledger().with_mut(|li| li.timestamp += 1000);
 
@@ -17675,7 +17762,7 @@ mod tests {
             &engineer,
             &None,
         );
-        client.take_health_snapshot(&asset_id);
+        client.take_health_snapshot(&asset_owner, &asset_id);
 
         let snapshots = client.get_health_snapshots(&asset_id);
         assert_eq!(snapshots.len(), 2, "should have one snapshot per take_health_snapshot call");
@@ -17697,7 +17784,7 @@ mod tests {
         env.mock_all_auths();
 
         let (client, asset_registry_client, _, admin) = setup(&env, 0);
-        let (asset_id, _) = register_asset(&env, &asset_registry_client);
+        let (asset_id, asset_owner) = register_asset(&env, &asset_registry_client);
 
         // Tighten the cap to 3 so the test doesn't need 500+ iterations.
         client.update_max_snapshots(&admin, &3);
@@ -17705,7 +17792,7 @@ mod tests {
         // Take 5 snapshots at distinct timestamps.
         let mut timestamps = Vec::new(&env);
         for _ in 0..5u32 {
-            let snap = client.take_health_snapshot(&asset_id);
+            let snap = client.take_health_snapshot(&asset_owner, &asset_id);
             timestamps.push_back(snap.snapshot_timestamp);
             env.ledger().with_mut(|li| li.timestamp += 10);
         }
@@ -17758,7 +17845,7 @@ mod tests {
         let engineer = register_engineer(&env, &engineer_registry_client);
         client.authorize_engineer(&asset_owner, &asset_id, &engineer);
 
-        client.take_health_snapshot(&asset_id);
+        client.take_health_snapshot(&asset_owner, &asset_id);
 
         env.ledger().with_mut(|li| li.timestamp += 1000);
         client.submit_maintenance(
@@ -17769,7 +17856,7 @@ mod tests {
             &engineer,
             &None,
         );
-        client.take_health_snapshot(&asset_id);
+        client.take_health_snapshot(&asset_owner, &asset_id);
 
         let snapshots = client.get_health_snapshots(&asset_id);
         assert!(snapshots.len() >= 1);
@@ -17902,7 +17989,7 @@ mod tests {
             &engineer,
             &None,
         );
-        client.take_health_snapshot(&asset_id);
+        client.take_health_snapshot(&asset_owner, &asset_id);
 
         env.ledger().with_mut(|li| li.timestamp += 1000);
 
@@ -17914,7 +18001,7 @@ mod tests {
             &engineer,
             &None,
         );
-        client.take_health_snapshot(&asset_id);
+        client.take_health_snapshot(&asset_owner, &asset_id);
 
         let snapshots = client.get_health_snapshots(&asset_id);
         assert!(snapshots.len() >= 2, "should accumulate snapshots");
@@ -17944,7 +18031,7 @@ mod tests {
 
         let (client, _, _, _) = setup(&env, 0);
 
-        let result = client.try_take_health_snapshot(&999u64);
+        let result = client.try_take_health_snapshot(&Address::generate(&env), &999u64);
         assert!(result.is_err(), "should error for unknown asset");
     }
 
@@ -19209,7 +19296,7 @@ mod tests {
         );
 
         // Take a health snapshot
-        let snapshot = lifecycle.take_health_snapshot(&asset_id);
+        let snapshot = lifecycle.take_health_snapshot(&owner, &asset_id);
         assert!(!snapshot.reconstructed);
 
         // Anchor the snapshot
@@ -19262,7 +19349,7 @@ mod tests {
             &engineer,
             &None,
         );
-        lifecycle.take_health_snapshot(&asset_id);
+        lifecycle.take_health_snapshot(&owner, &asset_id);
 
         // Index 1 doesn't exist (only index 0)
         lifecycle.anchor_history_to_snapshot(&admin, &asset_id, &1);

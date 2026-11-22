@@ -12,11 +12,13 @@ mod test;
 
 use shared::{extend_persistent_ttl, require_admin};
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
-    Address, Env, String, Vec,
+    contract, contracterror, contractclient, contractimpl, contracttype, panic_with_error,
+    symbol_short, token, Address, Env, String, Vec,
 };
 
 /// Maximum trading history entries kept per NFT. Oldest entries are dropped first.
+/// Each dropped entry is announced with an `nft_trunc` event carrying `(token_id, trade)`,
+/// so provenance beyond this limit is still recoverable from the event log (issue #1971).
 pub const MAX_HISTORY: u32 = 100;
 
 #[contracterror]
@@ -43,6 +45,23 @@ pub enum ContractError {
     NotListed = 9,
     /// The owner cannot buy their own NFT.
     CannotBuyOwnToken = 10,
+    /// An NFT cannot be transferred to its current owner.
+    SelfTransfer = 11,
+    /// Royalty must be between 0 and 10,000 basis points.
+    InvalidRoyalty = 12,
+    /// The contract is paused; state-changing calls are rejected (issue #1973).
+    Paused = 13,
+    /// The NFT's asset is pledged as collateral under a lien in the asset registry (issue #1972).
+    AssetLocked = 14,
+}
+
+/// The slice of the asset registry this contract depends on.
+///
+/// Each NFT represents exactly one registry asset (`AssetToken::asset_id`), so the lien check
+/// queries the registry by that id before the NFT is listed, sold or transferred (issue #1972).
+#[contractclient(name = "AssetRegistryClient")]
+pub trait AssetRegistryInterface {
+    fn is_asset_locked(env: Env, asset_id: u64) -> bool;
 }
 
 #[contracttype]
@@ -97,6 +116,12 @@ pub enum DataKey {
     TokenByAsset(u64),
     Listing(u64),
     History(u64),
+    Paused,
+    AssetRegistry,
+    /// Original minter of a token, paid royalties on resales.
+    Creator(u64),
+    /// Royalty on resales, in basis points. Stored in instance storage.
+    RoyaltyBps,
 }
 
 #[contract]
@@ -112,6 +137,29 @@ fn stored_admin(env: &Env) -> Address {
 fn require_stored_admin(env: &Env, admin: &Address) {
     if require_admin(admin, &stored_admin(env)).is_err() {
         panic_with_error!(env, ContractError::UnauthorizedAdmin);
+    }
+}
+
+fn ensure_not_paused(env: &Env) {
+    let paused: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false);
+    if paused {
+        panic_with_error!(env, ContractError::Paused);
+    }
+}
+
+/// Rejects a sale or transfer when the registry reports a lien on the asset (issue #1972).
+fn ensure_asset_unlocked(env: &Env, asset_id: u64) {
+    let registry: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::AssetRegistry)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized));
+    if AssetRegistryClient::new(env, &registry).is_asset_locked(&asset_id) {
+        panic_with_error!(env, ContractError::AssetLocked);
     }
 }
 
@@ -136,7 +184,11 @@ fn record_trade(env: &Env, token_id: u64, trade: Trade) {
         .get(&key)
         .unwrap_or_else(|| Vec::new(env));
     if history.len() >= MAX_HISTORY {
+        // Emit the dropped entry so off-chain indexers keep full provenance (issue #1971).
+        let dropped = history.get(0).unwrap();
         history.remove(0);
+        env.events()
+            .publish((symbol_short!("nft_trunc"),), (token_id, dropped));
     }
     history.push_back(trade);
     env.storage().persistent().set(&key, &history);
@@ -152,8 +204,9 @@ fn move_token(env: &Env, token: &mut AssetToken, to: &Address) {
 
 #[contractimpl]
 impl AssetNft {
-    /// Sets the admin (asset registry bridge) and the token used for NFT sales.
-    pub fn initialize(env: Env, admin: Address, payment_token: Address) {
+    /// Sets the admin (asset registry bridge), the token used for NFT sales, and the asset
+    /// registry whose lien status gates listings, sales and transfers.
+    pub fn initialize(env: Env, admin: Address, payment_token: Address, asset_registry: Address) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, ContractError::AlreadyInitialized);
         }
@@ -161,11 +214,50 @@ impl AssetNft {
         env.storage()
             .instance()
             .set(&DataKey::PaymentToken, &payment_token);
+        env.storage()
+            .instance()
+            .set(&DataKey::AssetRegistry, &asset_registry);
         env.storage().instance().set(&DataKey::NextId, &1u64);
+    }
+
+    /// Pauses all state-changing calls: mint, transfer, metadata sync, listing, cancelling
+    /// and buying. Admin only (issue #1973).
+    pub fn pause(env: Env, admin: Address) {
+        require_stored_admin(&env, &admin);
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events()
+            .publish((symbol_short!("nft_pause"),), (admin,));
+    }
+
+    /// Lifts a pause set by [`AssetNft::pause`]. Admin only.
+    pub fn unpause(env: Env, admin: Address) {
+        require_stored_admin(&env, &admin);
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events()
+            .publish((symbol_short!("nft_unpse"),), (admin,));
+    }
+
+    /// Returns whether state-changing calls are currently blocked.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    /// Sets the creator royalty charged on resales, in basis points (10,000 = 100%).
+    /// Admin only. Zero disables royalties.
+    pub fn set_royalty_bps(env: Env, admin: Address, bps: u32) {
+        require_stored_admin(&env, &admin);
+        if bps > 10_000 {
+            panic_with_error!(&env, ContractError::InvalidRoyalty);
+        }
+        env.storage().instance().set(&DataKey::RoyaltyBps, &bps);
     }
 
     /// Mints the NFT for an asset to `owner`. Admin only. One NFT per asset. Returns the token id.
     pub fn mint(env: Env, admin: Address, asset_id: u64, owner: Address, uri: String) -> u64 {
+        ensure_not_paused(&env);
         require_stored_admin(&env, &admin);
         if env
             .storage()
@@ -187,6 +279,10 @@ impl AssetNft {
             synced_at: now,
         };
         save_token(&env, &token);
+
+        let creator_key = DataKey::Creator(id);
+        env.storage().persistent().set(&creator_key, &owner);
+        extend_persistent_ttl(&env, creator_key);
 
         let asset_key = DataKey::TokenByAsset(asset_id);
         env.storage().persistent().set(&asset_key, &id);
@@ -211,14 +307,19 @@ impl AssetNft {
 
     /// Transfers the NFT and the asset it represents. Fails while the NFT is listed.
     pub fn transfer(env: Env, from: Address, to: Address, token_id: u64) {
+        ensure_not_paused(&env);
         from.require_auth();
         let mut token = load_token(&env, token_id);
         if token.owner != from {
             panic_with_error!(&env, ContractError::NotTokenOwner);
         }
+        if from == to {
+            panic_with_error!(&env, ContractError::SelfTransfer);
+        }
         if env.storage().persistent().has(&DataKey::Listing(token_id)) {
             panic_with_error!(&env, ContractError::TokenListed);
         }
+        ensure_asset_unlocked(&env, token.asset_id);
 
         move_token(&env, &mut token, &to);
         record_trade(
@@ -245,6 +346,7 @@ impl AssetNft {
         collateral_score: u32,
         maintenance_count: u32,
     ) {
+        ensure_not_paused(&env);
         require_stored_admin(&env, &admin);
         let mut token = load_token(&env, token_id);
         token.uri = uri;
@@ -259,6 +361,7 @@ impl AssetNft {
 
     /// Lists an NFT for sale at `price` payment-token units. Owner only.
     pub fn list_for_sale(env: Env, owner: Address, token_id: u64, price: i128) {
+        ensure_not_paused(&env);
         owner.require_auth();
         if price <= 0 {
             panic_with_error!(&env, ContractError::InvalidPrice);
@@ -267,21 +370,25 @@ impl AssetNft {
         if token.owner != owner {
             panic_with_error!(&env, ContractError::NotTokenOwner);
         }
+        ensure_asset_unlocked(&env, token.asset_id);
 
         let key = DataKey::Listing(token_id);
         env.storage().persistent().set(
             &key,
             &Listing {
                 token_id,
-                seller: owner,
+                seller: owner.clone(),
                 price,
             },
         );
         extend_persistent_ttl(&env, key);
+        env.events()
+            .publish((symbol_short!("nft_list"),), (token_id, owner, price));
     }
 
     /// Removes an active listing. Owner only.
     pub fn cancel_listing(env: Env, owner: Address, token_id: u64) {
+        ensure_not_paused(&env);
         owner.require_auth();
         let listing = Self::get_listing(env.clone(), token_id)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotListed));
@@ -291,28 +398,60 @@ impl AssetNft {
         env.storage()
             .persistent()
             .remove(&DataKey::Listing(token_id));
+        env.events()
+            .publish((symbol_short!("nft_unlst"),), (token_id, owner));
     }
 
-    /// Buys a listed NFT. The price is paid to the seller and ownership transfers to the buyer.
+    /// Buys a listed NFT. The seller receives the price less any creator royalty, which goes
+    /// to the original minter. Ownership transfers to the buyer.
     pub fn buy(env: Env, buyer: Address, token_id: u64) {
+        ensure_not_paused(&env);
         buyer.require_auth();
         let listing = Self::get_listing(env.clone(), token_id)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotListed));
         if listing.seller == buyer {
             panic_with_error!(&env, ContractError::CannotBuyOwnToken);
         }
+        let mut token = load_token(&env, token_id);
+        // A lien may be placed after listing, so re-check at sale time.
+        ensure_asset_unlocked(&env, token.asset_id);
 
         let payment: Address = env
             .storage()
             .instance()
             .get(&DataKey::PaymentToken)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
-        token::Client::new(&env, &payment).transfer(&buyer, &listing.seller, &listing.price);
+        let token_client = token::Client::new(&env, &payment);
+        let royalty_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RoyaltyBps)
+            .unwrap_or(0);
+        let creator: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Creator(token_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::TokenNotFound));
+        // The creator only earns a royalty on resales; a creator selling their own NFT is paid in full.
+        let royalty = if creator != listing.seller && royalty_bps > 0 {
+            listing
+                .price
+                .checked_mul(royalty_bps as i128)
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::InvalidPrice))
+                / 10_000
+        } else {
+            0
+        };
+        if royalty > 0 {
+            token_client.transfer(&buyer, &creator, &royalty);
+        }
+        if listing.price - royalty > 0 {
+            token_client.transfer(&buyer, &listing.seller, &(listing.price - royalty));
+        }
 
         env.storage()
             .persistent()
             .remove(&DataKey::Listing(token_id));
-        let mut token = load_token(&env, token_id);
         move_token(&env, &mut token, &buyer);
 
         let now = env.ledger().timestamp();
