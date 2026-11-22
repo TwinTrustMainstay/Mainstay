@@ -53,7 +53,7 @@ use shared::{TTL_THRESHOLD, TTL_TARGET};
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::xdr::FromXdr;
 use soroban_sdk::{
-    contract, contractimpl, panic_with_error, symbol_short, Address, Bytes, BytesN, Env, Map,
+    contract, contractimpl, panic_with_error, symbol_short, token, Address, Bytes, BytesN, Env, Map,
     String, Symbol, Vec,
 };
 
@@ -65,6 +65,7 @@ const CONFIG: Symbol = symbol_short!("CONFIG");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 const PENDING_ADMIN_KEY: Symbol = symbol_short!("PADMIN");
 const TREASURY_ADDR_KEY: Symbol = symbol_short!("TREASURY");
+const FEE_TOKEN_KEY: Symbol = symbol_short!("FEE_TOK");
 /// Temporary-storage key for the reentrancy lock used in `submit_maintenance`.
 ///
 /// Stored in *temporary* storage so that it is **automatically discarded** at
@@ -231,7 +232,7 @@ pub(crate) fn next_chain_link(env: &Env, history: &Vec<MaintenanceRecord>) -> Op
     if history.is_empty() {
         None
     } else {
-        let last = history.get(history.len() - 1).unwrap();
+        let last = history.get(history.len() - 1).unwrap_or_else(|| panic_with_error!(env, ContractError::IndexOutOfBounds));
         Some(hash_maintenance_record(env, &last))
     }
 
@@ -251,10 +252,10 @@ pub(crate) fn next_chain_link(env: &Env, history: &Vec<MaintenanceRecord>) -> Op
         let mut output = Bytes::new(env);
         let mut i = 0u32;
         while i < input.len() {
-            let value = input.get(i).unwrap();
+            let value = input.get(i).unwrap_or_else(|| panic_with_error!(env, ContractError::IndexOutOfBounds));
             let mut count = 1u32;
             while i + count < input.len()
-                && input.get(i + count).unwrap() == value
+                && input.get(i + count).unwrap_or_else(|| panic_with_error!(env, ContractError::IndexOutOfBounds)) == value
                 && count < u8::MAX as u32
             {
                 count += 1;
@@ -273,11 +274,11 @@ pub(crate) fn next_chain_link(env: &Env, history: &Vec<MaintenanceRecord>) -> Op
         let mut output = Bytes::new(env);
         let mut i = 0u32;
         while i < input.len() {
-            let count = input.get(i).unwrap();
+            let count = input.get(i).unwrap_or_else(|| panic_with_error!(env, ContractError::IndexOutOfBounds));
             if count == 0 {
                 return None;
             }
-            let value = input.get(i + 1).unwrap();
+            let value = input.get(i + 1).unwrap_or_else(|| panic_with_error!(env, ContractError::IndexOutOfBounds));
             for _ in 0..count {
                 output.push_back(value);
             }
@@ -471,6 +472,15 @@ pub(crate) fn set_treasury_addr(env: &Env, addr: &Address) {
     extend_persistent_ttl(&env, &TREASURY_ADDR_KEY);
 }
 
+pub(crate) fn get_fee_token_addr(env: &Env) -> Option<Address> {
+    env.storage().persistent().get(&FEE_TOKEN_KEY)
+}
+
+pub(crate) fn set_fee_token_addr(env: &Env, addr: &Address) {
+    env.storage().persistent().set(&FEE_TOKEN_KEY, addr);
+    extend_persistent_ttl(env, &FEE_TOKEN_KEY);
+}
+
 /// Calculate the fee for a maintenance submission based on priority level (#1313)
 pub(crate) fn get_fee_for_priority(priority: Priority) -> u64 {
     match priority {
@@ -560,7 +570,7 @@ fn advance_recurring_tasks_on_submission(
 
     let mut changed = false;
     for i in 0..tasks.len() {
-        let mut task = tasks.get(i).unwrap();
+        let mut task = tasks.get(i).unwrap_or_else(|| panic_with_error!(env, ContractError::IndexOutOfBounds));
         if task.is_active && task.task_type == *task_type {
             task.next_due = timestamp.saturating_add(task.interval_value);
             tasks.set(i, task);
@@ -607,7 +617,7 @@ pub(crate) fn json_number(bytes: &Bytes, key: &[u8]) -> Option<u32> {
         let mut matched = true;
         let mut j: u32 = 0;
         while j < key.len() as u32 {
-            if bytes.get(i + j).unwrap() != key[j as usize] {
+            if bytes.get(i + j).unwrap_or(0) != key[j as usize] {
                 matched = false;
                 break;
             }
@@ -617,7 +627,7 @@ pub(crate) fn json_number(bytes: &Bytes, key: &[u8]) -> Option<u32> {
         if matched {
             let mut k = i + key.len() as u32;
             while k < len {
-                let ch = bytes.get(k).unwrap();
+                let ch = bytes.get(k).unwrap_or(0);
                 if ch == b':' {
                     k += 1;
                     break;
@@ -625,7 +635,7 @@ pub(crate) fn json_number(bytes: &Bytes, key: &[u8]) -> Option<u32> {
                 k += 1;
             }
             while k < len {
-                let ch = bytes.get(k).unwrap();
+                let ch = bytes.get(k).unwrap_or(0);
                 if ch.is_ascii_digit() {
                     break;
                 }
@@ -638,7 +648,7 @@ pub(crate) fn json_number(bytes: &Bytes, key: &[u8]) -> Option<u32> {
             let mut value: u32 = 0;
             let mut found_digit = false;
             while k < len {
-                let ch = bytes.get(k).unwrap();
+                let ch = bytes.get(k).unwrap_or(0);
                 if !ch.is_ascii_digit() {
                     break;
                 }
@@ -6288,7 +6298,13 @@ impl Lifecycle {
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
     pub fn set_treasury_address(env: Env, admin: Address, treasury_addr: Address) {
         ensure_not_paused(&env);
-        require_admin(&env, &admin);
+        admin.require_auth();
+        let config: Config = env
+            .storage()
+            .persistent()
+            .get(&CONFIG)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        require_quorum(&env, &config, &admin);
         set_treasury_addr(&env, &treasury_addr);
         env.events().publish(
             (symbol_short!("ADM_AUD"), symbol_short!("TREAS")),
@@ -6302,6 +6318,33 @@ impl Lifecycle {
     /// The treasury address if set, None otherwise
     pub fn get_treasury_address(env: Env) -> Option<Address> {
         get_treasury_addr(&env)
+    }
+
+    /// Admin-only: Set the fee token contract address used to transfer fees to the treasury (#2004).
+    ///
+    /// # Arguments
+    /// * `admin`      - The admin address that must match the stored config admin
+    /// * `token_addr` - The address of the token contract used for fee payments
+    ///
+    /// # Panics
+    /// - [`ContractError::NotInitialized`] if contract has not been initialized
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    pub fn set_fee_token_address(env: Env, admin: Address, token_addr: Address) {
+        ensure_not_paused(&env);
+        require_admin(&env, &admin);
+        set_fee_token_addr(&env, &token_addr);
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("FEE_TOK")),
+            (admin, token_addr, env.ledger().timestamp()),
+        );
+    }
+
+    /// Get the current fee token contract address (#2004).
+    ///
+    /// # Returns
+    /// The fee token contract address if set, None otherwise
+    pub fn get_fee_token_address(env: Env) -> Option<Address> {
+        get_fee_token_addr(&env)
     }
 
     /// Admin-only: Withdraw accumulated maintenance submission fees to the treasury address (#1313).
@@ -6328,6 +6371,18 @@ impl Lifecycle {
                 .persistent()
                 .set(&symbol_short!("FEE_BAL"), &0u64);
             extend_persistent_ttl(&env, &symbol_short!("FEE_BAL"));
+
+            // Transfer accumulated fees to the treasury address via the fee token contract.
+            if let (Some(treasury), Some(fee_token)) = (
+                get_treasury_addr(&env),
+                get_fee_token_addr(&env),
+            ) {
+                token::Client::new(&env, &fee_token).transfer(
+                    &env.current_contract_address(),
+                    &treasury,
+                    &(balance as i128),
+                );
+            }
 
             env.events().publish(
                 (symbol_short!("ADM_AUD"), symbol_short!("FEE_WTH")),
