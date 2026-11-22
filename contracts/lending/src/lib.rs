@@ -97,6 +97,14 @@ pub enum ContractError {
     AlreadyVoted = 40,
     /// The syndicate has not reached its quorum of approving votes.
     QuorumNotReached = 41,
+    /// A syndicate already exists for this loan (#1865).
+    SyndicateAlreadyExists = 42,
+    /// The lenders and shares lists have different lengths (#1865).
+    SyndicateLengthMismatch = 43,
+    /// Quorum must be between 1 and the number of lenders (#1865).
+    InvalidQuorum = 44,
+    /// Every syndicate share must be non-zero (#1865).
+    ZeroSyndicateShare = 45,
 }
 
 /// Syndicate action symbol used when a restructure must be approved by the syndicate.
@@ -375,7 +383,9 @@ fn voucher_history_key(voucher: &Address) -> (soroban_sdk::Symbol, Address) {
 }
 
 /// Storage keys for new features
-const MARKET_ORACLE_KEY: soroban_sdk::Symbol = symbol_short!("ORACLE");
+const MARKET_ORACLE_KEY: soroban_sdk::Symbol = symbol_short!("ORA_ADDR");
+/// Latest `MarketCondition` snapshot. Kept separate from the oracle address (#1866).
+const MARKET_CONDITION_KEY: soroban_sdk::Symbol = symbol_short!("MKT_COND");
 const LTV_HISTORY_KEY: soroban_sdk::Symbol = symbol_short!("LTV_HST");
 const RESTRUCTURE_KEY: soroban_sdk::Symbol = symbol_short!("REST");
 const SYNDICATE_KEY: soroban_sdk::Symbol = symbol_short!("SYND");
@@ -385,7 +395,7 @@ const INSURANCE_PAYOUT_KEY: soroban_sdk::Symbol = symbol_short!("INS_PAY");
 const RESTRUCTURE_COUNT_KEY: soroban_sdk::Symbol = symbol_short!("REST_CNT");
 
 fn market_condition_key() -> soroban_sdk::Symbol {
-    MARKET_ORACLE_KEY
+    MARKET_CONDITION_KEY
 }
 
 fn ltv_history_key(loan_id: u64) -> (soroban_sdk::Symbol, u64) {
@@ -1414,7 +1424,7 @@ impl LendingContract {
     /// Reduces LTV when volatility is elevated to manage risk.
     pub fn adjust_ltv_for_conditions(env: Env, admin: Address) -> u32 {
         require_admin(&env, &admin);
-        let market: Option<MarketCondition> = env.storage().persistent().get(&MARKET_ORACLE_KEY);
+        let market: Option<MarketCondition> = env.storage().persistent().get(&MARKET_CONDITION_KEY);
 
         let volatility = if let Some(m) = market {
             m.volatility
@@ -1488,8 +1498,8 @@ impl LendingContract {
             price_change_bps,
         };
 
-        env.storage().persistent().set(&MARKET_ORACLE_KEY, &market);
-        extend_persistent_ttl(&env, &MARKET_ORACLE_KEY);
+        env.storage().persistent().set(&MARKET_CONDITION_KEY, &market);
+        extend_persistent_ttl(&env, &MARKET_CONDITION_KEY);
     }
 
     // ── Issue #1646: Loan Syndication Support ──
@@ -1505,16 +1515,28 @@ impl LendingContract {
     ) {
         require_admin(&env, &admin);
 
+        // #1865: never overwrite a live syndicate.
+        if env.storage().persistent().has(&syndicate_key(loan_id)) {
+            panic_with_error!(&env, ContractError::SyndicateAlreadyExists);
+        }
+
         // Validate lenders and shares match
         if lenders.len() != shares.len() {
-            panic_with_error!(&env, ContractError::InvalidAdminAddress);
+            panic_with_error!(&env, ContractError::SyndicateLengthMismatch);
         }
 
         // Calculate total shares
         let mut total_shares: u64 = 0;
         for share in shares.iter() {
+            if share == 0 {
+                panic_with_error!(&env, ContractError::ZeroSyndicateShare);
+            }
             total_shares = total_shares.checked_add(share)
                 .unwrap_or_else(|| panic_with_error!(&env, ContractError::StakeSummationOverflow));
+        }
+
+        if quorum_required == 0 || quorum_required > lenders.len() {
+            panic_with_error!(&env, ContractError::InvalidQuorum);
         }
 
         let syndicate = Syndicate {
@@ -2580,20 +2602,28 @@ mod tests {
         }
     }
 
-    /// A minimal mock lifecycle contract that always returns ineligible.
-    #[contract]
-    pub struct MockLifecycleIneligible;
+    // Own module: #[contractimpl] generates per-function items, so the two mock lifecycle
+    // contracts (which export the same function names) cannot share one scope.
+    mod ineligible_lifecycle {
+        use super::*;
 
-    #[contractimpl]
-    impl MockLifecycleIneligible {
-        pub fn is_collateral_eligible(_env: Env, _asset_id: u64) -> bool {
-            false
-        }
+        /// A minimal mock lifecycle contract that always returns ineligible.
+        #[contract]
+        pub struct MockLifecycleIneligible;
 
-        pub fn get_collateral_score(_env: Env, _asset_id: u64) -> u32 {
-            0u32
+        #[contractimpl]
+        impl MockLifecycleIneligible {
+            pub fn is_collateral_eligible(_env: Env, _asset_id: u64) -> bool {
+                false
+            }
+
+            pub fn get_collateral_score(_env: Env, _asset_id: u64) -> u32 {
+                0u32
+            }
         }
     }
+
+    use ineligible_lifecycle::MockLifecycleIneligible;
 
     /// #1019: When a lifecycle contract is configured and the asset is eligible,
     /// request_loan should succeed.

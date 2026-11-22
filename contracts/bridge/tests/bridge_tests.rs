@@ -35,6 +35,7 @@ fn eth_config(env: &Env) -> ChainConfig {
         window_secs: 3_600,
         window_cap: 5_000,
         alert_threshold: 4_000,
+        attestation_window_secs: 600,
         address_len: 42,
     }
 }
@@ -51,6 +52,7 @@ fn xlm_config(env: &Env) -> ChainConfig {
         window_cap: 5_000,
         alert_threshold: 4_000,
         address_len: 56,
+        attestation_window_secs: 600,
     }
 }
 
@@ -771,6 +773,143 @@ fn test_set_relayers_validates_threshold_and_duplicates() {
     assert!(ctx
         .client
         .try_set_relayers(&ctx.admin, &vec![&ctx.env, a.clone(), a.clone()], &1)
+        .is_err());
+}
+
+// ── Issue #1920: approvals from removed relayers must not count ──
+
+#[test]
+fn test_removed_relayer_approval_does_not_count_toward_release() {
+    let ctx = setup();
+    let recipient = Address::generate(&ctx.env);
+    mint(&ctx, &ctx.client.address, 1_000);
+
+    // relayers[0] attests, then is removed from the set mid-release.
+    attest(&ctx, &ctx.relayers[0], 5, &recipient, 300);
+    let new_relayer = Address::generate(&ctx.env);
+    ctx.client.set_relayers(
+        &ctx.admin,
+        &vec![
+            &ctx.env,
+            ctx.relayers[1].clone(),
+            ctx.relayers[2].clone(),
+            new_relayer.clone(),
+        ],
+        &2,
+    );
+
+    // Only relayers[2] counts now: 1 approval, below threshold 2.
+    attest(&ctx, &ctx.relayers[2], 5, &recipient, 300);
+    let pending = ctx.client.get_release(&ETH, &5).unwrap();
+    assert!(!pending.executed);
+    assert_eq!(pending.approvals.len(), 1);
+    assert_eq!(balance(&ctx, &recipient), 0);
+
+    // A second current relayer reaches the threshold and the release executes.
+    attest(&ctx, &new_relayer, 5, &recipient, 300);
+    assert!(ctx.client.get_release(&ETH, &5).unwrap().executed);
+    assert_eq!(balance(&ctx, &recipient), 300);
+}
+
+// ── Issue #1921: pending releases expire ─────────────────────
+
+fn set_time(ctx: &Ctx, t: u64) {
+    ctx.env.ledger().with_mut(|li| li.timestamp = t);
+}
+
+#[test]
+fn test_attestation_accepted_at_window_deadline() {
+    let ctx = setup();
+    let recipient = Address::generate(&ctx.env);
+    mint(&ctx, &ctx.client.address, 1_000);
+
+    set_time(&ctx, 1_000);
+    attest(&ctx, &ctx.relayers[0], 7, &recipient, 300);
+
+    // Window is 600s from created_at = 1_000, so 1_600 is still open.
+    set_time(&ctx, 1_600);
+    attest(&ctx, &ctx.relayers[1], 7, &recipient, 300);
+    assert!(ctx.client.get_release(&ETH, &7).unwrap().executed);
+    assert_eq!(balance(&ctx, &recipient), 300);
+}
+
+#[test]
+fn test_attestation_rejected_after_window() {
+    let ctx = setup();
+    let recipient = Address::generate(&ctx.env);
+    mint(&ctx, &ctx.client.address, 1_000);
+
+    set_time(&ctx, 1_000);
+    attest(&ctx, &ctx.relayers[0], 8, &recipient, 300);
+
+    // One second past the deadline (1_601) the second approval is refused.
+    set_time(&ctx, 1_601);
+    let res = ctx.client.try_attest_release(
+        &ctx.relayers[1],
+        &ETH,
+        &8,
+        &ReleaseParams {
+            token: ctx.token.clone(),
+            recipient: recipient.clone(),
+            amount: 300,
+            confirmations: 12,
+        },
+    );
+    assert!(res.is_err());
+    let pending = ctx.client.get_release(&ETH, &8).unwrap();
+    assert!(!pending.executed);
+    assert_eq!(pending.approvals.len(), 1);
+    assert_eq!(balance(&ctx, &recipient), 0);
+}
+
+#[test]
+fn test_expire_release_only_after_window_then_removes_it() {
+    let ctx = setup();
+    let recipient = Address::generate(&ctx.env);
+    mint(&ctx, &ctx.client.address, 1_000);
+
+    set_time(&ctx, 1_000);
+    attest(&ctx, &ctx.relayers[0], 9, &recipient, 300);
+
+    // Still open at the deadline: cannot expire yet.
+    set_time(&ctx, 1_600);
+    assert!(ctx.client.try_expire_release(&ETH, &9).is_err());
+    assert!(ctx.client.get_release(&ETH, &9).is_some());
+
+    // Past the deadline: cleanup removes the record.
+    set_time(&ctx, 1_601);
+    ctx.client.expire_release(&ETH, &9);
+    assert!(ctx.client.get_release(&ETH, &9).is_none());
+}
+
+#[test]
+fn test_expire_release_keeps_executed_release_as_replay_guard() {
+    let ctx = setup();
+    let recipient = Address::generate(&ctx.env);
+    mint(&ctx, &ctx.client.address, 1_000);
+
+    set_time(&ctx, 1_000);
+    release(&ctx, 10, &recipient, 300);
+
+    set_time(&ctx, 10_000);
+    assert!(ctx.client.try_expire_release(&ETH, &10).is_err());
+    assert!(ctx.client.get_release(&ETH, &10).unwrap().executed);
+}
+
+#[test]
+fn test_expire_release_unknown_nonce_is_not_found() {
+    let ctx = setup();
+    assert!(ctx.client.try_expire_release(&ETH, &404).is_err());
+}
+
+#[test]
+fn test_add_chain_rejects_zero_attestation_window() {
+    let ctx = setup();
+    let mut cfg = eth_config(&ctx.env);
+    cfg.attestation_window_secs = 0;
+    assert!(ctx
+        .client
+        .try_add_chain(&ctx.admin, &4, &cfg)
         .is_err());
 }
 
