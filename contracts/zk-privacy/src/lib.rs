@@ -72,10 +72,12 @@ pub enum ContractError {
     BitsOutOfOrder = 8,
     /// `finalize_collateral_proof` was called before all bits were verified.
     IncompleteProof = 9,
+    /// A live attestation from a different owner already exists for this asset.
+    AttestationConflict = 10,
     /// An open proof session for the asset belongs to someone else, or has not expired yet.
-    SessionInProgress = 10,
+    SessionInProgress = 11,
     /// The caller is not an authorised maintenance submitter.
-    UnauthorizedSubmitter = 11,
+    UnauthorizedSubmitter = 12,
 }
 
 #[contracttype]
@@ -603,6 +605,17 @@ impl ZkPrivacy {
         }
 
         let now = env.ledger().timestamp();
+        // A live attestation held by another owner is relied on by lenders and must not be
+        // replaced. The same owner may renew it, and an expired one may be replaced by anyone.
+        if let Some(existing) = env
+            .storage()
+            .persistent()
+            .get::<_, CollateralAttestation>(&DataKey::Collateral(asset_id))
+        {
+            if existing.owner != session.owner && now < existing.expires_at {
+                return Err(ContractError::AttestationConflict);
+            }
+        }
         let attestation = CollateralAttestation {
             owner: session.owner.clone(),
             commitment: session.commitment.clone(),

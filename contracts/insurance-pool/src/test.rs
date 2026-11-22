@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use crate::{ClaimStatus, InsurancePool, InsurancePoolClient};
+use crate::{ClaimStatus, InsurancePool, InsurancePoolClient, MAX_TERM_SECS, MIN_TERM_SECS};
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
@@ -272,4 +272,233 @@ fn premium_rate_above_100_percent_is_rejected() {
     let contract_id = env.register(InsurancePool, ());
     let client = InsurancePoolClient::new(&env, &contract_id);
     client.initialize(&admin, &token_id, &10_001, &TERM_SECS);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn pending_claims_cannot_collectively_exceed_coverage() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let lender = funded(&env, &ctx, 10_000);
+    let policy_id = ctx.client.buy_policy(&lender, &7, &1_000);
+    ctx.client.file_claim(&lender, &policy_id, &600);
+    // 600 is still pending, so 600 more would total 1_200 against 1_000 of coverage.
+    ctx.client.file_claim(&lender, &policy_id, &600);
+}
+
+#[test]
+fn rejected_claim_frees_its_coverage_for_new_claims() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let lender = funded(&env, &ctx, 10_000);
+    let policy_id = ctx.client.buy_policy(&lender, &7, &1_000);
+    let first = ctx.client.file_claim(&lender, &policy_id, &600);
+    ctx.client.settle_claim(&ctx.admin, &first, &false);
+
+    // The rejected claim no longer reserves coverage, so this fits exactly.
+    ctx.client.file_claim(&lender, &policy_id, &1_000);
+}
+
+#[test]
+fn settled_claims_leave_only_unpaid_pending_exposure() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let provider = funded(&env, &ctx, 10_000);
+    ctx.client.provide_capital(&provider, &5_000);
+    let lender = funded(&env, &ctx, 10_000);
+    let policy_id = ctx.client.buy_policy(&lender, &7, &1_000);
+    let paid = ctx.client.file_claim(&lender, &policy_id, &400);
+    ctx.client.settle_claim(&ctx.admin, &paid, &true);
+
+    // Paid claim reduced coverage to 600 and nothing is pending, so a 600 claim fits.
+    ctx.client.file_claim(&lender, &policy_id, &600);
+}
+
+#[test]
+fn claim_filed_at_expiry_boundary_settles_after_expiry() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let provider = funded(&env, &ctx, 10_000);
+    ctx.client.provide_capital(&provider, &5_000);
+    let lender = funded(&env, &ctx, 10_000);
+    let policy_id = ctx.client.buy_policy(&lender, &7, &1_000);
+    let expires_at = ctx.client.get_policy(&policy_id).expires_at;
+
+    // Filing at exactly expires_at is still inside the term.
+    env.ledger().with_mut(|l| l.timestamp = expires_at);
+    let claim_id = ctx.client.file_claim(&lender, &policy_id, &400);
+
+    // Settlement after expiry is allowed for a claim filed in time.
+    env.ledger().with_mut(|l| l.timestamp = expires_at + 10_000);
+    assert_eq!(ctx.client.settle_claim(&ctx.admin, &claim_id, &true), 400);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #10)")]
+fn claim_filed_one_second_after_expiry_cannot_be_filed() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let lender = funded(&env, &ctx, 10_000);
+    let policy_id = ctx.client.buy_policy(&lender, &7, &1_000);
+    let expires_at = ctx.client.get_policy(&policy_id).expires_at;
+    env.ledger().with_mut(|l| l.timestamp = expires_at + 1);
+    ctx.client.file_claim(&lender, &policy_id, &100);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn pause_blocks_capital_deposits() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let provider = funded(&env, &ctx, 10_000);
+    ctx.client.pause(&ctx.admin);
+    ctx.client.provide_capital(&provider, &1_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn pause_blocks_withdrawals() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let provider = funded(&env, &ctx, 10_000);
+    ctx.client.provide_capital(&provider, &1_000);
+    ctx.client.pause(&ctx.admin);
+    ctx.client.withdraw_capital(&provider, &100);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn pause_blocks_policy_purchases() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let lender = funded(&env, &ctx, 10_000);
+    ctx.client.pause(&ctx.admin);
+    ctx.client.buy_policy(&lender, &7, &1_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #15)")]
+fn pause_blocks_claim_filing() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let lender = funded(&env, &ctx, 10_000);
+    let policy_id = ctx.client.buy_policy(&lender, &7, &1_000);
+    ctx.client.pause(&ctx.admin);
+    ctx.client.file_claim(&lender, &policy_id, &100);
+}
+
+#[test]
+fn settlement_stays_open_while_paused() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let provider = funded(&env, &ctx, 10_000);
+    ctx.client.provide_capital(&provider, &5_000);
+    let lender = funded(&env, &ctx, 10_000);
+    let policy_id = ctx.client.buy_policy(&lender, &7, &1_000);
+    let claim_id = ctx.client.file_claim(&lender, &policy_id, &400);
+    ctx.client.pause(&ctx.admin);
+    assert_eq!(ctx.client.settle_claim(&ctx.admin, &claim_id, &true), 400);
+}
+
+#[test]
+fn unpause_restores_operations() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let provider = funded(&env, &ctx, 10_000);
+    ctx.client.pause(&ctx.admin);
+    assert!(ctx.client.is_paused());
+    ctx.client.unpause(&ctx.admin);
+    assert!(!ctx.client.is_paused());
+    assert_eq!(ctx.client.provide_capital(&provider, &1_000), 1_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn non_admin_cannot_pause() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let intruder = Address::generate(&env);
+    ctx.client.pause(&intruder);
+}
+
+#[test]
+fn admin_can_update_premium_rate() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let lender = funded(&env, &ctx, 10_000);
+    ctx.client.set_premium_bps(&ctx.admin, &1_000); // 10%
+    assert_eq!(ctx.client.quote_premium(&1_000), 100);
+    ctx.client.buy_policy(&lender, &7, &1_000);
+    assert_eq!(ctx.token.balance(&lender), 10_000 - 100);
+}
+
+#[test]
+fn premium_rate_bounds_are_inclusive() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    ctx.client.set_premium_bps(&ctx.admin, &0);
+    assert_eq!(ctx.client.quote_premium(&1_000), 0);
+    ctx.client.set_premium_bps(&ctx.admin, &10_000);
+    assert_eq!(ctx.client.quote_premium(&1_000), 1_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn premium_rate_above_maximum_is_rejected_on_update() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    ctx.client.set_premium_bps(&ctx.admin, &10_001);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn non_admin_cannot_update_premium_rate() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let intruder = Address::generate(&env);
+    ctx.client.set_premium_bps(&intruder, &100);
+}
+
+#[test]
+fn term_bounds_are_inclusive_and_apply_to_new_policies() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let lender = funded(&env, &ctx, 10_000);
+    ctx.client.set_term_secs(&ctx.admin, &MIN_TERM_SECS);
+    let short = ctx.client.buy_policy(&lender, &7, &100);
+    assert_eq!(
+        ctx.client.get_policy(&short).expires_at,
+        1_000 + MIN_TERM_SECS
+    );
+    ctx.client.set_term_secs(&ctx.admin, &MAX_TERM_SECS);
+    let long = ctx.client.buy_policy(&lender, &7, &100);
+    assert_eq!(
+        ctx.client.get_policy(&long).expires_at,
+        1_000 + MAX_TERM_SECS
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn term_below_minimum_is_rejected() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    ctx.client.set_term_secs(&ctx.admin, &(MIN_TERM_SECS - 1));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #16)")]
+fn term_above_maximum_is_rejected() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    ctx.client.set_term_secs(&ctx.admin, &(MAX_TERM_SECS + 1));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn non_admin_cannot_update_term() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let intruder = Address::generate(&env);
+    ctx.client.set_term_secs(&intruder, &MIN_TERM_SECS);
 }

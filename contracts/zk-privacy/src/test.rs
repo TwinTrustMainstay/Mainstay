@@ -362,6 +362,70 @@ fn collateral_finalize_requires_all_bits() {
 }
 
 #[test]
+fn collateral_finalize_rejects_replacing_another_owners_attestation() {
+    let (env, id, _admin) = setup();
+    let client = ZkPrivacyClient::new(&env, &id);
+    let lender_owner = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let r = blinding_from_seed(&env, &seed(&env, 1), b"collateral");
+    let (c, proof) = prove_adequacy(&env, 7, 1500, &r, 1000, &seed(&env, 2)).unwrap();
+    submit_collateral(&env, &client, &lender_owner, 7, &c, 1000, &proof).unwrap();
+
+    // A different owner opens a session for the same asset with a valid proof and tries to finalize.
+    client.begin_collateral_proof(&attacker, &7, &c, &1000, &proof.bit_commitments);
+    let total = proof.bit_proofs.len();
+    let mut start = 0;
+    while start < total {
+        let mut chunk: Vec<BitProof> = Vec::new(&env);
+        for k in start..(start + BITS_PER_TX).min(total) {
+            chunk.push_back(proof.bit_proofs.get(k).unwrap());
+        }
+        client.submit_collateral_bits(&7, &chunk);
+        start += BITS_PER_TX;
+    }
+    assert_eq!(
+        client.try_finalize_collateral_proof(&7),
+        Err(Ok(ContractError::AttestationConflict))
+    );
+
+    // The original attestation is untouched.
+    let att = client.get_collateral_attestation(&7).unwrap();
+    assert_eq!(att.owner, lender_owner);
+    assert!(client.get_collateral_session(&7).is_some());
+}
+
+#[test]
+fn collateral_owner_can_renew_own_attestation() {
+    let (env, id, _admin) = setup();
+    let client = ZkPrivacyClient::new(&env, &id);
+    let owner = Address::generate(&env);
+    let r = blinding_from_seed(&env, &seed(&env, 1), b"collateral");
+    let (c, proof) = prove_adequacy(&env, 7, 1500, &r, 1000, &seed(&env, 2)).unwrap();
+    submit_collateral(&env, &client, &owner, 7, &c, 1000, &proof).unwrap();
+
+    assert_eq!(
+        submit_collateral(&env, &client, &owner, 7, &c, 1000, &proof),
+        Ok(())
+    );
+}
+
+#[test]
+fn expired_attestation_can_be_replaced_by_another_owner() {
+    let (env, id, _admin) = setup();
+    let client = ZkPrivacyClient::new(&env, &id);
+    let first = Address::generate(&env);
+    let second = Address::generate(&env);
+    let r = blinding_from_seed(&env, &seed(&env, 1), b"collateral");
+    let (c, proof) = prove_adequacy(&env, 7, 1500, &r, 1000, &seed(&env, 2)).unwrap();
+    submit_collateral(&env, &client, &first, 7, &c, 1000, &proof).unwrap();
+
+    env.ledger()
+        .with_mut(|l| l.timestamp += ATTESTATION_TTL_SECS + 1);
+    submit_collateral(&env, &client, &second, 7, &c, 1000, &proof).unwrap();
+    assert_eq!(client.get_collateral_attestation(&7).unwrap().owner, second);
+}
+
+#[test]
 fn collateral_attestation_expires() {
     let (env, id, _admin) = setup();
     let client = ZkPrivacyClient::new(&env, &id);
