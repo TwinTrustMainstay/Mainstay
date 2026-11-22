@@ -25,7 +25,8 @@ pub(crate) use storage::{
 pub(crate) use events::{
     EVENT_ADMIN_SET, EVENT_DECAY, EVENT_INIT, EVENT_MAINT, EVENT_PROP_ADMIN, EVENT_PRUNED,
     EVENT_REG_AST, EVENT_REG_ENG, EVENT_RST_SCR, EVENT_XFER, EVENT_WEIGHT_PROP, EVENT_WEIGHT_EXEC,
-    EVENT_RECONSTR, EVENT_TASK_DUE_SOON,
+    EVENT_RECONSTR, EVENT_TASK_DUE_SOON, EVENT_MNT_SIG, EVENT_PROV_REG, EVENT_PROV_RM,
+    EVENT_EXT_SCR, EVENT_DEG_CRV,
 };
 
 use crate::errors::ContractError;
@@ -1279,12 +1280,16 @@ impl Lifecycle {
             signatures.push_back(MaintenanceSignature {
                 asset_id,
                 record_timestamp,
-                signer,
+                signer: signer.clone(),
                 public_key,
                 signature,
             });
             env.storage().persistent().set(&key, &signatures);
             extend_persistent_ttl(&env, &key);
+            env.events().publish(
+                (EVENT_MNT_SIG,),
+                (asset_id, record_timestamp, signer),
+            );
         }
 
         /// Returns whether a valid stored signature exists for a record.
@@ -7816,6 +7821,7 @@ impl Lifecycle {
         providers.push_back(provider.clone());
         env.storage().persistent().set(&providers_key, &providers);
         shared::extend_persistent_ttl(&env, &providers_key);
+        env.events().publish((EVENT_PROV_REG,), (provider,));
     }
 
     /// Remove a score provider from the registry.
@@ -7838,15 +7844,21 @@ impl Lifecycle {
             .unwrap_or_else(|| Vec::new(&env));
 
         let mut new_providers: Vec<Address> = Vec::new(&env);
+        let mut removed = false;
         for p in 0..providers.len() {
             let addr = providers.get(p).unwrap();
             if addr != provider {
                 new_providers.push_back(addr);
+            } else {
+                removed = true;
             }
         }
 
         env.storage().persistent().set(&providers_key, &new_providers);
         shared::extend_persistent_ttl(&env, &providers_key);
+        if removed {
+            env.events().publish((EVENT_PROV_RM,), (provider,));
+        }
     }
 
     /// Submit an external score from a provider for consensus scoring.
@@ -7907,6 +7919,8 @@ impl Lifecycle {
         scores.push_back(entry);
         env.storage().persistent().set(&ext_scores_key, &scores);
         shared::extend_persistent_ttl(&env, &ext_scores_key);
+        env.events()
+            .publish((EVENT_EXT_SCR,), (asset_id, provider, score));
     }
 
     /// Get consensus score using median of external provider scores.
@@ -8041,6 +8055,7 @@ impl Lifecycle {
         let curve_key = degradation_curve_key(&category);
         env.storage().persistent().set(&curve_key, &curve);
         shared::extend_persistent_ttl(&env, &curve_key);
+        env.events().publish((EVENT_DEG_CRV,), (category, version));
     }
 
     /// Get degradation curve for an asset category.
@@ -9141,6 +9156,10 @@ mod tests {
     mod snapshot_auth_tests;
     mod snapshot_event_tests;
     mod attestor_event_tests;
+    mod maintenance_signature_event_tests;
+    mod score_provider_event_tests;
+    mod external_score_event_tests;
+    mod degradation_curve_event_tests;
 
     fn setup<'a>(
         env: &'a Env,
