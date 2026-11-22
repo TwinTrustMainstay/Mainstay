@@ -320,6 +320,8 @@ Errors returned by the `zk-privacy` contract (`contracts/zk-privacy`).
 | 7 | `SessionNotFound` | No collateral proof session is open for the asset. Call `begin_collateral_proof` first. |
 | 8 | `BitsOutOfOrder` | A bit chunk was empty, larger than `BITS_PER_TX` (4), or would run past the last bit. |
 | 9 | `IncompleteProof` | `finalize_collateral_proof` was called before all 32 bits were verified. |
+| 10 | `SessionInProgress` | An open collateral proof session for the asset belongs to another account, or to the same owner but has not yet expired (`SESSION_TTL_SECS`, 24 hours). |
+| 11 | `UnauthorizedSubmitter` | The caller is not on the admin-managed maintenance submitter allowlist, or did not sign the call. |
 
 
 - **`InvalidProof`** – regenerate the proof from the current commitment, roster order, asset id, and threshold. Proofs are bound to all of these, so a stale or copied proof fails.
