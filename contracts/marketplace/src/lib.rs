@@ -11,7 +11,9 @@
 //! * **Auctions**: the admin opens an auction for a maintenance task. Credentialed
 //!   engineers bid, either openly or via a sealed commit/reveal. The admin-free
 //!   `finalize_auction` picks a winner by price or reputation. Awards can be
-//!   disputed within a window and the admin resolves the dispute.
+//!   disputed within a window and the admin resolves the dispute. A dispute
+//!   requires a refundable bond (issue #1942): it is returned when the dispute
+//!   is upheld (the award changes) and forfeited otherwise.
 
 mod auction;
 mod pricing;
@@ -76,12 +78,16 @@ pub enum ContractError {
     AuctionModeMismatch = 21,
     /// The auction already has the maximum number of bids.
     BidLimitReached = 22,
+    /// No dispute bond is configured, so disputes are disabled until the admin sets one.
+    DisputeBondNotConfigured = 23,
+    /// Dispute bond amount must be greater than zero.
+    InvalidDisputeBond = 24,
     /// No bid deposit has been configured, so commitments cannot be taken.
-    DepositNotConfigured = 23,
+    DepositNotConfigured = 25,
     /// Bid deposit amount must be positive.
-    InvalidDepositConfig = 24,
+    InvalidDepositConfig = 26,
     /// The forfeited deposit pool can only be claimed after the reveal window.
-    ForfeitWindowOpen = 25,
+    ForfeitWindowOpen = 27,
 }
 
 /// Credential status as reported by the engineer registry. Variants must match
@@ -115,6 +121,25 @@ pub struct PricingConfig {
     pub min_update_interval_secs: u64,
 }
 
+/// Admin-configured terms for disputing an award.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeBondTerms {
+    /// Token the bond is posted in.
+    pub token: Address,
+    /// Bond amount, in `token` units.
+    pub amount: i128,
+}
+
+/// A bond posted by a bidder when disputing an auction award.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeBond {
+    pub bidder: Address,
+    pub token: Address,
+    pub amount: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarketState {
@@ -140,6 +165,10 @@ enum DataKey {
     BidDeposit,
     Deposit(u64, Address),
     DepositPool(u64),
+    DisputeBondTerms,
+    DisputeBond(u64),
+    /// Engineers who committed to a sealed auction, in commit order.
+    Committers(u64),
 }
 
 /// Deposit every commitment must lock. Refunded on reveal, forfeited otherwise.
@@ -171,6 +200,7 @@ pub trait EngineerRegistry {
 }
 
 const PRICE_UPDATE_TOPIC: Symbol = symbol_short!("PRC_UPD");
+const PRICING_CONFIG_TOPIC: Symbol = symbol_short!("PRC_CFG");
 const AUCTION_NEW_TOPIC: Symbol = symbol_short!("AUC_NEW");
 const BID_TOPIC: Symbol = symbol_short!("AUC_BID");
 const COMMIT_TOPIC: Symbol = symbol_short!("AUC_COMM");
@@ -180,6 +210,7 @@ const DISPUTE_TOPIC: Symbol = symbol_short!("AUC_DISP");
 const RESOLVE_TOPIC: Symbol = symbol_short!("AUC_RSLV");
 const FORFEIT_TOPIC: Symbol = symbol_short!("AUC_FORF");
 const REJECT_TOPIC: Symbol = symbol_short!("AUC_REJ");
+const BOND_TOPIC: Symbol = symbol_short!("AUC_BOND");
 
 fn require_admin_auth(env: &Env, admin: &Address) {
     let stored: Address = env
@@ -300,20 +331,40 @@ fn refund_deposit(env: &Env, auction_id: u64, engineer: &Address) {
     env.storage().persistent().remove(&key);
 }
 
-/// Panics unless `engineer` holds a valid or grace-period credential.
-fn ensure_credentialed(env: &Env, engineer: &Address) {
+/// Whether `engineer` currently holds a valid or grace-period credential.
+fn is_credentialed(env: &Env, engineer: &Address) -> bool {
     let registry: Address = env
         .storage()
         .instance()
         .get(&DataKey::Registry)
         .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized));
     let status = EngineerRegistryClient::new(env, &registry).verify_engineer(engineer, &None);
-    if !matches!(
+    matches!(
         status,
         CredentialStatus::Valid | CredentialStatus::GracePeriod
-    ) {
+    )
+}
+
+/// Panics unless `engineer` holds a valid or grace-period credential.
+fn ensure_credentialed(env: &Env, engineer: &Address) {
+    if !is_credentialed(env, engineer) {
         panic_with_error!(env, ContractError::NotCredentialed);
     }
+}
+
+fn load_committers(env: &Env, auction_id: u64) -> Vec<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Committers(auction_id))
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+fn store_committers(env: &Env, auction_id: u64, committers: &Vec<Address>) {
+    let key = DataKey::Committers(auction_id);
+    env.storage().persistent().set(&key, committers);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, shared::TTL_THRESHOLD, shared::TTL_TARGET);
 }
 
 fn reputation_of(env: &Env, engineer: &Address) -> u32 {
@@ -363,7 +414,26 @@ impl Marketplace {
             .extend_ttl(shared::TTL_THRESHOLD, shared::TTL_TARGET);
     }
 
+    /// Admin-only: set the bond a bidder must post to open a dispute.
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if `admin` is not the stored admin
+    /// - [`ContractError::InvalidDisputeBond`] if `amount` is not positive
+    pub fn set_dispute_bond(env: Env, admin: Address, token: Address, amount: i128) {
+        require_admin_auth(&env, &admin);
+        if amount <= 0 {
+            panic_with_error!(&env, ContractError::InvalidDisputeBond);
+        }
+        env.storage().instance().set(
+            &DataKey::DisputeBondTerms,
+            &DisputeBondTerms { token, amount },
+        );
+    }
+
     /// Admin-only: replace the pricing configuration. Existing history is kept.
+    ///
+    /// Publishes a `PRC_CFG` event whose data is `(old, new)` so off-chain price
+    /// consumers can detect the change.
     ///
     /// # Panics
     /// - [`ContractError::UnauthorizedAdmin`] if `admin` is not the stored admin
@@ -373,7 +443,10 @@ impl Marketplace {
         if !pricing::is_valid_config(&pricing) {
             panic_with_error!(&env, ContractError::InvalidPricingConfig);
         }
+        let old = load_pricing(&env);
         env.storage().instance().set(&DataKey::Pricing, &pricing);
+        env.events()
+            .publish((PRICING_CONFIG_TOPIC,), (old, pricing));
     }
 
     /// Admin-only: set the refundable deposit every commitment must lock.
@@ -498,13 +571,14 @@ impl Marketplace {
 
     /// Estimated price elasticity of demand between the last two observations, in bps.
     ///
-    /// Negative means demand fell as price rose. Returns `0` when fewer than two
-    /// observations exist or the estimate is undefined.
-    pub fn get_price_elasticity(env: Env) -> i64 {
+    /// Negative means demand fell as price rose. Returns `None` when fewer than two
+    /// observations exist or the estimate is undefined (for example, prior demand or
+    /// price was zero). `Some(0)` is a real measurement of zero elasticity.
+    pub fn get_price_elasticity(env: Env) -> Option<i64> {
         let history = load_history(&env);
         let len = history.len();
         if len < 2 {
-            return 0;
+            return None;
         }
         let prev = history.get(len - 2).unwrap();
         let curr = history.get(len - 1).unwrap();
@@ -678,6 +752,9 @@ impl Marketplace {
         env.storage()
             .persistent()
             .extend_ttl(&key, shared::TTL_THRESHOLD, shared::TTL_TARGET);
+        let mut committers = load_committers(&env, auction_id);
+        committers.push_back(engineer.clone());
+        store_committers(&env, auction_id, &committers);
         env.events()
             .publish((COMMIT_TOPIC, auction_id), (engineer,));
     }
@@ -768,11 +845,46 @@ impl Marketplace {
             panic_with_error!(&env, ContractError::AuctionStillOpen);
         }
 
+        // Only bids whose engineer still holds a valid credential at finalization
+        // are eligible. A lapsed winner falls through to the next valid bidder.
+        let committers = load_committers(&env, auction_id);
         let bids = load_bids(&env, auction_id);
+        let mut eligible: Vec<Bid> = Vec::new(&env);
+        if committers.is_empty() {
+            // Open auction: bids are already in placement order.
+            for bid in bids.iter() {
+                if is_credentialed(&env, &bid.engineer) {
+                    eligible.push_back(bid);
+                }
+            }
+        } else {
+            // Sealed auction: bids are stored in reveal order. Walk the committers
+            // in commit order so that ties resolve to the earliest commitment.
+            for engineer in committers.iter() {
+                if let Some(idx) = auction::find_bid(&bids, &engineer) {
+                    let bid = bids.get(idx).unwrap();
+                    if is_credentialed(&env, &bid.engineer) {
+                        eligible.push_back(bid);
+                    }
+                }
+            }
+        }
         auction.finalized_at = now;
-        match select_winner(&bids, auction.criterion) {
+
+        // Unrevealed commitments are forfeited. Remove them and the committer
+        // index now so no sealed-bid state outlives the auction.
+        for engineer in committers.iter() {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Commit(auction_id, engineer));
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Committers(auction_id));
+
+        match select_winner(&eligible, auction.criterion) {
             Some(idx) => {
-                let bid = bids.get(idx).unwrap();
+                let bid = eligible.get(idx).unwrap();
                 auction.status = AuctionStatus::Awarded;
                 auction.winner = Some(bid.engineer.clone());
                 auction.winning_price = bid.price;
@@ -791,13 +903,16 @@ impl Marketplace {
     }
 
     /// Dispute an awarded auction. Only a bidder on this auction may dispute, and
-    /// only within [`DISPUTE_WINDOW_SECS`] of finalization.
+    /// only within [`DISPUTE_WINDOW_SECS`] of finalization. The bidder posts the
+    /// configured dispute bond, which is refunded if the dispute is upheld. Each
+    /// auction admits at most one dispute, so a bidder cannot stack disputes.
     ///
     /// # Panics
     /// - [`ContractError::AuctionNotFound`] if the auction does not exist
     /// - [`ContractError::NotAwarded`] if the auction is not in the awarded state
     /// - [`ContractError::DisputeWindowClosed`] if the window has passed
     /// - [`ContractError::NotABidder`] if the caller did not bid
+    /// - [`ContractError::DisputeBondNotConfigured`] if no bond has been set
     pub fn open_dispute(env: Env, bidder: Address, auction_id: u64, reason: String) {
         bidder.require_auth();
         let mut auction = load_auction(&env, auction_id);
@@ -812,6 +927,28 @@ impl Marketplace {
         if auction::find_bid(&bids, &bidder).is_none() {
             panic_with_error!(&env, ContractError::NotABidder);
         }
+        let terms: DisputeBondTerms = env
+            .storage()
+            .instance()
+            .get(&DataKey::DisputeBondTerms)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::DisputeBondNotConfigured));
+        token::Client::new(&env, &terms.token).transfer(
+            &bidder,
+            &env.current_contract_address(),
+            &terms.amount,
+        );
+        let bond_key = DataKey::DisputeBond(auction_id);
+        env.storage().persistent().set(
+            &bond_key,
+            &DisputeBond {
+                bidder: bidder.clone(),
+                token: terms.token,
+                amount: terms.amount,
+            },
+        );
+        env.storage()
+            .persistent()
+            .extend_ttl(&bond_key, shared::TTL_THRESHOLD, shared::TTL_TARGET);
         auction.status = AuctionStatus::Disputed;
         store_auction(&env, &auction);
         env.events()
@@ -836,6 +973,22 @@ impl Marketplace {
         let idx = auction::find_bid(&bids, &final_winner)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotABidder));
         let bid = bids.get(idx).unwrap();
+        // A dispute is upheld when the award changes hands. Naming the original
+        // winner again upholds the award, so the disputer's bond is forfeited.
+        let upheld = auction.winner.as_ref() != Some(&final_winner);
+        let bond_key = DataKey::DisputeBond(auction_id);
+        if let Some(bond) = env.storage().persistent().get::<_, DisputeBond>(&bond_key) {
+            if upheld {
+                token::Client::new(&env, &bond.token).transfer(
+                    &env.current_contract_address(),
+                    &bond.bidder,
+                    &bond.amount,
+                );
+            }
+            env.storage().persistent().remove(&bond_key);
+            env.events()
+                .publish((BOND_TOPIC, auction_id), (bond.bidder, bond.amount, upheld));
+        }
         auction.status = AuctionStatus::Resolved;
         auction.winner = Some(final_winner.clone());
         auction.winning_price = bid.price;

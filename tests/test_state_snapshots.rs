@@ -44,7 +44,7 @@ fn health_snapshot_changes_match_the_maintenance_state_transition() {
     lifecycle.authorize_engineer(&owner, &asset_id, &engineer);
 
     let before_timestamp = env.ledger().timestamp();
-    let before = lifecycle.take_health_snapshot(&asset_id);
+    let before = lifecycle.take_health_snapshot(&owner, &asset_id);
     assert_eq!(before.snapshot_timestamp, before_timestamp);
     assert_eq!(before.score, 0);
     assert_eq!(before.maintenance_count, 0);
@@ -60,7 +60,7 @@ fn health_snapshot_changes_match_the_maintenance_state_transition() {
         &engineer,
     );
 
-    let after = lifecycle.take_health_snapshot(&asset_id);
+    let after = lifecycle.take_health_snapshot(&owner, &asset_id);
     assert_eq!(after.snapshot_timestamp, maintenance_timestamp);
     assert!(after.score > 0);
     assert_eq!(after.maintenance_count, 1);
