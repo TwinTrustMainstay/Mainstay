@@ -376,14 +376,18 @@ fn vote_cap_is_enforced() {
     let env = Env::default();
     let ctx = setup(&env);
     let proposer = holder(&ctx, 50);
+    // Voters must hold shares when the proposal is created to carry any weight.
+    let mut voters: Vec<Address> = Vec::new(&env);
+    for _ in 0..=MAX_VOTES_PER_PROPOSAL {
+        voters.push_back(holder(&ctx, 1));
+    }
     let id = ctx
         .client
         .create_proposal(&proposer, &title(&env), &param_kind(1));
-    for _ in 0..MAX_VOTES_PER_PROPOSAL {
-        let v = holder(&ctx, 1);
-        ctx.client.vote(&v, &id, &true);
+    for i in 0..MAX_VOTES_PER_PROPOSAL {
+        ctx.client.vote(&voters.get(i).unwrap(), &id, &true);
     }
-    let extra = holder(&ctx, 1);
+    let extra = voters.get(MAX_VOTES_PER_PROPOSAL).unwrap();
     assert_eq!(
         ctx.client.try_vote(&extra, &id, &true),
         Err(Ok(contract_err(ContractError::TooManyVotes)))
@@ -432,6 +436,79 @@ fn execute_requires_finalized_pass() {
         ctx.client.try_execute_proposal(&id),
         Err(Ok(contract_err(ContractError::ProposalNotPassed)))
     );
+}
+
+#[test]
+fn shares_received_after_creation_carry_no_vote_weight() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let a = holder(&ctx, 100);
+    let id = ctx.client.create_proposal(&a, &title(&env), &param_kind(1));
+
+    // Shares transferred in after creation are not part of the snapshot.
+    let late = Address::generate(&env);
+    ctx.client.transfer_shares(&a, &late, &60);
+    assert_eq!(
+        ctx.client.try_vote(&late, &id, &true),
+        Err(Ok(contract_err(ContractError::InsufficientShares)))
+    );
+
+    // The original holder votes with the snapshot balance, not the reduced live one.
+    ctx.client.vote(&a, &id, &true);
+    assert_eq!(ctx.client.get_proposal(&id).votes_for, 100);
+    assert_eq!(ctx.client.get_votes(&id).get(0).unwrap().weight, 100);
+}
+
+#[test]
+fn inbound_transfer_after_creation_does_not_change_vote_weight() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let voter = holder(&ctx, 50);
+    let id = ctx
+        .client
+        .create_proposal(&voter, &title(&env), &param_kind(1));
+
+    // A third party sends a share to the voter after creation. The vote still
+    // counts only the snapshot balance, and the voter cannot be locked out.
+    let dust_sender = holder(&ctx, 1);
+    ctx.client.transfer_shares(&dust_sender, &voter, &1);
+    ctx.client.vote(&voter, &id, &true);
+    assert_eq!(ctx.client.get_proposal(&id).votes_for, 50);
+}
+
+#[test]
+fn shares_sent_after_creation_still_count_once_for_the_sender() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let a = holder(&ctx, 100);
+    let b = Address::generate(&env);
+    let id = ctx.client.create_proposal(&a, &title(&env), &param_kind(1));
+
+    // `a` sends 60 to `b` after creation. Both sides together carry the
+    // snapshot total exactly once: `a` votes 100, `b` gets no weight.
+    ctx.client.transfer_shares(&a, &b, &60);
+    ctx.client.vote(&a, &id, &true);
+    assert_eq!(
+        ctx.client.try_vote(&b, &id, &true),
+        Err(Ok(contract_err(ContractError::InsufficientShares)))
+    );
+    assert_eq!(ctx.client.get_proposal(&id).total_shares_snapshot, 100);
+    assert_eq!(ctx.client.get_proposal(&id).votes_for, 100);
+}
+
+#[test]
+fn snapshot_weight_spans_multiple_changes_after_creation() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let a = holder(&ctx, 40);
+    let id = ctx.client.create_proposal(&a, &title(&env), &param_kind(1));
+    // Several changes to the same holder after creation; weight must still be 40.
+    let b = Address::generate(&env);
+    ctx.client.mint_shares(&ctx.admin, &a, &10);
+    ctx.client.transfer_shares(&a, &b, &20);
+    ctx.client.mint_shares(&ctx.admin, &a, &5);
+    ctx.client.vote(&a, &id, &false);
+    assert_eq!(ctx.client.get_proposal(&id).votes_against, 40);
 }
 
 mod outcome_properties {

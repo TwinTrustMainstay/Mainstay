@@ -1,6 +1,8 @@
 use super::*;
 use soroban_sdk::{
-    contracttype, symbol_short, testutils::Address as _, testutils::Events as _, testutils::Ledger,
+    contracttype, symbol_short,
+    testutils::{Address as _, Events as _, Ledger},
+    token::{Client as TokenClient, StellarAssetClient},
     Address, BytesN, Env, String, TryFromVal,
 };
 
@@ -217,7 +219,27 @@ fn elasticity_reflects_demand_response_to_price() {
     at(&env, T0 + 61);
     // Demand doubles and price rises 10%: elasticity = +100% / +10% = 10x.
     ctx.client.record_market_state(&ctx.admin, &10, &20);
-    assert_eq!(ctx.client.get_price_elasticity(), 100_000);
+    assert_eq!(ctx.client.get_price_elasticity(), Some(100_000));
+}
+
+#[test]
+fn elasticity_is_none_when_prior_demand_is_zero() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    // Zero prior demand: elasticity is undefined, not a neutral zero.
+    ctx.client.record_market_state(&ctx.admin, &10, &0);
+    at(&env, T0 + 61);
+    ctx.client.record_market_state(&ctx.admin, &10, &5);
+    assert_eq!(ctx.client.get_price_elasticity(), None);
+}
+
+#[test]
+fn elasticity_is_none_with_fewer_than_two_observations() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    assert_eq!(ctx.client.get_price_elasticity(), None);
+    ctx.client.record_market_state(&ctx.admin, &10, &10);
+    assert_eq!(ctx.client.get_price_elasticity(), None);
 }
 
 #[test]
@@ -498,21 +520,46 @@ fn mode_mismatches_are_rejected() {
     );
 }
 
+/// Registers a Stellar asset token and configures it as the dispute bond.
+fn configure_bond<'a>(
+    ctx: &Ctx<'a>,
+    amount: i128,
+) -> (Address, TokenClient<'a>, StellarAssetClient<'a>) {
+    let token_admin = Address::generate(ctx.env);
+    let token_id = ctx
+        .env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    ctx.client.set_dispute_bond(&ctx.admin, &token_id, &amount);
+    (
+        token_id.clone(),
+        TokenClient::new(ctx.env, &token_id),
+        StellarAssetClient::new(ctx.env, &token_id),
+    )
+}
+
+/// An awarded open auction: `cheap` wins at 1_000, `other` bid 1_500.
+fn awarded_auction(ctx: &Ctx) -> (u64, Address, Address) {
+    let id = ctx
+        .client
+        .create_auction(&ctx.admin, &open_params(ctx, WinnerCriterion::LowestPrice));
+    let cheap = engineer(ctx, CredentialStatus::Valid, 0);
+    let other = engineer(ctx, CredentialStatus::Valid, 0);
+    ctx.client.place_bid(&cheap, &id, &1_000);
+    ctx.client.place_bid(&other, &id, &1_500);
+    at(ctx.env, BID_END + 1);
+    ctx.client.finalize_auction(&id);
+    (id, cheap, other)
+}
+
 #[test]
 fn awarded_auction_can_be_disputed_and_admin_can_resolve() {
     let env = Env::default();
     let ctx = setup(&env);
-    let id = ctx
-        .client
-        .create_auction(&ctx.admin, &open_params(&ctx, WinnerCriterion::LowestPrice));
-    let cheap = engineer(&ctx, CredentialStatus::Valid, 0);
-    let other = engineer(&ctx, CredentialStatus::Valid, 0);
+    let (_token, token_client, minter) = configure_bond(&ctx, 500);
+    let (id, cheap, other) = awarded_auction(&ctx);
     let outsider = engineer(&ctx, CredentialStatus::Valid, 0);
-    ctx.client.place_bid(&cheap, &id, &1_000);
-    ctx.client.place_bid(&other, &id, &1_500);
-
-    at(&env, BID_END + 1);
-    ctx.client.finalize_auction(&id);
+    minter.mint(&other, &500);
 
     let reason = String::from_str(&env, "bid was mis-scored");
     assert_eq!(
@@ -521,16 +568,100 @@ fn awarded_auction_can_be_disputed_and_admin_can_resolve() {
     );
     ctx.client.open_dispute(&other, &id, &reason);
     assert_eq!(ctx.client.get_auction(&id).status, AuctionStatus::Disputed);
+    // Bond is escrowed in the contract while the dispute is open.
+    assert_eq!(token_client.balance(&other), 0);
+    assert_eq!(token_client.balance(&ctx.client.address), 500);
 
+    // Naming a different winner upholds the dispute: bond is refunded.
     ctx.client.resolve_dispute(&ctx.admin, &id, &other);
     let auction = ctx.client.get_auction(&id);
     assert_eq!(auction.status, AuctionStatus::Resolved);
-    assert_eq!(auction.winner, Some(other));
+    assert_eq!(auction.winner, Some(other.clone()));
     assert_eq!(auction.winning_price, 1_500);
+    assert_eq!(token_client.balance(&other), 500);
+    assert_eq!(token_client.balance(&ctx.client.address), 0);
     assert_eq!(
         ctx.client.try_resolve_dispute(&ctx.admin, &id, &cheap),
         Err(Ok(contract_err(ContractError::NotDisputed)))
     );
+}
+
+#[test]
+fn dispute_requires_a_configured_bond() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let (id, _cheap, other) = awarded_auction(&ctx);
+    assert_eq!(
+        ctx.client
+            .try_open_dispute(&other, &id, &String::from_str(&env, "x")),
+        Err(Ok(contract_err(ContractError::DisputeBondNotConfigured)))
+    );
+    assert_eq!(ctx.client.get_auction(&id).status, AuctionStatus::Awarded);
+}
+
+#[test]
+fn dispute_bond_must_be_positive() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    assert_eq!(
+        ctx.client.try_set_dispute_bond(&ctx.admin, &token_id, &0),
+        Err(Ok(contract_err(ContractError::InvalidDisputeBond)))
+    );
+}
+
+#[test]
+fn dispute_requires_the_bond_to_be_funded() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let _ = configure_bond(&ctx, 500);
+    let (id, _cheap, other) = awarded_auction(&ctx);
+    // `other` holds no bond tokens, so the escrow transfer fails and the
+    // dispute is not opened.
+    assert!(ctx
+        .client
+        .try_open_dispute(&other, &id, &String::from_str(&env, "x"))
+        .is_err());
+    assert_eq!(ctx.client.get_auction(&id).status, AuctionStatus::Awarded);
+}
+
+#[test]
+fn repeated_disputes_from_one_bidder_post_a_single_bond() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let (_token, token_client, minter) = configure_bond(&ctx, 500);
+    let (id, _cheap, other) = awarded_auction(&ctx);
+    minter.mint(&other, &1_000);
+    let reason = String::from_str(&env, "again");
+
+    ctx.client.open_dispute(&other, &id, &reason);
+    // The auction is now Disputed, so a second dispute is refused.
+    assert_eq!(
+        ctx.client.try_open_dispute(&other, &id, &reason),
+        Err(Ok(contract_err(ContractError::NotAwarded)))
+    );
+    // Only one bond was escrowed.
+    assert_eq!(token_client.balance(&other), 500);
+    assert_eq!(token_client.balance(&ctx.client.address), 500);
+}
+
+#[test]
+fn bond_is_forfeited_when_original_award_is_upheld() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let (_token, token_client, minter) = configure_bond(&ctx, 500);
+    let (id, cheap, other) = awarded_auction(&ctx);
+    minter.mint(&other, &500);
+    ctx.client
+        .open_dispute(&other, &id, &String::from_str(&env, "unfair"));
+
+    // Naming the original winner upholds the award, so the bond is not refunded.
+    ctx.client.resolve_dispute(&ctx.admin, &id, &cheap);
+    assert_eq!(ctx.client.get_auction(&id).winner, Some(cheap));
+    assert_eq!(token_client.balance(&other), 0);
+    assert_eq!(token_client.balance(&ctx.client.address), 500);
 }
 
 #[test]
