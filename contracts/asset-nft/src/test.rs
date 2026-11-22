@@ -3,7 +3,7 @@
 use crate::{AssetNft, AssetNftClient, Trade, TradeKind, MAX_HISTORY};
 use soroban_sdk::{
     contract, contractimpl, symbol_short, testutils::Address as _, testutils::Events, IntoVal,
-    TryFromVal,
+    TryFromVal, TryIntoVal, Symbol,
     token::{Client as TokenClient, StellarAssetClient},
     Address, Env, String,
 };
@@ -275,7 +275,7 @@ fn history_below_limit_emits_no_truncation_event() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #11)")]
+#[should_panic(expected = "Error(Contract, #13)")]
 fn pause_blocks_mint() {
     let env = Env::default();
     let ctx = setup(&env);
@@ -285,7 +285,7 @@ fn pause_blocks_mint() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #11)")]
+#[should_panic(expected = "Error(Contract, #13)")]
 fn pause_blocks_transfer() {
     let env = Env::default();
     let ctx = setup(&env);
@@ -297,7 +297,7 @@ fn pause_blocks_transfer() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #11)")]
+#[should_panic(expected = "Error(Contract, #13)")]
 fn pause_blocks_metadata_sync() {
     let env = Env::default();
     let ctx = setup(&env);
@@ -309,7 +309,7 @@ fn pause_blocks_metadata_sync() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #11)")]
+#[should_panic(expected = "Error(Contract, #13)")]
 fn pause_blocks_listing() {
     let env = Env::default();
     let ctx = setup(&env);
@@ -320,7 +320,7 @@ fn pause_blocks_listing() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #11)")]
+#[should_panic(expected = "Error(Contract, #13)")]
 fn pause_blocks_cancelling_listing() {
     let env = Env::default();
     let ctx = setup(&env);
@@ -332,7 +332,7 @@ fn pause_blocks_cancelling_listing() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #11)")]
+#[should_panic(expected = "Error(Contract, #13)")]
 fn pause_blocks_buy() {
     let env = Env::default();
     let ctx = setup(&env);
@@ -383,7 +383,7 @@ fn non_admin_cannot_unpause() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #12)")]
+#[should_panic(expected = "Error(Contract, #14)")]
 fn pledged_asset_cannot_be_listed() {
     let env = Env::default();
     let ctx = setup(&env);
@@ -394,7 +394,7 @@ fn pledged_asset_cannot_be_listed() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #12)")]
+#[should_panic(expected = "Error(Contract, #14)")]
 fn pledged_asset_cannot_be_transferred() {
     let env = Env::default();
     let ctx = setup(&env);
@@ -406,7 +406,7 @@ fn pledged_asset_cannot_be_transferred() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #12)")]
+#[should_panic(expected = "Error(Contract, #14)")]
 fn pledged_asset_cannot_be_sold() {
     let env = Env::default();
     let ctx = setup(&env);
@@ -433,4 +433,99 @@ fn released_lien_allows_transfer() {
     ctx.registry.set_locked(&7, &false);
     ctx.client.transfer(&alice, &bob, &token_id);
     assert_eq!(ctx.client.get_asset_owner(&7), Some(bob));
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")]
+fn transfer_to_current_owner_is_rejected() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let alice = Address::generate(&env);
+    let token_id = ctx.client.mint(&ctx.admin, &7, &alice, &uri(&env));
+    ctx.client.transfer(&alice, &alice, &token_id);
+}
+
+/// Returns the topic symbol of the most recently emitted event.
+fn last_event_topic(env: &Env) -> Symbol {
+    let events = env.events().all();
+    let (_, topics, _) = events.last().unwrap();
+    topics.get_unchecked(0).try_into_val(env).unwrap()
+}
+
+#[test]
+fn listing_emits_event() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let alice = Address::generate(&env);
+    let token_id = ctx.client.mint(&ctx.admin, &7, &alice, &uri(&env));
+
+    ctx.client.list_for_sale(&alice, &token_id, &500);
+    assert_eq!(last_event_topic(&env), symbol_short!("nft_list"));
+}
+
+#[test]
+fn cancelling_listing_emits_event() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let alice = Address::generate(&env);
+    let token_id = ctx.client.mint(&ctx.admin, &7, &alice, &uri(&env));
+
+    ctx.client.list_for_sale(&alice, &token_id, &500);
+    ctx.client.cancel_listing(&alice, &token_id);
+    assert_eq!(last_event_topic(&env), symbol_short!("nft_unlst"));
+}
+
+#[test]
+fn resale_pays_creator_royalty() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let creator = Address::generate(&env);
+    let reseller = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    ctx.payment_minter.mint(&buyer, &1_000);
+    let token_id = ctx.client.mint(&ctx.admin, &7, &creator, &uri(&env));
+    ctx.client.transfer(&creator, &reseller, &token_id);
+
+    ctx.client.set_royalty_bps(&ctx.admin, &1_000);
+    ctx.client.list_for_sale(&reseller, &token_id, &500);
+    ctx.client.buy(&buyer, &token_id);
+
+    // 10% of 500 goes to the creator; the reseller receives the rest.
+    assert_eq!(ctx.payments.balance(&creator), 50);
+    assert_eq!(ctx.payments.balance(&reseller), 450);
+    assert_eq!(ctx.payments.balance(&buyer), 500);
+    assert_eq!(ctx.client.get_asset_owner(&7), Some(buyer));
+}
+
+#[test]
+fn creator_selling_own_nft_receives_full_price() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let creator = Address::generate(&env);
+    let buyer = Address::generate(&env);
+    ctx.payment_minter.mint(&buyer, &1_000);
+    let token_id = ctx.client.mint(&ctx.admin, &7, &creator, &uri(&env));
+    ctx.client.set_royalty_bps(&ctx.admin, &1_000);
+
+    ctx.client.list_for_sale(&creator, &token_id, &500);
+    ctx.client.buy(&buyer, &token_id);
+
+    assert_eq!(ctx.payments.balance(&creator), 500);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")]
+fn royalty_above_100_percent_is_rejected() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    ctx.client.set_royalty_bps(&ctx.admin, &10_001);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")]
+fn non_admin_cannot_set_royalty() {
+    let env = Env::default();
+    let ctx = setup(&env);
+    let intruder = Address::generate(&env);
+    ctx.client.set_royalty_bps(&intruder, &500);
 }
