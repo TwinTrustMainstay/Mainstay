@@ -1,11 +1,19 @@
 //! Tests for the cross-chain bridge contract (#1743, #1744).
 
-use bridge::{Bridge, BridgeClient, ChainConfig, ReleaseParams, SwapStatus};
+use bridge::{Bridge, BridgeClient, ChainConfig, ContractError, ReleaseParams, SwapStatus};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils::{Address as _, Events as _, Ledger},
+    symbol_short,
     token::{Client as TokenClient, StellarAssetClient},
-    vec, Address, Bytes, BytesN, Env, Symbol,
+    vec, Address, Bytes, BytesN, Env, Error, IntoVal, Symbol, Val, Vec,
 };
+
+fn is_contract_error<T, C, I>(
+    res: Result<Result<T, C>, Result<Error, I>>,
+    err: ContractError,
+) -> bool {
+    matches!(res, Err(Ok(e)) if e == Error::from_contract_error(err as u32))
+}
 
 const ETH: u32 = 1;
 
@@ -27,6 +35,23 @@ fn eth_config(env: &Env) -> ChainConfig {
         window_secs: 3_600,
         window_cap: 5_000,
         alert_threshold: 4_000,
+        attestation_window_secs: 600,
+        address_len: 42,
+    }
+}
+
+/// A 56-character alphanumeric destination chain with a different address format.
+fn xlm_config(env: &Env) -> ChainConfig {
+    ChainConfig {
+        name: Symbol::new(env, "XLM"),
+        enabled: true,
+        min_amount: 10,
+        max_amount: 1_000,
+        required_confirmations: 1,
+        window_secs: 3_600,
+        window_cap: 5_000,
+        alert_threshold: 4_000,
+        address_len: 56,
         attestation_window_secs: 600,
     }
 }
@@ -100,7 +125,7 @@ fn release(ctx: &Ctx, nonce: u64, recipient: &Address, amount: i128) {
 }
 
 fn dest(ctx: &Ctx) -> Bytes {
-    Bytes::from_slice(&ctx.env, b"0xdeadbeef")
+    Bytes::from_slice(&ctx.env, b"0x00000000000000000000000000000000deadbeef")
 }
 
 // ── Outbound transfers ───────────────────────────────────────
@@ -170,6 +195,78 @@ fn test_bridge_out_rejects_empty_destination() {
 }
 
 #[test]
+fn test_bridge_out_rejects_wrong_length_destination_address() {
+    let ctx = setup();
+    let user = Address::generate(&ctx.env);
+    mint(&ctx, &user, 500);
+
+    // One byte short of the 42-byte ETH address format.
+    let short = Bytes::from_slice(&ctx.env, b"0x00000000000000000000000000000000deadbee");
+    let res = ctx
+        .client
+        .try_bridge_out(&user, &ctx.token, &100, &ETH, &short);
+    assert!(is_contract_error(
+        res,
+        ContractError::InvalidDestinationAddress
+    ));
+    assert_eq!(balance(&ctx, &user), 500);
+}
+
+#[test]
+fn test_bridge_out_rejects_non_alphanumeric_destination_address() {
+    let ctx = setup();
+    let user = Address::generate(&ctx.env);
+    mint(&ctx, &user, 500);
+
+    // Right length, but contains a space.
+    let bad = Bytes::from_slice(&ctx.env, b"0x0000000000000000000000000000000 deadbeef");
+    let res = ctx
+        .client
+        .try_bridge_out(&user, &ctx.token, &100, &ETH, &bad);
+    assert!(is_contract_error(
+        res,
+        ContractError::InvalidDestinationAddress
+    ));
+    assert_eq!(balance(&ctx, &user), 500);
+}
+
+#[test]
+fn test_bridge_out_validates_address_per_destination_chain() {
+    let ctx = setup();
+    ctx.client.add_chain(&ctx.admin, &2, &xlm_config(&ctx.env));
+    let user = Address::generate(&ctx.env);
+    mint(&ctx, &user, 500);
+
+    // The ETH 42-byte format is invalid for the 56-byte XLM chain.
+    let eth_style = Bytes::from_slice(&ctx.env, b"0x00000000000000000000000000000000deadbeef");
+    let res = ctx
+        .client
+        .try_bridge_out(&user, &ctx.token, &100, &2, &eth_style);
+    assert!(is_contract_error(
+        res,
+        ContractError::InvalidDestinationAddress
+    ));
+
+    // A 56-byte alphanumeric address is valid on XLM and rejected on ETH.
+    let xlm_style = Bytes::from_slice(
+        &ctx.env,
+        b"GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN7",
+    );
+    assert_eq!(
+        ctx.client
+            .bridge_out(&user, &ctx.token, &100, &2, &xlm_style),
+        1
+    );
+    let res = ctx
+        .client
+        .try_bridge_out(&user, &ctx.token, &100, &ETH, &xlm_style);
+    assert!(is_contract_error(
+        res,
+        ContractError::InvalidDestinationAddress
+    ));
+}
+
+#[test]
 fn test_bridge_out_rejects_unknown_chain() {
     let ctx = setup();
     let user = Address::generate(&ctx.env);
@@ -199,6 +296,39 @@ fn test_release_executes_only_at_threshold() {
     let pending = ctx.client.get_release(&ETH, &1).unwrap();
     assert!(pending.executed);
     assert_eq!(balance(&ctx, &recipient), 300);
+}
+
+#[test]
+fn test_release_event_lists_approving_relayers() {
+    use soroban_sdk::{IntoVal, TryFromVal};
+
+    let ctx = setup();
+    let recipient = Address::generate(&ctx.env);
+    mint(&ctx, &ctx.client.address, 1_000);
+    release(&ctx, 7, &recipient, 300);
+
+    let br_rel = Symbol::new(&ctx.env, "BR_REL");
+    let events = ctx.env.events().all();
+    let (_, _, data) = events
+        .iter()
+        .find(|(_, topics, _)| {
+            topics
+                .get(0)
+                .and_then(|t| Symbol::try_from_val(&ctx.env, &t).ok())
+                == Some(br_rel.clone())
+        })
+        .expect("BR_REL event emitted on execution");
+
+    let payload: (u32, u64, Address, Address, i128, soroban_sdk::Vec<Address>) =
+        data.into_val(&ctx.env);
+    assert_eq!(payload.0, ETH);
+    assert_eq!(payload.1, 7);
+    assert_eq!(payload.2, recipient);
+    assert_eq!(payload.4, 300);
+    assert_eq!(
+        payload.5,
+        vec![&ctx.env, ctx.relayers[0].clone(), ctx.relayers[1].clone()]
+    );
 }
 
 #[test]
@@ -447,6 +577,26 @@ fn test_swap_refund_only_after_expiry() {
 }
 
 #[test]
+fn test_swap_refund_emits_sender_token_and_amount() {
+    let ctx = setup();
+    let preimage = Bytes::from_slice(&ctx.env, b"secret");
+    let (id, sender, _) = open_swap(&ctx, &preimage, 1_000);
+
+    ctx.env.ledger().set_timestamp(1_000);
+    ctx.client.refund_swap(&id);
+
+    // BR_SWP_R is published after the payout transfer, so it is the last event.
+    let (contract, topics, data) = ctx.env.events().all().last().unwrap();
+    assert_eq!(contract, ctx.client.address);
+    assert_eq!(
+        topics,
+        vec![&ctx.env, symbol_short!("BR_SWP_R").into_val(&ctx.env)]
+    );
+    let emitted: (u64, Address, Address, i128) = data.into_val(&ctx.env);
+    assert_eq!(emitted, (id, sender, ctx.token.clone(), 200_i128));
+}
+
+#[test]
 fn test_swap_cannot_be_opened_with_past_expiry() {
     let ctx = setup();
     ctx.env.ledger().set_timestamp(500);
@@ -464,6 +614,62 @@ fn test_swap_cannot_be_opened_with_past_expiry() {
             &400
         )
         .is_err());
+}
+
+#[test]
+fn test_swap_expiry_capped_by_max_duration() {
+    let ctx = setup();
+    ctx.env.ledger().set_timestamp(1_000);
+    ctx.client.set_max_swap_duration(&ctx.admin, &3_600);
+    assert_eq!(ctx.client.get_max_swap_duration(), 3_600);
+
+    let sender = Address::generate(&ctx.env);
+    mint(&ctx, &sender, 500);
+    let hashlock = BytesN::from_array(&ctx.env, &[9u8; 32]);
+    let recipient = Address::generate(&ctx.env);
+
+    // Exactly at the boundary is accepted.
+    ctx.client.create_swap(
+        &sender,
+        &recipient,
+        &ctx.token,
+        &100,
+        &hashlock,
+        &(1_000 + 3_600),
+    );
+    // One second beyond the boundary is rejected.
+    assert!(ctx
+        .client
+        .try_create_swap(
+            &sender,
+            &recipient,
+            &ctx.token,
+            &100,
+            &hashlock,
+            &(1_000 + 3_601)
+        )
+        .is_err());
+}
+
+#[test]
+fn test_default_max_swap_duration_is_30_days() {
+    let ctx = setup();
+    assert_eq!(ctx.client.get_max_swap_duration(), 30 * 24 * 60 * 60);
+}
+
+#[test]
+fn test_set_max_swap_duration_is_admin_only_and_nonzero() {
+    let ctx = setup();
+    let impostor = Address::generate(&ctx.env);
+    assert!(ctx
+        .client
+        .try_set_max_swap_duration(&impostor, &3_600)
+        .is_err());
+    assert!(ctx
+        .client
+        .try_set_max_swap_duration(&ctx.admin, &0)
+        .is_err());
+    assert_eq!(ctx.client.get_max_swap_duration(), 30 * 24 * 60 * 60);
 }
 
 #[test]
@@ -546,6 +752,10 @@ fn test_add_chain_rejects_duplicate_and_invalid_config() {
         .client
         .try_add_chain(&ctx.admin, &3, &bad_alert)
         .is_err());
+
+    let mut zero_len = eth_config(&ctx.env);
+    zero_len.address_len = 0;
+    assert!(ctx.client.try_add_chain(&ctx.admin, &4, &zero_len).is_err());
 }
 
 #[test]
@@ -701,4 +911,175 @@ fn test_add_chain_rejects_zero_attestation_window() {
         .client
         .try_add_chain(&ctx.admin, &4, &cfg)
         .is_err());
+}
+
+#[test]
+fn test_initialize_requires_admin_authorization() {
+    let env = Env::default();
+    let contract_id = env.register(Bridge, ());
+    let client = BridgeClient::new(&env, &contract_id);
+
+    // No auth is mocked, so the admin never signed the initialize call.
+    let admin = Address::generate(&env);
+    assert!(client.try_initialize(&admin).is_err());
+}
+
+// ── Admin and configuration events ───────────────────────────
+
+/// Topic and payload of the most recent event emitted by the bridge.
+fn last_event(ctx: &Ctx) -> (Vec<Val>, Val) {
+    let (_, topics, data) = ctx.env.events().all().last().unwrap();
+    (topics, data)
+}
+
+#[test]
+fn test_pause_and_unpause_emit_admin_events() {
+    let ctx = setup();
+
+    ctx.client.pause(&ctx.admin);
+    let (topics, data) = last_event(&ctx);
+    assert_eq!(
+        topics,
+        vec![&ctx.env, symbol_short!("BR_PAUSE").into_val(&ctx.env)]
+    );
+    let (who,): (Address,) = data.into_val(&ctx.env);
+    assert_eq!(who, ctx.admin);
+
+    ctx.client.unpause(&ctx.admin);
+    let (topics, data) = last_event(&ctx);
+    assert_eq!(
+        topics,
+        vec![&ctx.env, symbol_short!("BR_RESUME").into_val(&ctx.env)]
+    );
+    let (who,): (Address,) = data.into_val(&ctx.env);
+    assert_eq!(who, ctx.admin);
+}
+
+#[test]
+fn test_set_relayers_emits_threshold_and_relayer_set() {
+    let ctx = setup();
+    let fresh = [Address::generate(&ctx.env), Address::generate(&ctx.env)];
+    let new_set = vec![&ctx.env, fresh[0].clone(), fresh[1].clone()];
+
+    ctx.client.set_relayers(&ctx.admin, &new_set, &1);
+
+    let (topics, data) = last_event(&ctx);
+    assert_eq!(
+        topics,
+        vec![&ctx.env, symbol_short!("BR_RELAYS").into_val(&ctx.env)]
+    );
+    let emitted: (Address, u32, Vec<Address>) = data.into_val(&ctx.env);
+    assert_eq!(emitted, (ctx.admin.clone(), 1, new_set));
+}
+
+#[test]
+fn test_add_update_and_enable_chain_emit_events() {
+    let ctx = setup();
+    let base_cfg = eth_config(&ctx.env);
+
+    let mut new_cfg = eth_config(&ctx.env);
+    new_cfg.name = Symbol::new(&ctx.env, "POLY");
+    ctx.client.add_chain(&ctx.admin, &2, &new_cfg);
+    let (topics, data) = last_event(&ctx);
+    assert_eq!(
+        topics,
+        vec![&ctx.env, symbol_short!("BR_CH_ADD").into_val(&ctx.env)]
+    );
+    let emitted: (Address, u32, ChainConfig) = data.into_val(&ctx.env);
+    assert_eq!(emitted, (ctx.admin.clone(), 2, new_cfg.clone()));
+
+    let mut updated = base_cfg.clone();
+    updated.max_amount = 2_000;
+    ctx.client.update_chain(&ctx.admin, &ETH, &updated);
+    let (topics, data) = last_event(&ctx);
+    assert_eq!(
+        topics,
+        vec![&ctx.env, symbol_short!("BR_CH_UPD").into_val(&ctx.env)]
+    );
+    let emitted: (Address, u32, ChainConfig) = data.into_val(&ctx.env);
+    assert_eq!(emitted, (ctx.admin.clone(), ETH, updated));
+
+    ctx.client.set_chain_enabled(&ctx.admin, &ETH, &false);
+    let (topics, data) = last_event(&ctx);
+    assert_eq!(
+        topics,
+        vec![&ctx.env, symbol_short!("BR_CH_ENB").into_val(&ctx.env)]
+    );
+    let emitted: (Address, u32, bool) = data.into_val(&ctx.env);
+    assert_eq!(emitted, (ctx.admin.clone(), ETH, false));
+}
+
+// ── Relayer-observed confirmations ───────────────────────────
+
+fn attest_with_confirmations(
+    ctx: &Ctx,
+    relayer: &Address,
+    nonce: u64,
+    recipient: &Address,
+    amount: i128,
+    confirmations: u32,
+) {
+    ctx.client.attest_release(
+        relayer,
+        &ETH,
+        &nonce,
+        &ReleaseParams {
+            token: ctx.token.clone(),
+            recipient: recipient.clone(),
+            amount,
+            confirmations,
+        },
+    );
+}
+
+#[test]
+fn test_disagreeing_confirmations_are_stored_per_relayer() {
+    let ctx = setup();
+    let recipient = Address::generate(&ctx.env);
+    // The release pays out of the bridge's own balance, so fund it first.
+    mint(&ctx, &ctx.client.address, 100);
+
+    attest_with_confirmations(&ctx, &ctx.relayers[0], 7, &recipient, 100, 12);
+    // Stays pending until the threshold is reached, so the record is readable.
+    let pending = ctx.client.get_release(&ETH, &7).unwrap();
+    assert_eq!(pending.confirmations, vec![&ctx.env, 12]);
+    assert!(!pending.executed);
+
+    attest_with_confirmations(&ctx, &ctx.relayers[1], 7, &recipient, 100, 30);
+
+    let pending = ctx.client.get_release(&ETH, &7).unwrap();
+    assert_eq!(pending.approvals.len(), 2);
+    assert_eq!(pending.confirmations, vec![&ctx.env, 12, 30]);
+    assert!(pending.executed);
+    assert_eq!(balance(&ctx, &recipient), 100);
+}
+
+#[test]
+fn test_attestation_below_requirement_does_not_count_toward_threshold() {
+    let ctx = setup();
+    let recipient = Address::generate(&ctx.env);
+    mint(&ctx, &ctx.client.address, 100);
+
+    // Relayer 0 reports 12, which meets the requirement. Relayer 1 reports 11,
+    // which is below it, so its attestation is refused outright.
+    attest_with_confirmations(&ctx, &ctx.relayers[0], 8, &recipient, 100, 12);
+    assert!(ctx
+        .client
+        .try_attest_release(
+            &ctx.relayers[1],
+            &ETH,
+            &8,
+            &ReleaseParams {
+                token: ctx.token.clone(),
+                recipient: recipient.clone(),
+                amount: 100,
+                confirmations: 11,
+            },
+        )
+        .is_err());
+
+    let pending = ctx.client.get_release(&ETH, &8).unwrap();
+    assert_eq!(pending.approvals.len(), 1);
+    assert!(!pending.executed);
+    assert_eq!(balance(&ctx, &recipient), 0);
 }

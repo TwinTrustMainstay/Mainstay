@@ -83,16 +83,52 @@ pub enum ContractError {
     InsuranceAlreadyRegistered = 33,
     /// Insurance coverage must be greater than zero.
     ZeroInsuranceCoverage = 34,
+    /// Suspension period is invalid.
+    InvalidSuspensionPeriod = 35,
+    /// The restructure proposal has already been accepted and cannot be reused.
+    RestructureAlreadyProcessed = 36,
+    /// Restructured payment must be greater than zero and not exceed the loan amount.
+    RestructureAmountInvalid = 37,
+    /// The restructure proposal does not refer to the borrower's active loan.
+    RestructureLoanMismatch = 38,
+    /// The loan is inside an accepted restructure's forbearance period and cannot be slashed.
+    InForbearance = 39,
+    /// This lender has already voted on this action for this loan.
+    AlreadyVoted = 40,
+    /// The syndicate has not reached its quorum of approving votes.
+    QuorumNotReached = 41,
     /// A syndicate already exists for this loan (#1865).
-    SyndicateAlreadyExists = 35,
+    SyndicateAlreadyExists = 42,
     /// The lenders and shares lists have different lengths (#1865).
-    SyndicateLengthMismatch = 36,
+    SyndicateLengthMismatch = 43,
     /// Quorum must be between 1 and the number of lenders (#1865).
-    InvalidQuorum = 37,
+    InvalidQuorum = 44,
     /// Every syndicate share must be non-zero (#1865).
-    ZeroSyndicateShare = 38,
-    /// Suspension period is invalid (shared error mapping).
-    InvalidSuspensionPeriod = 39,
+    ZeroSyndicateShare = 45,
+}
+
+/// Syndicate action symbol used when a restructure must be approved by the syndicate.
+const RESTRUCTURE_ACTION: Symbol = symbol_short!("RESTRUCT");
+
+fn syndicate_vote_key(loan_id: u64, action: &Symbol, lender: &Address) -> (Symbol, u64, Symbol, Address) {
+    (symbol_short!("SVOTE"), loan_id, action.clone(), lender.clone())
+}
+
+/// Counts the approving votes cast for `action` on `loan_id` by the syndicate's lenders.
+fn count_syndicate_approvals(env: &Env, syndicate: &Syndicate, action: &Symbol) -> u32 {
+    let mut approvals: u32 = 0;
+    for lender in syndicate.lenders.iter() {
+        if let Some(vote) = env
+            .storage()
+            .persistent()
+            .get::<_, SyndicateVote>(&syndicate_vote_key(syndicate.loan_id, action, &lender))
+        {
+            if vote.voted {
+                approvals += 1;
+            }
+        }
+    }
+    approvals
 }
 
 impl From<SharedContractError> for ContractError {
@@ -321,7 +357,7 @@ fn loan_status_key(loan_id: u64) -> (soroban_sdk::Symbol, u64) {
 fn set_loan_status(env: &Env, loan_id: u64, status: LoanStatus) {
     let key = loan_status_key(loan_id);
     env.storage().persistent().set(&key, &status);
-    extend_persistent_ttl(env, &key);
+    extend_persistent_ttl(env, key.clone());
 }
 
 fn get_loan_status(env: &Env, loan_id: u64) -> Option<LoanStatus> {
@@ -727,7 +763,7 @@ impl LendingContract {
             id: new_loan_id,
         };
         env.storage().persistent().set(&key, &loan);
-        extend_persistent_ttl(&env, &key);
+        extend_persistent_ttl(&env, key.clone());
         set_loan_status(&env, new_loan_id, LoanStatus::Active);
 
         // Transfer the loan amount to the borrower
@@ -808,7 +844,7 @@ impl LendingContract {
 
         loan.status = LoanStatus::Repaid;
         env.storage().persistent().set(&key, &loan);
-        extend_persistent_ttl(&env, &key);
+        extend_persistent_ttl(&env, key.clone());
         set_loan_status(&env, loan.id, LoanStatus::Repaid);
 
         // Track successful repayments in the borrower record for credit scoring.
@@ -918,7 +954,7 @@ impl LendingContract {
             stake,
         });
         env.storage().persistent().set(&key, &vouches);
-        extend_persistent_ttl(&env, &key);
+        extend_persistent_ttl(&env, key.clone());
 
         let hist_key = voucher_history_key(&voucher);
         let mut history: Vec<Address> = env
@@ -953,9 +989,20 @@ impl LendingContract {
             panic_with_error!(&env, ContractError::NoActiveLoan);
         }
 
+        // #1863: An accepted restructure suspends default until its forbearance ends.
+        if let Some(proposal) = env
+            .storage()
+            .persistent()
+            .get::<_, RestructureProposal>(&restructure_key(loan.id))
+        {
+            if proposal.status == 1 && env.ledger().timestamp() < proposal.forbearance_end {
+                panic_with_error!(&env, ContractError::InForbearance);
+            }
+        }
+
         loan.status = LoanStatus::Defaulted;
         env.storage().persistent().set(&key, &loan);
-        extend_persistent_ttl(&env, &key);
+        extend_persistent_ttl(&env, key.clone());
         set_loan_status(&env, loan.id, LoanStatus::Defaulted);
 
         let default_time = env.ledger().timestamp();
@@ -1087,7 +1134,7 @@ impl LendingContract {
 
             vouches.remove(idx);
             env.storage().persistent().set(&key, &vouches);
-            extend_persistent_ttl(&env, &key);
+            extend_persistent_ttl(&env, key.clone());
 
             let token_addr = get_token(&env);
             let tok = token::Client::new(&env, &token_addr);
@@ -1529,6 +1576,12 @@ impl LendingContract {
             panic_with_error!(&env, ContractError::NotSyndicateLender);
         }
 
+        // #1864: each lender may vote once per action per loan.
+        let key = syndicate_vote_key(loan_id, &action, &lender);
+        if env.storage().persistent().has(&key) {
+            panic_with_error!(&env, ContractError::AlreadyVoted);
+        }
+
         let vote_record = SyndicateVote {
             lender,
             loan_id,
@@ -1536,7 +1589,23 @@ impl LendingContract {
             voted: vote,
         };
 
+        env.storage().persistent().set(&key, &vote_record);
+        extend_persistent_ttl(&env, key.clone());
+
         env.events().publish((SYNDICATE_VOTED,), (loan_id, vote));
+    }
+
+    /// Returns the number of approving votes for `action` on `loan_id`.
+    /// Returns 0 when the loan has no syndicate.
+    pub fn get_syndicate_approvals(env: Env, loan_id: u64, action: Symbol) -> u32 {
+        match env
+            .storage()
+            .persistent()
+            .get::<_, Syndicate>(&syndicate_key(loan_id))
+        {
+            Some(syndicate) => count_syndicate_approvals(&env, &syndicate, &action),
+            None => 0,
+        }
     }
 
     /// Get syndicate details for a loan.
@@ -1566,6 +1635,11 @@ impl LendingContract {
 
         if loan.status != LoanStatus::Active {
             panic_with_error!(&env, ContractError::NoActiveLoan);
+        }
+
+        // #1863: The proposal must bind to the borrower's active loan.
+        if loan.id != loan_id {
+            panic_with_error!(&env, ContractError::RestructureLoanMismatch);
         }
 
         // Set forbearance period to 30 days from now
@@ -1602,6 +1676,24 @@ impl LendingContract {
             .get(&restructure_key(loan_id))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::RestructureNotFound));
 
+        // #1864: a syndicated loan's restructure needs the syndicate's quorum of approvals.
+        if let Some(syndicate) = env
+            .storage()
+            .persistent()
+            .get::<_, Syndicate>(&syndicate_key(loan_id))
+        {
+            let approvals = count_syndicate_approvals(&env, &syndicate, &RESTRUCTURE_ACTION);
+            if approvals < syndicate.quorum_required {
+                panic_with_error!(&env, ContractError::QuorumNotReached);
+            }
+        }
+
+        // #1861: A proposal may be accepted once; replaying it would re-extend
+        // the deadline and burn restructure slots.
+        if proposal.status != 0 {
+            panic_with_error!(&env, ContractError::RestructureAlreadyProcessed);
+        }
+
         // Check restructuring limits (max 3 restructures per borrower)
         let borrower_count_key = restructure_count_key(&proposal.borrower);
         let count: u32 = env.storage().persistent().get(&borrower_count_key).unwrap_or(0);
@@ -1616,6 +1708,13 @@ impl LendingContract {
             .get(&loan_key(&proposal.borrower))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoActiveLoan));
 
+        // #1862: reduced_payment_amount is the restructured amount due. It must
+        // lower the obligation (never raise it, never reach zero) and is applied
+        // to the loan so repay settles against the agreed amount.
+        if proposal.reduced_payment_amount == 0 || proposal.reduced_payment_amount > loan.amount {
+            panic_with_error!(&env, ContractError::RestructureAmountInvalid);
+        }
+        loan.amount = proposal.reduced_payment_amount;
         loan.deadline = proposal.new_deadline;
         env.storage().persistent().set(&loan_key(&proposal.borrower), &loan);
         extend_persistent_ttl(&env, &loan_key(&proposal.borrower));
@@ -1623,6 +1722,12 @@ impl LendingContract {
         // Increment restructure count
         env.storage().persistent().set(&borrower_count_key, &(count + 1));
         extend_persistent_ttl(&env, &borrower_count_key);
+
+        // Mark the proposal as accepted in the same logical write so it cannot be replayed.
+        let mut accepted = proposal.clone();
+        accepted.status = 1;
+        env.storage().persistent().set(&restructure_key(loan_id), &accepted);
+        extend_persistent_ttl(&env, &restructure_key(loan_id));
 
         env.events().publish((RESTRUCTURE_ACCEPTED,), (loan_id, proposal.new_deadline));
     }
@@ -1670,7 +1775,7 @@ impl LendingContract {
         };
 
         env.storage().persistent().set(&key, &insurance);
-        extend_persistent_ttl(&env, &key);
+        extend_persistent_ttl(&env, key.clone());
         let lender_key = insurance_lender_key(asset_id);
         env.storage().persistent().set(&lender_key, &lender);
         extend_persistent_ttl(&env, &lender_key);
@@ -2497,20 +2602,28 @@ mod tests {
         }
     }
 
-    /// A minimal mock lifecycle contract that always returns ineligible.
-    #[contract]
-    pub struct MockLifecycleIneligible;
+    // Own module: #[contractimpl] generates per-function items, so the two mock lifecycle
+    // contracts (which export the same function names) cannot share one scope.
+    mod ineligible_lifecycle {
+        use super::*;
 
-    #[contractimpl]
-    impl MockLifecycleIneligible {
-        pub fn is_collateral_eligible(_env: Env, _asset_id: u64) -> bool {
-            false
-        }
+        /// A minimal mock lifecycle contract that always returns ineligible.
+        #[contract]
+        pub struct MockLifecycleIneligible;
 
-        pub fn get_collateral_score(_env: Env, _asset_id: u64) -> u32 {
-            0u32
+        #[contractimpl]
+        impl MockLifecycleIneligible {
+            pub fn is_collateral_eligible(_env: Env, _asset_id: u64) -> bool {
+                false
+            }
+
+            pub fn get_collateral_score(_env: Env, _asset_id: u64) -> u32 {
+                0u32
+            }
         }
     }
+
+    use ineligible_lifecycle::MockLifecycleIneligible;
 
     /// #1019: When a lifecycle contract is configured and the asset is eligible,
     /// request_loan should succeed.

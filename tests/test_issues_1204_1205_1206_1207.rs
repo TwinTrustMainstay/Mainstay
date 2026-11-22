@@ -154,7 +154,7 @@ fn test_anchor_history_to_snapshot_emits_admin_audit_event() {
     let env = Env::default();
     let s = Setup::new(&env);
 
-    s.lifecycle.take_health_snapshot(&s.asset_id);
+    s.lifecycle.take_health_snapshot(&s.asset_owner, &s.asset_id);
     s.lifecycle
         .anchor_history_to_snapshot(&s.lc_admin, &s.asset_id, &0);
 
