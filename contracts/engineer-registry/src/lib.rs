@@ -317,7 +317,7 @@ impl EngineerRegistry {
 
         // Emit engineer registration event
         env.events().publish(
-            (symbol_short!("reg_eng"),),
+            (REG_ENG_TOPIC,),
             (
                 engineer.clone(),
                 credential_hash.clone(),
@@ -1278,12 +1278,12 @@ mod tests {
         let issued_at = env.ledger().timestamp();
         client.register_engineer(&engineer, &hash, &issuer, &validity_period, &None);
 
-        // ISS_ADD event fires first, reg_eng is the second event
+        // ISS_ADD event fires first, REG_ENG is the second event
         let events = env.events().all();
         let (_, topics, data) = events.last().unwrap();
 
         use soroban_sdk::TryIntoVal;
-        let reg_topic = symbol_short!("reg_eng");
+        let reg_topic = symbol_short!("REG_ENG");
         let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
         assert_eq!(t0, reg_topic);
 
