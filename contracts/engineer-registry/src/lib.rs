@@ -256,6 +256,7 @@ const ENGINEER_COUNT: Symbol = symbol_short!("ENG_CNT");
 #[allow(dead_code)]
 const REG_ENG_TOPIC: Symbol = symbol_short!("REG_ENG");
 const REVOKE_TOPIC: Symbol = symbol_short!("REV_CRED");
+const REVOKE_PROPOSED_TOPIC: Symbol = symbol_short!("PROP_RVK");
 const SUSPEND_TOPIC: Symbol = symbol_short!("SUSP_ENG");
 #[allow(dead_code)]
 const UNSUSPEND_TOPIC: Symbol = symbol_short!("UNSUSP_E");
@@ -464,14 +465,19 @@ impl EngineerRegistry {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
         record.issuer.require_auth();
         let key = revoke_timelock_key(&engineer);
+        let proposed_at = env.ledger().timestamp();
         env.storage().persistent().set(
             &key,
             &TimelockProposal {
-                proposed_at: env.ledger().timestamp(),
+                proposed_at,
                 executed: false,
             },
         );
         extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (REVOKE_PROPOSED_TOPIC, engineer.clone()),
+            (record.issuer.clone(), engineer, proposed_at),
+        );
     }
 
     /// Execute a pending engineer credential revocation after its timelock has expired.
@@ -2666,6 +2672,38 @@ mod tests {
         assert_eq!(emitted_hash, hash);
         assert_eq!(emitted_revoked_by, issuer);
         assert_eq!(emitted_timestamp, revoked_at);
+    }
+
+    #[test]
+    fn test_propose_revoke_credential_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+
+        let proposed_at = env.ledger().timestamp();
+        client.propose_revoke_credential(&engineer);
+
+        let events = env.events().all();
+        let (_, topics, data) = events.last().unwrap();
+
+        use soroban_sdk::TryIntoVal;
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, REVOKE_PROPOSED_TOPIC);
+        let t1: Address = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t1, engineer);
+
+        let (emitted_issuer, emitted_engineer, emitted_timestamp): (Address, Address, u64) =
+            data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_issuer, issuer);
+        assert_eq!(emitted_engineer, engineer);
+        assert_eq!(emitted_timestamp, proposed_at);
     }
 
     #[test]
