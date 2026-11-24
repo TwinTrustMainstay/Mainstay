@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "account": {
+    "name": "sample-account",
+    "api_key": "fixture-api-key-secret",
+    "password": "fixture-password-secret",
+    "profile": {
+      "region": "eu-west"
+    }
+  },
+  "wallet": {
+    "privateKey": "fixture-private-key-secret",
+    "seed_phrase": "fixture-seed-phrase-secret"
+  },
+  "sessions": [
+    {
+      "status": "active",
+      "refresh_token": "fixture-refresh-token-secret"
+    }
+  ]
+}
