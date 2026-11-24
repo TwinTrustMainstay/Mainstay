@@ -1,5 +1,6 @@
 #![no_std]
 
+use shared::error::SharedContractError;
 use soroban_sdk::contracterror;
 
 #[contracterror]
@@ -29,4 +30,77 @@ pub enum ContractError {
     NotesTooLong = 20,
     /// Asset score is frozen due to decommission; decay and mutation are blocked.
     ScoreFrozen = 21,
+    /// Asset is decommissioned and cannot accept maintenance records.
+    AssetDecommissioned = 22,
+    /// Batch submission exceeds the maximum allowed batch size (DoS / gas-limit guard).
+    BatchTooLarge = 23,
+    /// Fewer valid signers were provided than the configured admin_threshold requires.
+    InsufficientSigners = 24,
+    /// A reentrant call was detected: the contract is already executing submit_maintenance.
+    Reentrancy = 25,
+    /// The admins list supplied to set_admin_quorum contains a duplicate address.
+    DuplicateAdmin = 26,
+    /// The requested health snapshot index does not exist for the given asset.
+    SnapshotNotFound = 27,
+    /// Fewer than 2 matching task-type records exist; cannot compute a prediction.
+    InsufficientPredictionData = 28,
+    /// A weight-change proposal already exists and has not been executed yet.
+    WeightProposalAlreadyExists = 29,
+    /// Engineer's specialization does not match the asset's type.
+    SpecializationMismatch = 30,
+    /// No recurring task exists with the given task_id for this asset.
+    RecurringTaskNotFound = 31,
+    /// The recurring task exists but is not active.
+    RecurringTaskInactive = 32,
+    /// A recurring task with an equivalent schedule already exists for this asset.
+    DuplicateRecurringTask = 33,
+    /// Recurring task interval_type/interval_value combination is invalid.
+    InvalidRecurringSchedule = 34,
+    /// No duplicate maintenance record exists with the given timestamp.
+    DuplicateRecordNotFound = 35,
+    /// A compliance standard is already registered for this asset type.
+    StandardAlreadyRegistered = 36,
+    /// Engineer has exceeded the configured max_submissions_per_hour rate limit.
+    RateLimitExceeded = 37,
+    /// Bulk engineer authorization revocation exceeds the maximum allowed batch size.
+    BatchRevokeTooLarge = 38,
+    /// The admins list supplied to set_admin_quorum exceeds the maximum allowed size (10).
+    TooManyAdmins = 39,
+    /// Insufficient fee provided for the maintenance submission priority level (#1313).
+    InsufficientFee = 40,
+    ConflictOfInterest = 41,
+    UnauthorizedAttestor = 42,
+    RecordNotFound = 43,
+    CompressionFailed = 44,
+    CompressionRequiresDecommissioned = 45,
+    /// No timestamp authority is registered under the given `authority_id` (#1750).
+    TimestampAuthorityNotFound = 46,
+    /// The timestamp authority is revoked, or is not active at the token's `issued_at` (#1750).
+    TimestampAuthorityInactive = 47,
+    /// Token window is invalid: `expires_at` must be after `issued_at`, and `issued_at` must not be in the future (#1750).
+    InvalidTimestampWindow = 48,
+    /// A renewal token's `issued_at` must be strictly later than the stored token's (#1750).
+    TimestampNotNewer = 49,
+    /// No notary is registered under the given `notary_id` (#1753).
+    NotaryNotFound = 50,
+    /// The notary is revoked (#1753).
+    NotaryInactive = 51,
+    /// The notary's accreditation credential has expired (#1753).
+    NotaryCredentialExpired = 52,
+    /// The maintenance record already has a notarization (#1753).
+    AlreadyNotarized = 53,
+}
+
+impl From<SharedContractError> for ContractError {
+    fn from(e: SharedContractError) -> Self {
+        match e {
+            SharedContractError::NotInitialized => ContractError::NotInitialized,
+            SharedContractError::AlreadyInitialized => ContractError::AlreadyInitialized,
+            SharedContractError::UnauthorizedAdmin => ContractError::UnauthorizedAdmin,
+            SharedContractError::Paused => ContractError::Paused,
+            SharedContractError::TimelockNotExpired => ContractError::TimelockNotExpired,
+            SharedContractError::ProposalNotFound => ContractError::ProposalNotFound,
+            SharedContractError::PendingAdminAlreadyExists => ContractError::PendingAdminAlreadyExists,
+        }
+    }
 }

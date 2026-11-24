@@ -5,6 +5,83 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+- Added invoice cost reconciliation, task grouping, maintenance dispute resolution,
+  and hash-based maintenance evidence attachments to the lifecycle contract.
+
+### Added
+- `lending`: `record_lien` now emits a `lien_cr` event with `asset_id` and `loan_id` (closes [#2007](https://github.com/TwinTrustMainstay/Mainstay/issues/2007))
+- `lending`: `release_lien` now emits a `lien_rl` event with `asset_id` and `loan_id` (closes [#2007](https://github.com/TwinTrustMainstay/Mainstay/issues/2007))
+- `lending`: `set_market_oracle` now emits an `oracl_set` event with the new oracle address (closes [#2008](https://github.com/TwinTrustMainstay/Mainstay/issues/2008))
+- `lending`: `update_market_conditions` now emits a `mkt_upd` event with `volatility` and `price_change_bps` (closes [#2008](https://github.com/TwinTrustMainstay/Mainstay/issues/2008))
+- `lending`: `slash_treasury` now emits a `trsry_sl` event with the admin address and amount transferred (closes [#2009](https://github.com/TwinTrustMainstay/Mainstay/issues/2009))
+- `lending`: `set_max_ltv_bps` now emits an `ltv_set` event with the old and new basis-point values (closes [#2006](https://github.com/TwinTrustMainstay/Mainstay/issues/2006))
+- Frequently asked questions (#1721): 28 questions in eight topics, generated
+  from `docs/faq/faq.json` into `docs/faq.md` and a searchable page at
+  `docs/faq/index.html`. The page supports "was this helpful?" votes. An
+  optional `FEEDBACK_URL` sends votes and zero-result searches to a backend.
+  A FAQ question issue template is included.
+- Data model reference (#1720): entity relationship diagrams, state transitions
+  for assets, credentials, and loans, encoding rules for addresses, symbols,
+  hashes, timestamps, and amounts, worked JSON examples, and a data dictionary.
+- Performance tuning guide for operators (#1719): per-operation cost drivers and
+  limits, batching and pagination guidance, metrics to monitor, and a method for
+  recording before/after measurements.
+- API reference generated from the contract sources (#1718): an OpenAPI 3.0
+  spec, a Swagger UI explorer with filtering and "Try it out", and curl examples
+  for every contract function. Regenerate with `scripts/generate_api_docs.py`.
+- New `marketplace` contract (`contracts/marketplace`) with dynamic maintenance pricing: the admin records supply (available engineers) and demand (pending tasks), and the price moves toward the implied multiplier with a surge cap, a per-update step limit, and a minimum update interval. Price history (bounded to 100 observations) and a demand-elasticity estimate are exposed (closes [#1738](https://github.com/TwinTrustMainstay/Mainstay/issues/1738))
+- `marketplace` maintenance auctions: open auctions and sealed-bid (commit/reveal) auctions for maintenance tasks, with lowest-price or highest-reputation winner selection, bid history, and bidder disputes resolved by the admin within a 3-day window. Bids require a valid or grace-period engineer credential (closes [#1739](https://github.com/TwinTrustMainstay/Mainstay/issues/1739))
+- New `governance` contract (`contracts/governance`): transferable voting shares, proposals for platform parameter changes or treasury funding grants, quorum- and approval-threshold voting, execution of passed proposals, and per-proposal vote history. A voter's shares are locked until the proposal's voting period ends (closes [#1740](https://github.com/TwinTrustMainstay/Mainstay/issues/1740))
+- `award_quality_bonus` in `engineer-registry`: admin-only reward of 1–50 reputation points for high-quality work, capped at the 1000 maximum (closes [#1741](https://github.com/TwinTrustMainstay/Mainstay/issues/1741))
+- `ContractError` (`marketplace`) variants 1–22 (`NotInitialized` through `BidLimitReached`); `ContractError` (`governance`) variants 1–17 (`NotInitialized` through `TooManyVotes`)
+- `ContractError` (`engineer-registry`) variant `InvalidReputationBonus` (37)
+- Storage keys added: `marketplace` `PriceHistory`, `Auction`, `Bids`, `Commit`, `Pricing`, `Registry`, `NextAuctionId`; `governance` `Shares`, `TotalShares`, `LockedUntil`, `Treasury`, `Proposal`, `Votes`, `Voted`, `Param`, `Config`, `NextProposalId`
+- `scripts/export-assets.py` exports backed-up asset records to CSV and
+  dependency-free Excel `.xlsx` workbooks.
+- `mainstay-sdk`: an official typed Rust facade for registration, asset lookup,
+  and faceted asset search.
+- `scripts/mock-soroban-rpc.py` and its fixture provide a deterministic,
+  dependency-free Soroban JSON-RPC endpoint for offline integration tests.
+- `search_assets` now returns asset-type facet counts across the full matching result set,
+  enabling clients to build advanced filters without a second query.
+- `calculate_maintenance_roi` and `MaintenanceRoi` expose auditable maintenance cost, avoided-loss, and ROI metrics (basis points).
+- `get_industry_benchmark` and `IndustryBenchmark` provide anonymized cross-tenant maintenance aggregates by asset type.
+- `record_score_baseline` now automatically persists and emits score anomalies when a new observation exceeds the configured two-standard-deviation threshold.
+- `generate_compliance_report` and `ComplianceReport` provide on-chain audit summaries with proof status, cost, record counts, and hash-chain integrity.
+- `.github/CODEOWNERS`: required-reviewer rules gate all PRs touching `contracts/`, CI workflows, `SECURITY.md`, and the threat-model doc (closes [#781](https://github.com/TwinTrustMainstay/Mainstay/issues/781))
+- `CONTRIBUTING.md`: documented branch-protection requirements (1 approval + passing CI, no force-push) and the CODEOWNERS review expectation for `contracts/` (closes [#781](https://github.com/TwinTrustMainstay/Mainstay/issues/781))
+- `test_cross_owner_duplicate_serial_rejected` in `asset-registry`: verifies that the global serial-number dedup key blocks a second owner from registering the same physical machine (closes [#782](https://github.com/TwinTrustMainstay/Mainstay/issues/782))
+- `test_decay_score_never_drops_to_zero_with_history` in `lifecycle`: verifies that calling `decay_score` on an asset with maintenance records never stores or returns 0 (closes [#784](https://github.com/TwinTrustMainstay/Mainstay/issues/784))
+- `ContractError` (`lifecycle/src/errors.rs`) variants added since 1.0.0: `ScoreOverflow` (19), `NotesTooLong` (20), `ScoreFrozen` (21), `AssetDecommissioned` (22), `BatchTooLarge` (23), `InsufficientSigners` (24), `Reentrancy` (25), `DuplicateAdmin` (26), `SnapshotNotFound` (27), `InsufficientPredictionData` (28), `WeightProposalAlreadyExists` (29), `SpecializationMismatch` (30), `RecurringTaskNotFound` (31), `RecurringTaskInactive` (32), `DuplicateRecurringTask` (33), `InvalidRecurringSchedule` (34), `DuplicateRecordNotFound` (35), `StandardAlreadyRegistered` (36), `RateLimitExceeded` (37), `BatchRevokeTooLarge` (38)
+- `Config` (`lifecycle/src/types.rs`) fields added since 1.0.0: `admins` and `admin_threshold` (multisig admin quorum), `max_engineer_history` (per-engineer history cap), `min_collateral_score`, `max_notes_length`, `task_weights`, `max_submissions_per_hour` (engineer rate limiting)
+- Regional encrypted DSAR tables and queues, with the privacy processing contract documented in `docs/privacy.md`.
+- Storage keys (`lifecycle/src/storage.rs`) added since 1.0.0: `SCHIST` (score history), `LUPD` (last score update timestamp), `FROZEN` / `FRZ_SCR` (decommission freeze flag and frozen score), `HLTH_SNP` (health snapshots), `XFER_HIST` (ownership transfer history), `ENG_HIST` / `ENG_AUTH` (per-engineer history and per-asset authorization), `SUB_WIN` (rolling-hour submission rate window), `RVK_TL` / `TL_PROP` (timelocked engineer-revocation and generic admin proposals), `MSTD` / `SCR_WGT` (per-asset-type maintenance standards and scoring weights), `EXT_SCR` (external provider scores per asset), `ANOM` (score anomalies per asset), `PEERGRP` (peer-group statistics), and the resumable cleanup cursors `EXTC_CSR` / `ANOMC_CSR`
+- Lifecycle contract now emits events for score-anomaly creation (`ANOMALY`), anomaly investigation-status transitions (`ANOM_STS`), and peer-group registration (`PEER_GRP`), so operators can alert on new anomalies and peer-group benchmark changes (closes [#1998](https://github.com/TwinTrustMainstay/Mainstay/issues/1998), [#1999](https://github.com/TwinTrustMainstay/Mainstay/issues/1999))
+
+### Fixed
+- Engineer bonds (#1962, #1963, #1964): `slash` is refused while a dispute is
+  open. Disputes lapse after a 30-day deadline so a bond cannot be locked
+  forever. `open_dispute` and `record_performance` reject engineers with no
+  bond (`BondNotFound`) instead of creating phantom records.
+- Engineer bonds (#1965): `open_dispute` takes a reason and an evidence hash.
+  They are stored in an audit record (`get_dispute`) and emitted in an event.
+- Metrics exporter: the exporter no longer crashes on its first collection, and its HTTP endpoint now returns metrics (the response was never sent before).
+- Backup checksums use paths relative to the backup directory, so backups verify after being copied to another location.
+- `update_reputation` in `engineer-registry`: decay is now applied to the stored score before the delta is added. Previously an inactive engineer's decayed reputation was overwritten by the undecayed stored value on the next update (closes [#1741](https://github.com/TwinTrustMainstay/Mainstay/issues/1741))
+- `apply_decay` in `lifecycle/src/scoring.rs`: enforce `MIN_SCORE_WITH_HISTORY = 1` in both the main decay path and the early-return path so the stored score is never written as 0 for an asset that has at least one maintenance record (closes [#784](https://github.com/TwinTrustMainstay/Mainstay/issues/784))
+- `get_maintenance_history_page` in `lifecycle`: cap the caller-supplied `limit` at `MAX_PAGE_SIZE` (100) so a large `limit` can no longer reintroduce an unbounded, potentially oversized response (closes [#1075](https://github.com/TwinTrustMainstay/Mainstay/issues/1075))
+- `HealthSnapshot` in `lifecycle`: renamed the `timestamp` field to `snapshot_timestamp` to make explicit that it records when the snapshot was captured (closes [#1076](https://github.com/TwinTrustMainstay/Mainstay/issues/1076))
+- `clear_old_external_scores` in `lifecycle`: each call now examines at most `MAX_CLEANUP_BATCH` entries and resumes from a stored cursor, so a long external-score history is cleared across bounded transactions instead of rebuilding the whole vector in one call (closes [#2000](https://github.com/TwinTrustMainstay/Mainstay/issues/2000))
+- `clear_old_anomalies` in `lifecycle`: same batch limit and resumable cursor, so a large anomaly log is cleared across bounded transactions instead of iterating the whole vector in one call (closes [#2001](https://github.com/TwinTrustMainstay/Mainstay/issues/2001))
+
+### Security
+- `initialize_admin` in `asset-registry` already required `deployer.require_auth()`, preventing front-run attacks; the existing `test_initialize_admin_rejects_non_deployer` test and deployment-runbook section 3 now explicitly document this protection (closes [#783](https://github.com/TwinTrustMainstay/Mainstay/issues/783))
+- API Nginx now emits baseline security headers, restricts CORS to configured origins, and omits API keys from access logs.
+- API instances now run in private subnets and accept port 8080 traffic only from the public load balancer security group.
+- API logs and data-subject messages now have configurable maximum retention, and API root volumes are encrypted at rest.
+
 ## [1.0.0] - 2026-06-02
 
 ### Added

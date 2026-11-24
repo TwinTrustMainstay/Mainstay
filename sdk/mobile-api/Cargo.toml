@@ -1,0 +1,8 @@
+[package]
+name = "mobile-api"
+version = "0.1.0"
+edition = "2021"
+description = "Framework-independent mobile client backend helpers: versioning, rate limiting, delta sync, push queue, payload projection"
+license = "MIT"
+
+[dependencies]

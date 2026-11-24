@@ -1,0 +1,10 @@
+[package]
+name = "analytics"
+version = "0.1.0"
+edition = "2021"
+description = "Predictive analytics (failure prediction, maintenance scheduling, engineer ranking) for Mainstay (issue #1757)"
+publish = false
+
+[lib]
+
+[dependencies]

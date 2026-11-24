@@ -1,0 +1,62 @@
+name: State Snapshot
+
+# Periodic export of contract state (#1727).
+#
+# Runs scripts/backup.sh against the configured network, packages the export
+# as a checksummed snapshot, verifies it, and uploads it as a workflow artifact.
+# Disabled unless the repository sets the SNAPSHOTS_ENABLED variable to "true".
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    name: Export and verify contract state
+    runs-on: ubuntu-latest
+    if: vars.SNAPSHOTS_ENABLED == 'true'
+    environment: snapshots
+    env:
+      STELLAR_NETWORK: ${{ vars.STELLAR_NETWORK || 'testnet' }}
+      STELLAR_RPC_URL: ${{ vars.STELLAR_RPC_URL || 'https://soroban-testnet.stellar.org' }}
+      CONTRACT_ASSET_REGISTRY: ${{ vars.CONTRACT_ASSET_REGISTRY }}
+      CONTRACT_ENGINEER_REGISTRY: ${{ vars.CONTRACT_ENGINEER_REGISTRY }}
+      CONTRACT_LIFECYCLE: ${{ vars.CONTRACT_LIFECYCLE }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Stellar CLI
+        run: |
+          # Keep in sync with the upgrade-test job in ci.yml.
+          STELLAR_CLI_VER="22.5.0"
+          curl -sSfL "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VER}/stellar-cli_${STELLAR_CLI_VER}_linux_amd64.tar.gz" -o stellar-cli.tar.gz
+          tar -xzf stellar-cli.tar.gz
+          chmod +x stellar
+          sudo mv stellar /usr/local/bin/stellar
+
+      - name: Export contract state
+        run: ./scripts/backup.sh --output-dir "$RUNNER_TEMP/backup"
+
+      - name: Create and verify snapshot
+        run: |
+          python3 -m scripts.ops.snapshot create \
+            --backup-dir "$RUNNER_TEMP/backup" \
+            --out-dir snapshots \
+            --network "$STELLAR_NETWORK" \
+            --keep 0
+          python3 -m scripts.ops.snapshot verify snapshots/snapshot-*.json.gz
+
+      - name: Upload snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-snapshot-${{ github.run_id }}
+          path: snapshots/
+          retention-days: 90

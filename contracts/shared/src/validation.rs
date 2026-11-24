@@ -15,6 +15,12 @@ pub fn require_string_length(value: &SorobanString, field: &str, max: u32) {
     }
 }
 
+/// Panics if `value` is an empty vector.
+///
+/// **Element validation is the caller's responsibility.** This function only
+/// checks that the collection has at least one entry. Callers must separately
+/// validate individual elements (e.g. reject zero-value or null-equivalent
+/// entries) according to their own domain rules.
 pub fn require_non_empty_vec<T>(value: &soroban_sdk::Vec<T>, field: &str) {
     if value.is_empty() {
         panic!("validation: {} must not be empty", field);
@@ -80,6 +86,18 @@ mod tests {
     fn empty_vec_rejected() {
         let env = Env::default();
         let items: Vec<u64> = Vec::new(&env);
+        require_non_empty_vec(&items, "items");
+    }
+
+    /// #805: require_non_empty_vec passes a vec containing zero-value entries —
+    /// element validation is the caller's responsibility, not this helper's.
+    #[test]
+    fn vec_with_zero_entries_passes_non_empty_check() {
+        let env = Env::default();
+        let mut items: Vec<u64> = Vec::new(&env);
+        items.push_back(0u64);
+        items.push_back(0u64);
+        // Should NOT panic — the vec is non-empty; callers own per-element validation.
         require_non_empty_vec(&items, "items");
     }
 }

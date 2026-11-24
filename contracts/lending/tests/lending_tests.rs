@@ -1,10 +1,10 @@
 #![cfg(test)]
 
-use lending::{LendingContract, LendingContractClient, ContractError, LoanStatus};
+use lending::{ContractError, LendingContract, LendingContractClient, LoanStatus};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils::{Address as _, Events, Ledger},
     token::{Client as TokenClient, StellarAssetClient},
-    Address, Env, String,
+    Address, Env, String, Symbol, TryFromVal,
 };
 
 fn setup_contract_and_token(env: &Env) -> (Address, Address, Address, Address) {
@@ -21,9 +21,23 @@ fn setup_contract_and_token(env: &Env) -> (Address, Address, Address, Address) {
     let client = LendingContractClient::new(env, &contract_id);
 
     // Initialize lending contract
-    client.initialize(&deployer, &admin, &token_id);
+    client.initialize(&deployer, &admin, &token_id, &0);
 
     (contract_id, token_id, admin, token_admin)
+}
+
+fn has_event(env: &Env, contract_id: &Address, symbol: &str) -> bool {
+    let target = Symbol::new(env, symbol);
+    env.events().all().iter().any(|(addr, topics, _data)| {
+        if &addr != contract_id {
+            return false;
+        }
+        topics.iter().any(|topic| {
+            Symbol::try_from_val(env, &topic)
+                .map(|s| s == target)
+                .unwrap_or(false)
+        })
+    })
 }
 
 #[test]
@@ -66,7 +80,7 @@ fn test_vouch_with_active_loan_rejection() {
     stellar_asset_client.mint(&voucher, &10_000_000);
 
     // Request a loan first
-    client.request_loan(&borrower, &100_000);
+    client.request_loan(&borrower, &100_000, &0u64);
 
     // Verify loan is active
     let loan = client.get_loan(&borrower);
@@ -97,10 +111,13 @@ fn test_insufficient_contract_balance_rejection() {
 
     // Attempt to request loan of 100 should fail with InsufficientFunds
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client.request_loan(&borrower, &100);
+        client.request_loan(&borrower, &100, &0u64);
     }));
 
-    assert!(result.is_err(), "Loan request with insufficient contract balance should fail");
+    assert!(
+        result.is_err(),
+        "Loan request with insufficient contract balance should fail"
+    );
 }
 
 #[test]
@@ -154,14 +171,17 @@ fn test_withdraw_vouch_with_active_loan_rejection() {
     client.vouch(&borrower, &voucher, &1_000);
 
     // Request a loan
-    client.request_loan(&borrower, &100_000);
+    client.request_loan(&borrower, &100_000, &0u64);
 
     // Attempt to withdraw vouch with active loan should fail
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         client.withdraw_vouch(&borrower, &voucher);
     }));
 
-    assert!(result.is_err(), "Withdraw vouch with active loan should fail");
+    assert!(
+        result.is_err(),
+        "Withdraw vouch with active loan should fail"
+    );
 }
 
 #[test]
@@ -184,9 +204,98 @@ fn test_loan_disbursal_transfers_funds() {
     assert_eq!(initial_balance, 0);
 
     // Request loan
-    client.request_loan(&borrower, &100_000);
+    client.request_loan(&borrower, &100_000, &0u64);
 
     // Check borrower received the loan amount
     let final_balance = token_client.balance(&borrower);
     assert_eq!(final_balance, 100_000);
+}
+
+#[test]
+fn test_set_prepayment_penalty_lender_only() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, token_id, _admin, _token_admin) = setup_contract_and_token(&env);
+    let client = LendingContractClient::new(&env, &contract_id);
+    let stellar_asset_client = StellarAssetClient::new(&env, &token_id);
+
+    let borrower = Address::generate(&env);
+    let lender = Address::generate(&env);
+
+    // Fund contract so the loan can be disbursed
+    stellar_asset_client.mint(&env.current_contract_address(), &1_000_000);
+
+    // Borrower requests a loan; lender funds it
+    client.request_loan(&borrower, &100_000, &0u64);
+    client.fund_loan(&borrower, &lender);
+
+    // Lender sets a prepayment penalty of 200 bps (2%)
+    client.set_prepayment_penalty(&borrower, &200);
+
+    // A non-lender attempt should be rejected
+    let impostor = Address::generate(&env);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        client.set_prepayment_penalty(&borrower, &100);
+    }));
+    assert!(result.is_err(), "Non-lender must not set penalty");
+    let _ = impostor;
+}
+
+#[test]
+fn test_compute_prepayment_penalty_capped_at_three_percent() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, token_id, _admin, _token_admin) = setup_contract_and_token(&env);
+    let client = LendingContractClient::new(&env, &contract_id);
+    let stellar_asset_client = StellarAssetClient::new(&env, &token_id);
+
+    let borrower = Address::generate(&env);
+    let lender = Address::generate(&env);
+
+    stellar_asset_client.mint(&env.current_contract_address(), &1_000_000);
+
+    client.request_loan(&borrower, &100_000, &0u64);
+    client.fund_loan(&borrower, &lender);
+
+    // Request an excessive penalty (10%); it must be capped at 3% (300 bps)
+    client.set_prepayment_penalty(&borrower, &1_000);
+
+    // 3% of 100_000 = 3_000
+    let penalty = client.compute_prepayment_penalty(&borrower, &100_000);
+    assert_eq!(penalty, 3_000);
+}
+
+#[test]
+fn test_compute_prepayment_penalty_applied_to_prepayment() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (contract_id, token_id, _admin, _token_admin) = setup_contract_and_token(&env);
+    let client = LendingContractClient::new(&env, &contract_id);
+    let token_client = TokenClient::new(&env, &token_id);
+    let stellar_asset_client = StellarAssetClient::new(&env, &token_id);
+
+    let borrower = Address::generate(&env);
+    let lender = Address::generate(&env);
+
+    stellar_asset_client.mint(&env.current_contract_address(), &1_000_000);
+
+    client.request_loan(&borrower, &100_000, &0u64);
+    client.fund_loan(&borrower, &lender);
+
+    // 1% penalty
+    client.set_prepayment_penalty(&borrower, &100);
+
+    // Borrower prepays 50_000; penalty = 1% of 50_000 = 500
+    let penalty = client.compute_prepayment_penalty(&borrower, &50_000);
+    assert_eq!(penalty, 500);
+
+    let borrower_balance_before = token_client.balance(&borrower);
+    client.prepay(&borrower, &50_000);
+    let borrower_balance_after = token_client.balance(&borrower);
+
+    // Borrower should be debited the prepayment plus the penalty
+    assert_eq!(borrower_balance_before - borrower_balance_after, 50_500);
 }

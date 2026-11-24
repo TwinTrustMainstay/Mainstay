@@ -3,41 +3,47 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-OUTPUT="$(mktemp)"
-trap 'rm -f "$OUTPUT"' EXIT
+SOURCE="$SCRIPT_DIR/fixtures/sensitive-backup"
+WORK="$(mktemp -d)"
+OUTPUT="$WORK/output"
+trap 'rm -rf "$WORK"' EXIT
 
-bash "$ROOT/scripts/sanitize-backup.sh" \
-  < "$SCRIPT_DIR/fixtures/sensitive-backup.json" \
-  > "$OUTPUT"
+"$ROOT/scripts/sanitize-backup.sh" "$SOURCE" "$OUTPUT" > /dev/null
 
 for secret in \
-  fixture-api-key-secret \
-  fixture-password-secret \
-  fixture-private-key-secret \
-  fixture-seed-phrase-secret \
-  fixture-refresh-token-secret; do
-  if grep -Fq "$secret" "$OUTPUT"; then
+  ASSET-CONTRACT-ID-SECRET \
+  ENGINEER-CONTRACT-ID-SECRET \
+  ORIGINAL-OWNER-SECRET \
+  PRODUCTION-SERIAL-SECRET \
+  CONFIDENTIAL_PRODUCTION_LOCATION_SECRET \
+  PRODUCTION-LENDER-SECRET \
+  PRODUCTION-LOAN-ID-SECRET \
+  PRODUCTION-ENGINEER-SECRET \
+  CONFIDENTIAL_MAINTENANCE_NOTES_SECRET; do
+  if grep -R -Fq "$secret" "$OUTPUT"; then
     echo "Sensitive fixture value leaked: $secret" >&2
     exit 1
   fi
 done
 
-jq -e '
-  def has_sensitive_fields:
-    if type == "object" then
-      any(to_entries[]; (.key | test("(?i)(password|passwd|secret|token|api[_-]?key|private[_-]?key|mnemonic|seed[_-]?phrase)")) or (.value | has_sensitive_fields))
-    elif type == "array" then
-      any(.[]; has_sensitive_fields)
-    else
-      false
-    end;
+jq -e --arg original_owner "ORIGINAL-OWNER-SECRET" '
+  .owner != $original_owner
+  and (.owner | test("^G[A-Z2-7]{55}$"))
+  and .serial_number == "DEV-SERIAL-1"
+  and .metadata == "Synthetic development asset 1"
+  and .lender == null
+  and .loan_id == null
+  and .asset_type == "generator"
+' "$OUTPUT/assets/1.json" > /dev/null
 
-  (has_sensitive_fields | not)
-  and .version == 1
-  and .account.name == "sample-account"
-  and .account.profile.region == "eu-west"
-  and .wallet != null
-  and .sessions[0].status == "active"
-' "$OUTPUT" > /dev/null
+jq -e '
+  length == 1
+  and .[0].engineer == "GDEV-ENGINEER"
+  and .[0].task_type == "inspection"
+  and .[0].notes == "Synthetic development maintenance record"
+' "$OUTPUT/maintenance/1_history.json" > /dev/null
+
+jq -e '.score == 72' "$OUTPUT/maintenance/1_score.json" > /dev/null
+grep -q "synthetic and intended for local or standalone development" "$OUTPUT/contract_ids.md"
 
 echo "Backup sanitizer test passed."

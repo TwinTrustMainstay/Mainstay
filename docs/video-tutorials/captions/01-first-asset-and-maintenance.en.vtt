@@ -1,0 +1,30 @@
+WEBVTT
+NOTE
+Draft captions from the recording script. Re-time every cue against the final recording before publishing.
+
+00:00:00.000 --> 00:00:12.000
+Welcome. In this tutorial you register an industrial asset on Mainstay and record the first maintenance task for it.
+
+00:00:12.000 --> 00:00:25.000
+You need the contracts built and a local or testnet deployment. See the deployment tutorial for setup.
+
+00:00:25.000 --> 00:00:60.000
+Call register_asset with an asset type, a name, a serial number and the owner's address. The call returns an asset ID that every later step uses.
+
+00:00:60.000 --> 00:00:95.000
+Serial numbers must be unique. Registering the same serial twice is rejected.
+
+00:00:95.000 --> 00:00:130.000
+Before an engineer can sign work, the issuer adds them to the Engineer Registry with a credential and an expiry date.
+
+00:00:130.000 --> 00:00:170.000
+Then the asset owner authorizes that engineer for this asset.
+
+00:00:170.000 --> 00:00:225.000
+Now submit a maintenance record. Pass the asset ID, the task type, a short note and the engineer's address. The engineer must hold a valid credential.
+
+00:00:225.000 --> 00:00:250.000
+The record is stored as an immutable event on the ledger.
+
+00:00:250.000 --> 00:00:290.000
+Read the maintenance history for the asset, then read its collateral score. The score reflects the record you just added.

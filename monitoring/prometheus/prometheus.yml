@@ -1,0 +1,34 @@
+# Prometheus configuration for the Mainstay time-series store.
+#
+# Start with retention flags (see docs/monitoring/METRICS_COLLECTION.md):
+#   prometheus --config.file=monitoring/prometheus/prometheus.yml \
+#     --storage.tsdb.retention.time=30d
+#
+# Raw samples are kept locally for 30 days. Longer tiers are handled by
+# remote_write to a long-term store (see the commented block below).
+
+global:
+  scrape_interval: 60s
+  evaluation_interval: 60s
+  external_labels:
+    service: mainstay
+
+rule_files:
+  - rules.yml
+
+scrape_configs:
+  - job_name: mainstay-exporter
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["localhost:9600"]
+
+# Long-term retention (uncomment and set the endpoint for your store).
+# remote_write:
+#   - url: https://metrics-store.example.internal/api/v1/write
+#     queue_config:
+#       max_samples_per_send: 1000
+#     write_relabel_configs:
+#       # Keep only the catalogued Mainstay series in long-term storage.
+#       - source_labels: [__name__]
+#         regex: "mainstay_.*"
+#         action: keep

@@ -1,0 +1,55 @@
+# promtool test rules scripts/monitoring/exporter-down.test.yml
+# Exporter process gone: the custom series is absent, or Prometheus up is 0.
+rule_files:
+  - alerting-rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # No mainstay_exporter_up series. up is healthy so only absent() fires.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="mainstay"}'
+        values: '1+0x5'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: MainstayExporterDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: Mainstay Prometheus exporter is down
+              description: "The Mainstay metrics exporter has been down for 5 minutes. No contract health metrics are being collected. Check the prometheus-exporter.sh process and Stellar RPC connectivity.\n"
+
+  # Scrape target is down while the gauge, if present, is still 1.
+  - interval: 1m
+    input_series:
+      - series: mainstay_exporter_up
+        values: '1+0x5'
+      - series: 'up{job="mainstay"}'
+        values: '0+0x5'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: MainstayExporterDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: mainstay
+            exp_annotations:
+              summary: Mainstay Prometheus exporter is down
+              description: "The Mainstay metrics exporter has been down for 5 minutes. No contract health metrics are being collected. Check the prometheus-exporter.sh process and Stellar RPC connectivity.\n"
+
+  # Collection timestamp series is missing, so staleness cannot be computed.
+  - interval: 1m
+    input_series:
+      - series: mainstay_exporter_up
+        values: '1+0x5'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: StaleMetrics
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: Metrics are stale (>2 min old)
+              description: "The latest metrics collection is more than 2 minutes old. The exporter may have crashed or the Stellar RPC may be unreachable.\n"

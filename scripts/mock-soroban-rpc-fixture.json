@@ -1,0 +1,13 @@
+{
+  "getHealth": {
+    "status": "healthy"
+  },
+  "getLatestLedger": {
+    "id": "fixture-ledger",
+    "protocolVersion": 22,
+    "sequence": 42
+  },
+  "getLedgerEntries": {
+    "entries": []
+  }
+}

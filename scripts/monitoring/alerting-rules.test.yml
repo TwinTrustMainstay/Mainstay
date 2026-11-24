@@ -1,0 +1,60 @@
+# promtool test rules scripts/monitoring/alerting-rules.test.yml
+# Every metric name used by alerting-rules.yml and grafana-dashboard.json.
+rule_files:
+  - alerting-rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  - interval: 1m
+    input_series:
+      - series: mainstay_exporter_up
+        values: 1+0x10
+      - series: mainstay_assets_total
+        values: 4+0x10
+      - series: mainstay_maintenance_records_total
+        values: 7+0x10
+      - series: mainstay_avg_collateral_score
+        values: 80+0x10
+      - series: mainstay_scored_assets_count
+        values: 3+0x10
+      - series: mainstay_engineers_total
+        values: 2+0x10
+      - series: mainstay_metrics_collection_seconds
+        values: 1+0x10
+    promql_expr_test:
+      - expr: mainstay_exporter_up
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="mainstay_exporter_up"}'
+            value: 1
+      - expr: mainstay_assets_total
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="mainstay_assets_total"}'
+            value: 4
+      - expr: mainstay_maintenance_records_total
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="mainstay_maintenance_records_total"}'
+            value: 7
+      - expr: mainstay_avg_collateral_score
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="mainstay_avg_collateral_score"}'
+            value: 80
+      - expr: mainstay_scored_assets_count
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="mainstay_scored_assets_count"}'
+            value: 3
+      - expr: mainstay_engineers_total
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="mainstay_engineers_total"}'
+            value: 2
+      - expr: mainstay_metrics_collection_seconds
+        eval_time: 5m
+        exp_samples:
+          - labels: '{__name__="mainstay_metrics_collection_seconds"}'
+            value: 1

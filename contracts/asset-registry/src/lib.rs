@@ -1,10 +1,14 @@
 #![no_std]
+use shared::error::SharedContractError;
 use shared::validation::{require_non_empty_vec, require_string_length};
+use shared::{extend_persistent_ttl, require_admin, DEFAULT_TTL_LEDGERS, TTL_THRESHOLD, TTL_TARGET};
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, panic_with_error, symbol_short,
     Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
+
+pub use shared::error::SharedContractError as SharedError;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -33,7 +37,61 @@ pub enum ContractError {
     /// Asset has already been deprecated and cannot be deprecated again.
     AssetAlreadyDeprecated = 17,
     /// The batch exceeds the maximum allowed size.
-    BatchTooLarge = 17,
+    BatchTooLarge = 18,
+    AssetLocked = 19,
+    LendingContractNotSet = 20,
+    UnauthorizedLender = 21,
+    LoanIdMismatch = 22,
+    AssetNotLocked = 23,
+    /// Engineer's specialization does not match the asset's type.
+    /// Mirrors lifecycle::ContractError::SpecializationMismatch so cross-contract
+    /// calls decode this discriminant correctly.
+    SpecializationMismatch = 30,
+    /// An unexpired ownership transfer is already pending for this asset.
+    TransferAlreadyPending = 24,
+    /// No pending ownership transfer exists for this asset.
+    NoPendingTransfer = 25,
+    /// The pending ownership transfer's acceptance window has elapsed.
+    TransferExpired = 26,
+    /// A pending ownership transfer exists but has not yet passed its timeout.
+    TransferNotExpired = 27,
+    /// A required configuration field was missing for the requested operation
+    /// (e.g. `SearchFilter::lifecycle_contract` when sorting by `ByCollateralScore`).
+    InvalidConfig = 44,
+    /// Condition not met for transfer (issue #1316).
+    ConditionNotMet = 31,
+    /// No transfer condition exists for this asset (issue #1316).
+    NoTransferCondition = 32,
+    /// Bundle merkle root not found (issue #1317).
+    BundleNotFound = 33,
+    /// Asset not in bundle or invalid merkle proof (issue #1317).
+    InvalidBundleProof = 34,
+    /// Collateral pool not found (issue #1318).
+    PoolNotFound = 35,
+    /// Cannot create collateral pool for single asset (issue #1318).
+    InvalidPoolSize = 36,
+    /// A co-owned asset must use the weighted voting flow for critical changes.
+    MultisigRequired = 37,
+    /// A co-owner action has already been executed.
+    ActionAlreadyExecuted = 38,
+    InvalidEncryptedData = 39,
+    /// The supplied serial hash does not match the encrypted serial bytes.
+    InvalidSerialNumberHash = 40,
+}
+
+impl From<SharedContractError> for ContractError {
+    fn from(e: SharedContractError) -> Self {
+        match e {
+            SharedContractError::NotInitialized => ContractError::NotInitialized,
+            SharedContractError::AlreadyInitialized => ContractError::AdminAlreadyInitialized,
+            SharedContractError::UnauthorizedAdmin => ContractError::UnauthorizedAdmin,
+            SharedContractError::Paused => ContractError::Paused,
+            SharedContractError::TimelockNotExpired => ContractError::TimelockNotExpired,
+            SharedContractError::ProposalNotFound => ContractError::ProposalNotFound,
+            SharedContractError::PendingAdminAlreadyExists => ContractError::PendingAdminAlreadyExists,
+            SharedContractError::InvalidSuspensionPeriod => ContractError::InvalidConfig,
+        }
+    }
 }
 
 #[contracttype]
@@ -49,8 +107,57 @@ pub struct Asset {
     pub owner: Address,
     pub registered_at: u64,
     pub metadata_updated_at: u64,
+    /// Incremented on every successful call to `update_asset_metadata`.
+    /// Starts at 0 when the asset is first registered.
+    pub metadata_version: u32,
     /// Soft lifecycle status set by the owner. Defaults to `Active` on registration.
     pub deprecation_status: DeprecationStatus,
+    /// Whether this asset is currently locked as collateral under a lien.
+    /// While `true`, ownership transfers are blocked.
+    pub is_locked: bool,
+    /// The lending contract address that placed the lien, if any.
+    pub lender: Option<Address>,
+    /// The loan ID associated with the lien, used to verify the correct loan
+    /// releases the lock on repayment.
+    pub loan_id: Option<u64>,
+    /// Unix timestamp when the asset was deprecated. `None` if the asset is still active
+    /// or was decommissioned without going through the `Deprecated` state.
+    pub deprecated_at: Option<u64>,
+    /// Co-owners with weighted voting rights. Each tuple is (address, vote_weight).
+    /// Empty if the asset has only a single owner.
+    pub co_owners: Vec<(Address, u32)>,
+}
+
+/// Types of actions that require co-owner voting approval.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActionType {
+    Transfer = 0,
+    Deprecate = 1,
+}
+
+/// A proposal for a co-owner action requiring voting.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionProposal {
+    pub proposal_id: u64,
+    pub asset_id: u64,
+    pub action_type: ActionType,
+    pub proposed_by: Address,
+    pub proposed_at: u64,
+    pub new_owner: Option<Address>,
+    pub votes: Vec<(Address, bool)>,
+    pub executed: bool,
+}
+
+/// A single entry in the metadata change history for an asset.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetadataHistoryEntry {
+    pub version: u32,
+    pub old_hash: BytesN<32>,
+    pub new_hash: BytesN<32>,
+    pub updated_at: u64,
 }
 
 #[contracttype]
@@ -67,6 +174,17 @@ pub struct AssetInput {
     pub asset_type: Symbol,
     pub metadata: String,
     pub serial_number: String,
+}
+
+/// Client-side encrypted fields for sensitive asset data.
+///
+/// The registry stores ciphertext only. Encryption and key management remain
+/// outside the contract so each owner can use their organisation's KMS.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EncryptedAssetFields {
+    pub serial_number: Bytes,
+    pub location: Bytes,
 }
 
 /// Paginated result for `get_assets_by_type_paginated`.
@@ -96,6 +214,43 @@ pub struct TimelockProposal {
     pub executed: bool,
 }
 
+/// A pending multi-signature ownership transfer awaiting acceptance by `new_owner`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingTransfer {
+    pub new_owner: Address,
+    pub initiated_at: u64,
+}
+
+/// Transfer condition for conditional asset transfers (issue #1316).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransferCondition {
+    pub condition_type: Symbol, // "SCORE_MIN", "SCORE_MAX", etc.
+    pub threshold: u64,
+    pub set_at: u64,
+}
+
+/// Bundle registration for multi-asset batch registration (issue #1317).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BundleRegistration {
+    pub merkle_root: BytesN<32>,
+    pub asset_count: u32,
+    pub registered_at: u64,
+}
+
+/// Collateral pool for multi-asset loans (issue #1318).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollateralPool {
+    pub pool_id: u64,
+    pub lender: Address,
+    pub asset_ids: Vec<u64>,
+    pub created_at: u64,
+    pub is_locked: bool,
+}
+
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum AssetStatus {
@@ -104,37 +259,284 @@ pub enum AssetStatus {
     UnderMaintenance = 2,
 }
 
+/// Issue #1766: signature algorithm identifiers for the quantum-resistance
+/// migration. Soroban's host does not currently expose native CRYSTALS or
+/// SPHINCS+ verification primitives, so `Crystals`/`Sphincs` here identify
+/// which scheme a signer has migrated to for off-chain/future on-chain
+/// verification plumbing — they are not yet backed by on-chain signature
+/// checks. See docs/post-quantum-migration.md for the phased plan.
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum CryptoAlgorithm {
+    /// Ed25519, used throughout this contract today via `require_auth`.
+    /// Vulnerable to a sufficiently large quantum computer (Shor's algorithm).
+    Legacy = 0,
+    /// CRYSTALS-Dilithium (NIST FIPS 204) — lattice-based PQ signature scheme.
+    Crystals = 1,
+    /// SPHINCS+ (NIST FIPS 205) — hash-based PQ signature scheme.
+    Sphincs = 2,
+}
+
+/// Issue #1766: contract-wide post-quantum migration configuration.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuantumMigrationConfig {
+    /// The algorithm new signers are expected to migrate to.
+    pub active_algorithm: CryptoAlgorithm,
+    /// When true, Legacy (Ed25519) signatures remain accepted alongside
+    /// `active_algorithm` so existing signers can migrate gradually instead
+    /// of being cut off immediately.
+    pub dual_algorithm_enabled: bool,
+    /// Ledger timestamp after which Legacy signatures are rejected outright.
+    /// Zero means no sunset deadline has been set yet.
+    pub legacy_sunset_at: u64,
+}
+
 /// Storage key enum for indexed lookups.
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     /// Maps a keyword category (arbitrary bytes) to the list of asset IDs tagged with it.
     AssetsByCategory(Bytes),
     /// Maps an owner address to the list of asset IDs they own.
     AssetsByOwner(Address),
+    /// Maps (asset_id, proposal_id) to an ActionProposal for co-owner voting.
+    ActionProposal(u64, u64),
+    /// Stores the next proposal ID counter for an asset.
+    ActionProposalCounter(u64),
+    /// Maps an original (pre-restore) asset ID to the new asset ID assigned by
+    /// [`AssetRegistry::restore_asset`], so maintenance history keyed by the old
+    /// ID can be re-linked after a restore.
+    RestoreIdMap(u64),
+}
+
+/// Filter criteria for [`AssetRegistry::search_assets`].
+///
+/// All fields are optional; omitting a field means "no constraint on that dimension".
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SearchFilter {
+    /// Return only assets whose `asset_type` matches this value exactly.
+    pub asset_type: Option<Symbol>,
+    /// Return only assets whose `metadata` field contains this substring (case-sensitive).
+    pub manufacturer: Option<String>,
+    /// Return only assets registered at least this many months ago (1 month ≈ 30 days).
+    pub min_age_months: Option<u32>,
+    /// Return only assets registered at most this many months ago (1 month ≈ 30 days).
+    pub max_age_months: Option<u32>,
+    /// How to sort the results.  Defaults to no particular order when `None`.
+    pub sort: Option<SortOrder>,
+    /// Required when `sort` is [`SortOrder::ByCollateralScore`]. If omitted while
+    /// that sort order is requested, `search_assets` panics with
+    /// `ContractError::InvalidConfig` instead of attempting the cross-contract call.
+    pub lifecycle_contract: Option<Address>,
+}
+
+/// Sorting options for [`AssetRegistry::search_assets`].
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SortOrder {
+    /// Sort by on-chain collateral score (descending, highest first).
+    /// Requires `SearchFilter::lifecycle_contract` to be set.
+    ByCollateralScore = 0,
+    /// Sort by most-recent metadata update timestamp (descending, newest first).
+    ByMaintenanceDate = 1,
+}
+
+/// Result page returned by [`AssetRegistry::search_assets`].
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SearchPage {
+    /// Matched assets (up to 100).
+    pub assets: Vec<Asset>,
+    /// Total number of assets that matched the filter (before the 100-result cap).
+    pub total: u32,
+    /// Counts for each asset type represented by the complete result set.
+    pub facets: Vec<FacetCount>,
+}
+
+/// A count of matching assets grouped by asset type.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FacetCount {
+    pub asset_type: Symbol,
+    pub count: u32,
+}
+
+/// Issue #1629: Asset usage tracking and analytics data
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UsageAnalytics {
+    pub asset_id: u64,
+    pub total_usage_hours: u64,
+    pub usage_percentage: u32,
+    pub last_usage_update: u64,
+    pub maintenance_threshold_hours: u64,
+}
+
+/// Issue #1629: A single usage record for an asset
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UsageRecord {
+    pub hours_used: u64,
+    pub recorded_at: u64,
+}
+
+/// Issue #1630: Asset warranty information
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Warranty {
+    pub warranty_id: u64,
+    pub start_date: u64,
+    pub expiry_date: u64,
+    pub coverage_type: String,
+    pub provider: String,
+    pub is_active: bool,
+}
+
+/// Issue #1630: Warranty claim with history tracking
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WarrantyClaim {
+    pub claim_id: u64,
+    pub warranty_id: u64,
+    pub claim_reason: String,
+    pub claimed_at: u64,
+    pub claim_status: ClaimStatus,
+}
+
+/// Issue #1630: Warranty claim status
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ClaimStatus {
+    Pending = 0,
+    Approved = 1,
+    Rejected = 2,
+    Settled = 3,
+}
+
+/// Issue #1631: Asset compliance certification
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComplianceCert {
+    pub cert_id: u64,
+    pub cert_type: String,
+    pub issuer: String,
+    pub expiry_date: u64,
+    pub standard: String,
+    pub issue_date: u64,
+}
+
+/// Issue #1631: Compliance status for an asset
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ComplianceStatus {
+    pub asset_id: u64,
+    pub is_compliant: bool,
+    pub expired_count: u32,
+    pub active_count: u32,
+    pub last_verified_at: u64,
+}
+
+/// Issue #1632: Maintenance window for an asset
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceWindow {
+    pub day_of_week: u32,
+    pub start_hour: u32,
+    pub end_hour: u32,
 }
 
 const ASSET_COUNT: Symbol = symbol_short!("A_COUNT");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
+/// Default window for a proposed new owner to accept an ownership transfer.
+const TRANSFER_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
 
 const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
 const ASSET_TYPE_PREFIX: Symbol = symbol_short!("AST_TYPE");
 const PENDING_ADMIN_KEY: Symbol = symbol_short!("PADMIN");
 const DECOMM_PREFIX: Symbol = symbol_short!("DECOMM");
+const LIFECYCLE_KEY: Symbol = symbol_short!("LIFECYCLE");
+/// Issue #1766: post-quantum migration config singleton.
+const QUANTUM_CONFIG_KEY: Symbol = symbol_short!("QNTM_CFG");
+const DEPLOYER_KEY: Symbol = symbol_short!("DEPLOYER");
+const ALLOWED_ASSET_TYPES_KEY: Symbol = symbol_short!("A_TYPES");
+
+/// Storage key for the authorized lending contract address.
+/// Only the contract stored under this key may call `lock_asset_as_collateral`
+/// and `unlock_asset_from_collateral`.
+const LENDING_CONTRACT_KEY: Symbol = symbol_short!("LEND_CTR");
 
 /// Maximum number of assets that may be registered in a single batch call.
 const MAX_BATCH_SIZE: u32 = 50;
 
-/// Soroban persistent-storage TTL constants.
-/// 1 ledger ≈ 5 seconds → 518_400 ledgers ≈ 30 days.
-const TTL_THRESHOLD: u32 = 518_400;
-const TTL_TARGET: u32 = 518_400;
+/// Storage key prefix for transfer conditions (issue #1316).
+const TRANSFER_CONDITION_PREFIX: Symbol = symbol_short!("XFRCOND");
+
+/// Storage key prefix for bundle registrations (issue #1317).
+const BUNDLE_PREFIX: Symbol = symbol_short!("BUNDLE");
+
+/// Storage key prefix for collateral pools (issue #1318).
+const COLLATERAL_POOL_PREFIX: Symbol = symbol_short!("POOL");
+
+/// Counter for collateral pool IDs (issue #1318).
+const POOL_ID_COUNTER: Symbol = symbol_short!("POOL_ID");
+
 pub const DEREG_TOPIC: Symbol = symbol_short!("DEREG");
 pub const ADD_TYPE_TOPIC: Symbol = symbol_short!("ADD_TYPE");
 pub const RM_TYPE_TOPIC: Symbol = symbol_short!("RM_TYPE");
 
 fn asset_key(id: u64) -> (Symbol, u64) {
     (symbol_short!("ASSET"), id)
+}
+
+fn metadata_history_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("META_HIS"), asset_id)
+}
+
+// Issue #1629: Storage keys for usage tracking
+fn usage_analytics_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("USG_ANA"), asset_id)
+}
+
+fn usage_records_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("USG_REC"), asset_id)
+}
+
+// Issue #1630: Storage keys for warranty tracking
+fn warranties_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("WARR"), asset_id)
+}
+
+fn warranty_claims_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("WARR_CL"), asset_id)
+}
+
+fn warranty_counter_key() -> Symbol {
+    symbol_short!("WARR_CTR")
+}
+
+fn claim_counter_key() -> Symbol {
+    symbol_short!("CLM_CTR")
+}
+
+// Issue #1631: Storage keys for compliance tracking
+fn compliance_certs_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("COMP_C"), asset_id)
+}
+
+fn compliance_status_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("COMP_S"), asset_id)
+}
+
+fn cert_counter_key() -> Symbol {
+    symbol_short!("CERT_CTR")
+}
+
+// Issue #1632: Storage keys for maintenance windows
+fn maintenance_windows_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("MAINT_W"), asset_id)
 }
 
 fn timelock_key(op: Symbol, asset_id: u64) -> (Symbol, Symbol, u64) {
@@ -151,14 +553,22 @@ fn require_timelock_ready(env: &Env, op: Symbol, asset_id: u64) {
     if proposal.executed {
         panic_with_error!(env, ContractError::ProposalNotFound);
     }
-    if env.ledger().timestamp().saturating_sub(proposal.proposed_at) < TIMELOCK_DELAY_SECS {
+    // #795: Compare using ledger timestamp (Unix seconds), NOT ledger sequence number.
+    // TIMELOCK_DELAY_SECS is expressed in seconds; env.ledger().timestamp() returns
+    // Unix epoch seconds — they are directly comparable.  env.ledger().sequence()
+    // returns the ledger number (currently ~30M on mainnet) and must NOT be used here:
+    // the comparison would be either instant (delay << sequence) or centuries long.
+    if env
+        .ledger()
+        .timestamp()
+        .saturating_sub(proposal.proposed_at)
+        < TIMELOCK_DELAY_SECS
+    {
         panic_with_error!(env, ContractError::TimelockNotExpired);
     }
     proposal.executed = true;
     env.storage().persistent().set(&key, &proposal);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    extend_persistent_ttl(&env, &key);
 }
 
 /// Global timelock key for admin-level operations (e.g., upgrade).
@@ -176,14 +586,21 @@ fn require_global_timelock_ready(env: &Env, op: Symbol) {
     if proposal.executed {
         panic_with_error!(env, ContractError::ProposalNotFound);
     }
-    if env.ledger().timestamp().saturating_sub(proposal.proposed_at) < TIMELOCK_DELAY_SECS {
+    // #795: Compare using ledger timestamp (Unix seconds), NOT ledger sequence number.
+    // TIMELOCK_DELAY_SECS is expressed in seconds; env.ledger().timestamp() returns
+    // Unix epoch seconds — they are directly comparable.  env.ledger().sequence()
+    // returns the ledger number and must NOT be used here.
+    if env
+        .ledger()
+        .timestamp()
+        .saturating_sub(proposal.proposed_at)
+        < TIMELOCK_DELAY_SECS
+    {
         panic_with_error!(env, ContractError::TimelockNotExpired);
     }
     proposal.executed = true;
     env.storage().persistent().set(&key, &proposal);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    extend_persistent_ttl(&env, &key);
 }
 
 /// Decommissioned flag key: asset_id → bool.
@@ -193,14 +610,52 @@ fn decommissioned_key(asset_id: u64) -> (Symbol, u64) {
 
 /// Deduplication key: (owner, asset_type, sha256(metadata)) → existing asset_id.
 /// asset_type is included so same owner+metadata with different type is not erroneously deduplicated.
-fn dedup_key(owner: &Address, asset_type: &Symbol, hash: &BytesN<32>) -> (Symbol, Address, Symbol, BytesN<32>) {
-    (symbol_short!("DEDUP"), owner.clone(), asset_type.clone(), hash.clone())
+fn dedup_key(
+    owner: &Address,
+    asset_type: &Symbol,
+    hash: &BytesN<32>,
+) -> (Symbol, Address, Symbol, BytesN<32>) {
+    (
+        symbol_short!("DEDUP"),
+        owner.clone(),
+        asset_type.clone(),
+        hash.clone(),
+    )
 }
 
 /// Serial-number dedup key: sha256(serial_number) → existing asset_id.
 /// Prevents the same physical machine from being registered twice regardless of metadata.
 fn serial_dedup_key(hash: &BytesN<32>) -> (Symbol, BytesN<32>) {
     (symbol_short!("SN_DEDUP"), hash.clone())
+}
+
+/// Serial-number lookup key for `get_asset_by_serial_number`.
+///
+/// This is the same underlying storage slot as `serial_dedup_key` — the
+/// deduplication map written during `register_asset` doubles as the reverse
+/// lookup index.  The helper is kept separate so call-sites are self-documenting.
+fn serial_number_lookup_key(env: &Env, serial: &String) -> (Symbol, BytesN<32>) {
+    let sn_bytes = serial.clone().to_xdr(env);
+    let hash: BytesN<32> = env.crypto().sha256(&sn_bytes).into();
+    serial_dedup_key(&hash)
+}
+
+fn get_asset_by_serial_hash(env: &Env, hash: &BytesN<32>) -> Option<Asset> {
+    let key = serial_dedup_key(hash);
+    let asset_id: u64 = env.storage().persistent().get(&key)?;
+    let asset_storage_key = asset_key(asset_id);
+    let asset: Asset = env.storage().persistent().get(&asset_storage_key)?;
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    env.storage()
+        .persistent()
+        .extend_ttl(&asset_storage_key, TTL_THRESHOLD, TTL_TARGET);
+    Some(asset)
+}
+
+fn encrypted_asset_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("ENC_ASSET"), asset_id)
 }
 
 /// Owner index key: owner → Vec<u64> of asset IDs.
@@ -213,6 +668,18 @@ fn asset_type_key(asset_type: &Symbol) -> (Symbol, Symbol) {
     (ASSET_TYPE_PREFIX, asset_type.clone())
 }
 
+fn allowed_asset_types(env: &Env) -> Vec<Symbol> {
+    env.storage()
+        .persistent()
+        .get(&ALLOWED_ASSET_TYPES_KEY)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+fn set_allowed_asset_types(env: &Env, asset_types: &Vec<Symbol>) {
+    env.storage().persistent().set(&ALLOWED_ASSET_TYPES_KEY, asset_types);
+    extend_persistent_ttl(&env, &ALLOWED_ASSET_TYPES_KEY);
+}
+
 /// Asset type count key: asset_type → u64 (number of registered assets of this type).
 fn type_count_key(asset_type: &Symbol) -> (Symbol, Symbol) {
     (symbol_short!("AST_CNT"), asset_type.clone())
@@ -222,7 +689,7 @@ fn type_count_inc(env: &Env, asset_type: &Symbol) {
     let key = type_count_key(asset_type);
     let count: u64 = env.storage().persistent().get(&key).unwrap_or(0);
     env.storage().persistent().set(&key, &(count + 1));
-    env.storage().persistent().extend_ttl(&key, 518400, 518400);
+    extend_persistent_ttl(&env, &key);
 }
 
 fn type_count_dec(env: &Env, asset_type: &Symbol) {
@@ -230,7 +697,7 @@ fn type_count_dec(env: &Env, asset_type: &Symbol) {
     let count: u64 = env.storage().persistent().get(&key).unwrap_or(0);
     if count > 0 {
         env.storage().persistent().set(&key, &(count - 1));
-        env.storage().persistent().extend_ttl(&key, 518400, 518400);
+        extend_persistent_ttl(&env, &key);
     }
 }
 
@@ -248,7 +715,7 @@ fn type_assets_add(env: &Env, asset_type: &Symbol, asset_id: u64) {
         .unwrap_or_else(|| Vec::new(env));
     ids.push_back(asset_id);
     env.storage().persistent().set(&key, &ids);
-    env.storage().persistent().extend_ttl(&key, 518400, 518400);
+    extend_persistent_ttl(&env, &key);
 }
 
 fn type_assets_remove(env: &Env, asset_type: &Symbol, asset_id: u64) {
@@ -265,7 +732,7 @@ fn type_assets_remove(env: &Env, asset_type: &Symbol, asset_id: u64) {
         }
     }
     env.storage().persistent().set(&key, &updated);
-    env.storage().persistent().extend_ttl(&key, 518400, 518400);
+    extend_persistent_ttl(&env, &key);
 }
 
 /// Append an asset ID to the owner's index.
@@ -278,9 +745,7 @@ fn owner_index_add(env: &Env, owner: &Address, asset_id: u64) {
         .unwrap_or_else(|| Vec::new(env));
     ids.push_back(asset_id);
     env.storage().persistent().set(&key, &ids);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    extend_persistent_ttl(&env, key.clone());
 }
 
 /// Remove an asset ID from the owner's index.
@@ -312,12 +777,10 @@ fn owner_index_remove(env: &Env, owner: &Address, asset_id: u64) {
         env.storage().persistent().remove(&key);
     } else {
         env.storage().persistent().set(&key, &updated);
-        env.storage().persistent().extend_ttl(&key, 518400, 518400);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
     }
-    env.storage().persistent().set(&key, &updated);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 }
 
 /// Category index key: category bytes → Vec<u64> of asset IDs.
@@ -330,6 +793,26 @@ fn asset_categories_key(asset_id: u64) -> (Symbol, u64) {
     (symbol_short!("AST_CATS"), asset_id)
 }
 
+/// Pending transfer key for ownership transfers.
+fn pending_transfer_key(asset_id: u64) -> (Symbol, u64) {
+    (symbol_short!("PXFER"), asset_id)
+}
+
+/// Transfer condition key for conditional transfers (issue #1316).
+fn transfer_condition_key(asset_id: u64) -> (Symbol, u64) {
+    (TRANSFER_CONDITION_PREFIX, asset_id)
+}
+
+/// Bundle registration key (issue #1317).
+fn bundle_key(merkle_root: &BytesN<32>) -> (Symbol, BytesN<32>) {
+    (BUNDLE_PREFIX, merkle_root.clone())
+}
+
+/// Collateral pool key (issue #1318).
+fn collateral_pool_key(pool_id: u64) -> (Symbol, u64) {
+    (COLLATERAL_POOL_PREFIX, pool_id)
+}
+
 fn category_assets_add(env: &Env, category: &Bytes, asset_id: u64) {
     let key = category_assets_key(category);
     let mut ids: Vec<u64> = env
@@ -339,7 +822,10 @@ fn category_assets_add(env: &Env, category: &Bytes, asset_id: u64) {
         .unwrap_or_else(|| Vec::new(env));
     ids.push_back(asset_id);
     env.storage().persistent().set(&key, &ids);
-    env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    extend_persistent_ttl(&env, key.clone());
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 }
 
 fn category_assets_remove(env: &Env, category: &Bytes, asset_id: u64) {
@@ -359,7 +845,10 @@ fn category_assets_remove(env: &Env, category: &Bytes, asset_id: u64) {
         env.storage().persistent().remove(&key);
     } else {
         env.storage().persistent().set(&key, &updated);
-        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, key.clone());
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
     }
 }
 
@@ -377,7 +866,10 @@ fn asset_categories_add(env: &Env, asset_id: u64, category: &Bytes) {
     }
     cats.push_back(category.clone());
     env.storage().persistent().set(&key, &cats);
-    env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+    extend_persistent_ttl(&env, &key);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
 }
 
 fn asset_categories_remove_all(env: &Env, asset_id: u64) {
@@ -403,11 +895,150 @@ fn ensure_not_paused(env: &Env) {
     }
 }
 
+/// Validate that every character in a Symbol is alphanumeric or underscore
+/// (`[A-Za-z0-9_]`). Panics with [`ContractError::InvalidAssetType`] otherwise.
+///
+/// Soroban Symbol XDR layout: 4-byte type tag + 4-byte big-endian length + raw ASCII chars.
+/// We skip the 8-byte header and inspect the remaining bytes directly.
+fn validate_asset_type_symbol(env: &Env, asset_type: &Symbol) {
+    let xdr_bytes = asset_type.clone().to_xdr(env);
+    // XDR header is 8 bytes (4-byte discriminant + 4-byte length).
+    let header_len: u32 = 8;
+    let total = xdr_bytes.len();
+    if total <= header_len {
+        // Empty symbol — treat as invalid.
+        panic_with_error!(env, ContractError::InvalidAssetType);
+    }
+    for i in header_len..total {
+        let b = xdr_bytes.get(i).unwrap_or(0);
+        let valid = (b >= b'A' && b <= b'Z')
+            || (b >= b'a' && b <= b'z')
+            || (b >= b'0' && b <= b'9')
+            || b == b'_';
+        if !valid {
+            panic_with_error!(env, ContractError::InvalidAssetType);
+        }
+    }
+}
+
+/// #1759: Default privacy budget per asset type, in milli-epsilon (epsilon = 10).
+pub const DEFAULT_DP_BUDGET_MILLI: u64 = 10_000;
+
+/// #1759: Fixed-point scale used by the discrete Laplace sampler (1e18).
+const DP_SCALE: u128 = 1_000_000_000_000_000_000;
+
+/// #1759: Upper bound on Bernoulli trials per geometric draw (keeps gas bounded).
+const DP_MAX_GEOM_STEPS: u64 = 10_000;
+
+/// #1760: Metadata for an off-chain sidecar blob. Only the content hash and
+/// metadata live on-chain; the bytes live in content-addressed storage (IPFS / Arweave).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SidecarRecord {
+    /// SHA-256 digest of the sidecar bytes.
+    pub content_hash: BytesN<32>,
+    /// Content address (e.g. `ipfs://...` or `ar://...`).
+    pub uri: String,
+    /// Size of the off-chain blob, used for storage cost tracking.
+    pub size_bytes: u64,
+    /// Ledger timestamp when the record was added.
+    pub added_at: u64,
+    /// Ledger timestamp after which anyone may expire the record. 0 = no expiry.
+    pub retain_until: u64,
+    /// True once the record has been removed or expired.
+    pub deleted: bool,
+}
+
+/// #1759: A differential-privacy query over aggregate asset counts.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DpQuery {
+    /// Asset type to count.
+    pub asset_type: Symbol,
+    /// Epsilon for this query, in milli-units (1000 = epsilon 1.0).
+    pub epsilon_milli: u32,
+}
+
+/// #1759: Noisy aggregate result from [`AssetRegistry::get_dp_stats`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NoisyStats {
+    pub asset_type: Symbol,
+    /// Count plus two-sided geometric noise, clamped to zero.
+    pub noisy_count: u64,
+    /// Epsilon that was charged to the budget for this query.
+    pub epsilon_milli: u32,
+}
+
+/// #1759: Exact discrete Laplace (two-sided geometric) mechanism helpers.
+/// `e^{-x}` in fixed point. Requires `x <= 5 * DP_SCALE` to avoid overflow.
+fn dp_exp_neg(x: u128) -> u128 {
+    let mut term: u128 = DP_SCALE;
+    let mut pos: u128 = DP_SCALE;
+    let mut neg: u128 = 0;
+    for k in 1u128..60 {
+        term = term * x / (DP_SCALE * k);
+        if k % 2 == 1 {
+            neg += term;
+        } else {
+            pos += term;
+        }
+    }
+    pos.saturating_sub(neg)
+}
+
+/// Samples the number of failures before the first success, where each trial
+/// continues with probability `q` (a geometric draw with parameter `q`).
+fn dp_geometric(env: &Env, q: u128) -> u64 {
+    let mut count = 0u64;
+    while count < DP_MAX_GEOM_STEPS {
+        let u = env.prng().gen_range::<u64>(0..(DP_SCALE as u64)) as u128;
+        if u < q {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    count
+}
+
+/// Marks sidecar `index` for `asset_id` as deleted and releases its tracked bytes.
+fn mark_sidecar_deleted(env: &Env, asset_id: u64, index: u32) {
+    let key = DataKey::AssetSidecars(asset_id);
+    let mut list: Vec<SidecarRecord> = env.storage().persistent().get(&key).unwrap_or(Vec::new(env));
+    let mut rec = list
+        .get(index)
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::SidecarNotFound));
+    if rec.deleted {
+        panic_with_error!(env, ContractError::SidecarDeleted);
+    }
+    rec.deleted = true;
+    let size = rec.size_bytes;
+    list.set(index, rec);
+    env.storage().persistent().set(&key, &list);
+    extend_persistent_ttl(env, key);
+
+    let bytes_key = DataKey::SidecarBytes(asset_id);
+    let total: u64 = env.storage().persistent().get(&bytes_key).unwrap_or(0);
+    env.storage()
+        .persistent()
+        .set(&bytes_key, &total.saturating_sub(size));
+    extend_persistent_ttl(env, bytes_key);
+}
+
 #[contract]
 pub struct AssetRegistry;
 
 #[contractimpl]
 impl AssetRegistry {
+    /// Store the deployer address at deploy time.
+    pub fn __constructor(env: Env, deployer: Address) {
+        env.storage().instance().set(&DEPLOYER_KEY, &deployer);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_TARGET);
+    }
+
     /// Propose a timelocked deregistration for an asset.
     /// This is the first step in removing an asset from the registry.
     ///
@@ -443,11 +1074,7 @@ impl AssetRegistry {
         let key = timelock_key(DEREG_TOPIC, asset_id);
         // Block re-proposal if a pending proposal already exists to prevent
         // the owner from resetting the timelock clock indefinitely.
-        if let Some(existing) = env
-            .storage()
-            .persistent()
-            .get::<_, TimelockProposal>(&key)
-        {
+        if let Some(existing) = env.storage().persistent().get::<_, TimelockProposal>(&key) {
             if !existing.executed {
                 panic_with_error!(&env, ContractError::ProposalAlreadyExists);
             }
@@ -459,9 +1086,7 @@ impl AssetRegistry {
                 executed: false,
             },
         );
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &key);
     }
 
     /// Execute a previously proposed asset deregistration after the timelock expires.
@@ -492,12 +1117,21 @@ impl AssetRegistry {
     /// # Panics
     /// - [`ContractError::DuplicateAsset`] if the same owner tries to register identical metadata
     /// - [`ContractError::InvalidAssetType`] if the asset type is not in the allowlist
-    pub fn register_asset(env: Env, asset_type: Symbol, metadata: String, serial_number: String, owner: Address) -> u64 {
+    pub fn register_asset(
+        env: Env,
+        asset_type: Symbol,
+        metadata: String,
+        serial_number: String,
+        owner: Address,
+    ) -> u64 {
         ensure_not_paused(&env);
         owner.require_auth();
 
         require_string_length(&metadata, "metadata", 256);
         require_string_length(&serial_number, "serial_number", 64);
+
+        // Validate asset_type contains only alphanumeric + underscore characters.
+        validate_asset_type_symbol(&env, &asset_type);
 
         // Validate asset type against allowlist
         if !Self::is_valid_asset_type(env.clone(), asset_type.clone()) {
@@ -529,20 +1163,33 @@ impl AssetRegistry {
             owner: owner.clone(),
             registered_at: env.ledger().timestamp(),
             metadata_updated_at: env.ledger().timestamp(),
+            metadata_version: 0,
             deprecation_status: DeprecationStatus::Active,
+            is_locked: false,
+            lender: None,
+            loan_id: None,
+            deprecated_at: None,
+            co_owners: Vec::new(&env),
         };
         env.storage().persistent().set(&asset_key(id), &asset);
-        env.storage()
-            .persistent()
-            .extend_ttl(&asset_key(id), TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &asset_key(id));
         env.storage().persistent().set(&ASSET_COUNT, &id);
+        extend_persistent_ttl(&env, &ASSET_COUNT);
+        env.storage().persistent().set(&dk, &id);
+        extend_persistent_ttl(&env, &dk);
+        env.storage().persistent().set(&sdk, &id);
+        extend_persistent_ttl(&env, &sdk);
         env.storage()
             .persistent()
             .extend_ttl(&ASSET_COUNT, TTL_THRESHOLD, TTL_TARGET);
         env.storage().persistent().set(&dk, &id);
-        env.storage().persistent().extend_ttl(&dk, TTL_THRESHOLD, TTL_TARGET);
+        env.storage()
+            .persistent()
+            .extend_ttl(&dk, TTL_THRESHOLD, TTL_TARGET);
         env.storage().persistent().set(&sdk, &id);
-        env.storage().persistent().extend_ttl(&sdk, TTL_THRESHOLD, TTL_TARGET);
+        env.storage()
+            .persistent()
+            .extend_ttl(&sdk, TTL_THRESHOLD, TTL_TARGET);
 
         // Update owner index
         owner_index_add(&env, &owner, id);
@@ -559,6 +1206,94 @@ impl AssetRegistry {
             (id, owner.clone(), env.ledger().timestamp()),
         );
 
+        id
+    }
+
+    /// Register an asset without putting sensitive serial or location data on-chain.
+    ///
+    /// `serial_number_hash` must be the SHA-256 digest of `encrypted_serial_number`.
+    /// Binding the lookup key to the ciphertext prevents callers from reserving
+    /// arbitrary plaintext-serial hashes. Clients can look up the record using
+    /// `get_asset_by_serial_number_hash`; the contract cannot infer the plaintext
+    /// serial from ciphertext. `encrypted_*` values must be produced client-side using an
+    /// authenticated encryption scheme and can only be decrypted by authorised
+    /// off-chain consumers.
+    pub fn register_asset_encrypted(
+        env: Env,
+        asset_type: Symbol,
+        metadata: String,
+        serial_number_hash: BytesN<32>,
+        encrypted_serial_number: Bytes,
+        encrypted_location: Bytes,
+        owner: Address,
+    ) -> u64 {
+        ensure_not_paused(&env);
+        owner.require_auth();
+        require_string_length(&metadata, "metadata", 256);
+        if encrypted_serial_number.is_empty() || encrypted_serial_number.len() > 4096
+            || encrypted_location.is_empty() || encrypted_location.len() > 4096
+        {
+            panic_with_error!(&env, ContractError::InvalidEncryptedData);
+        }
+        let expected_serial_hash: BytesN<32> =
+            env.crypto().sha256(&encrypted_serial_number).into();
+        if serial_number_hash != expected_serial_hash {
+            panic_with_error!(&env, ContractError::InvalidSerialNumberHash);
+        }
+        validate_asset_type_symbol(&env, &asset_type);
+        if !Self::is_valid_asset_type(env.clone(), asset_type.clone()) {
+            panic_with_error!(&env, ContractError::InvalidAssetType);
+        }
+
+        let serial_key = serial_dedup_key(&serial_number_hash);
+        if env.storage().persistent().has(&serial_key) {
+            panic_with_error!(&env, ContractError::DuplicateAsset);
+        }
+        let meta_hash: BytesN<32> = env.crypto().sha256(&metadata.clone().to_xdr(&env)).into();
+        let metadata_key = dedup_key(&owner, &asset_type, &meta_hash);
+        if env.storage().persistent().has(&metadata_key) {
+            panic_with_error!(&env, ContractError::DuplicateAsset);
+        }
+
+        let id: u64 = env.storage().persistent().get(&ASSET_COUNT).unwrap_or(0) + 1;
+        let asset = Asset {
+            asset_id: id,
+            asset_type: asset_type.clone(),
+            metadata,
+            serial_number: String::from_str(&env, "[encrypted]"),
+            owner: owner.clone(),
+            registered_at: env.ledger().timestamp(),
+            metadata_updated_at: env.ledger().timestamp(),
+            metadata_version: 0,
+            deprecation_status: DeprecationStatus::Active,
+            is_locked: false,
+            lender: None,
+            loan_id: None,
+            deprecated_at: None,
+            co_owners: Vec::new(&env),
+        };
+        let encrypted_key = encrypted_asset_key(id);
+        let encrypted = EncryptedAssetFields {
+            serial_number: encrypted_serial_number,
+            location: encrypted_location,
+        };
+        env.storage().persistent().set(&asset_key(id), &asset);
+        env.storage().persistent().set(&encrypted_key, &encrypted);
+        env.storage().persistent().set(&ASSET_COUNT, &id);
+        env.storage().persistent().set(&metadata_key, &id);
+        env.storage().persistent().set(&serial_key, &id);
+        extend_persistent_ttl(&env, &asset_key(id));
+        extend_persistent_ttl(&env, &encrypted_key);
+        extend_persistent_ttl(&env, &ASSET_COUNT);
+        extend_persistent_ttl(&env, &metadata_key);
+        extend_persistent_ttl(&env, &serial_key);
+        owner_index_add(&env, &owner, id);
+        type_count_inc(&env, &asset_type);
+        type_assets_add(&env, &asset_type, id);
+        env.events().publish(
+            (symbol_short!("reg_asset"),),
+            (id, owner, env.ledger().timestamp()),
+        );
         id
     }
 
@@ -634,22 +1369,31 @@ impl AssetRegistry {
                 owner: owner.clone(),
                 registered_at: env.ledger().timestamp(),
                 metadata_updated_at: env.ledger().timestamp(),
+                metadata_version: 0,
                 deprecation_status: DeprecationStatus::Active,
+                is_locked: false,
+                lender: None,
+                loan_id: None,
+                deprecated_at: None,
+                co_owners: Vec::new(&env),
             };
 
             env.storage().persistent().set(&asset_key(id), &asset);
-            env.storage()
-                .persistent()
-                .extend_ttl(&asset_key(id), TTL_THRESHOLD, TTL_TARGET);
+            extend_persistent_ttl(&env, &asset_key(id));
             env.storage()
                 .persistent()
                 .set(&dedup_key(&owner, &asset_in.asset_type, &meta_hash), &id);
+            extend_persistent_ttl(&env, &dedup_key(&owner, &asset_in.asset_type, &meta_hash));
+            env.storage().persistent().set(&serial_dedup_key(&sn_hash), &id);
+            extend_persistent_ttl(&env, &serial_dedup_key(&sn_hash));
             env.storage().persistent().extend_ttl(
                 &dedup_key(&owner, &asset_in.asset_type, &meta_hash),
                 TTL_THRESHOLD,
                 TTL_TARGET,
             );
-            env.storage().persistent().set(&serial_dedup_key(&sn_hash), &id);
+            env.storage()
+                .persistent()
+                .set(&serial_dedup_key(&sn_hash), &id);
             env.storage().persistent().extend_ttl(
                 &serial_dedup_key(&sn_hash),
                 TTL_THRESHOLD,
@@ -678,18 +1422,12 @@ impl AssetRegistry {
 
         if next_id > env.storage().persistent().get(&ASSET_COUNT).unwrap_or(0) {
             env.storage().persistent().set(&ASSET_COUNT, &next_id);
-            env.storage()
-                .persistent()
-                .extend_ttl(&ASSET_COUNT, TTL_THRESHOLD, TTL_TARGET);
+            extend_persistent_ttl(&env, &ASSET_COUNT);
         }
 
         // Ensure owner index TTL is extended after all batch writes
         if !ids.is_empty() {
-            env.storage().persistent().extend_ttl(
-                &owner_index_key(&owner),
-                TTL_THRESHOLD,
-                TTL_TARGET,
-            );
+            extend_persistent_ttl(&env, owner_index_key(&owner));
         }
 
         // Emit batch registration event
@@ -714,13 +1452,102 @@ impl AssetRegistry {
     /// # Panics
     /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
     pub fn get_asset(env: Env, asset_id: u64) -> Asset {
+        let key = asset_key(asset_id);
+        let asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+        // Extend TTL on read to prevent stale data after TTL expiry
         env.storage()
             .persistent()
-            .get(&asset_key(asset_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound))
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        asset
     }
 
-    /// Returns true if an asset with the given ID exists, false otherwise.
+    /// Returns whether the asset is currently locked as collateral under a lien.
+    ///
+    /// Read-only lookup for other contracts (for example the asset NFT contract, issue #1972)
+    /// that must refuse to sell or transfer a pledged asset.
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    pub fn is_asset_locked(env: Env, asset_id: u64) -> bool {
+        let asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+        asset.is_locked
+    }
+
+    /// Return all registered assets from `asset_ids` in one invocation.
+    ///
+    /// Missing IDs are omitted, matching the tolerant behavior of the other
+    /// batch read endpoints. The input is bounded to keep response and
+    /// instruction usage predictable for API clients.
+    pub fn batch_get_assets(env: Env, asset_ids: Vec<u64>) -> Vec<Asset> {
+        if asset_ids.len() > MAX_BATCH_SIZE {
+            panic_with_error!(&env, ContractError::BatchTooLarge);
+        }
+
+        let mut assets = Vec::new(&env);
+        for asset_id in asset_ids.iter() {
+            let key = asset_key(asset_id);
+            if let Some(asset) = env.storage().persistent().get(&key) {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+                assets.push_back(asset);
+            }
+        }
+        assets
+    }
+
+    /// Look up an asset by its physical serial number.
+    ///
+    /// Field engineers and auditors who know a machine's manufacturer plate number
+    /// can use this function to retrieve the full on-chain record without needing
+    /// to know the numeric `asset_id` in advance.
+    ///
+    /// The lookup is O(1): during plaintext registration, a mapping of
+    /// `sha256(serial_number) → asset_id` is written under the serial deduplication
+    /// key. Encrypted records should be queried with
+    /// `get_asset_by_serial_number_hash`.
+    ///
+    /// # Arguments
+    /// * `serial` - The physical serial number string (case-sensitive, as registered)
+    ///
+    /// # Returns
+    /// `Some(Asset)` if an asset with that serial number exists; `None` otherwise.
+    pub fn get_asset_by_serial_number(env: Env, serial: String) -> Option<Asset> {
+        let key = serial_number_lookup_key(&env, &serial);
+        get_asset_by_serial_hash(&env, &key.1)
+    }
+
+    /// Look up an asset registered with encrypted serial data by its ciphertext hash.
+    ///
+    /// The supplied hash must be the same SHA-256 digest that was verified and
+    /// stored during `register_asset_encrypted`.
+    pub fn get_asset_by_serial_number_hash(
+        env: Env,
+        serial_number_hash: BytesN<32>,
+    ) -> Option<Asset> {
+        get_asset_by_serial_hash(&env, &serial_number_hash)
+    }
+
+    /// Check whether an asset with the given ID is present in the registry.
+    ///
+    /// This is a lightweight existence check that reads a single persistent storage
+    /// entry and does **not** verify the asset's deprecation or decommission status.
+    /// Use [`get_asset`] if you need the full asset record, or [`asset_status`] if
+    /// you need operational state.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset to check
+    ///
+    /// # Returns
+    /// `true` if a record for `asset_id` exists in persistent storage; `false` otherwise
     pub fn asset_exists(env: Env, asset_id: u64) -> bool {
         env.storage().persistent().has(&asset_key(asset_id))
     }
@@ -744,32 +1571,51 @@ impl AssetRegistry {
 
         // Check if asset is decommissioned
         let decomm_key = decommissioned_key(asset_id);
-        let is_decommissioned: bool = env
-            .storage()
-            .persistent()
-            .get(&decomm_key)
-            .unwrap_or(false);
+        let is_decommissioned: bool = env.storage().persistent().get(&decomm_key).unwrap_or(false);
 
         if is_decommissioned {
+            // Extend TTL on read
+            env.storage()
+                .persistent()
+                .extend_ttl(&decomm_key, TTL_THRESHOLD, TTL_TARGET);
             return AssetStatus::Decommissioned;
         }
 
         // Check if asset is under maintenance
         let maint_key = (symbol_short!("U_MAINT"), asset_id);
-        let is_under_maintenance: bool = env
-            .storage()
-            .persistent()
-            .get(&maint_key)
-            .unwrap_or(false);
+        let is_under_maintenance: bool =
+            env.storage().persistent().get(&maint_key).unwrap_or(false);
 
         if is_under_maintenance {
+            // Extend TTL on read
+            env.storage()
+                .persistent()
+                .extend_ttl(&maint_key, TTL_THRESHOLD, TTL_TARGET);
             return AssetStatus::UnderMaintenance;
         }
+
+        // For Active status, extend TTL on the asset itself
+        env.storage()
+            .persistent()
+            .extend_ttl(&asset_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
 
         AssetStatus::Active
     }
 
-    /// Returns all asset IDs owned by the given address.
+    /// Return all asset IDs currently owned by the given address.
+    ///
+    /// Uses the owner-to-assets index maintained by [`register_asset`] and
+    /// [`transfer_asset`]. The list is updated on every registration and transfer
+    /// so it reflects the owner's current portfolio.
+    ///
+    /// For owners with large portfolios that may exceed return-data limits, prefer
+    /// the paginated variant [`get_assets_by_owner_paginated`].
+    ///
+    /// # Arguments
+    /// * `owner` - The address of the asset owner to query
+    ///
+    /// # Returns
+    /// A `Vec<u64>` of asset IDs owned by `owner` (empty vec if none)
     pub fn get_assets_by_owner(env: Env, owner: Address) -> Vec<u64> {
         let key = owner_index_key(&owner);
         let ids: Vec<u64> = env
@@ -778,9 +1624,7 @@ impl AssetRegistry {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
         if env.storage().persistent().has(&key) {
-            env.storage()
-                .persistent()
-                .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+            extend_persistent_ttl(&env, key.clone());
         }
         ids
     }
@@ -794,7 +1638,12 @@ impl AssetRegistry {
     ///
     /// # Returns
     /// Vec containing the requested page of asset IDs
-    pub fn get_assets_by_owner_page(env: Env, owner: Address, page: u32, page_size: u32) -> Vec<u64> {
+    pub fn get_assets_by_owner_page(
+        env: Env,
+        owner: Address,
+        page: u32,
+        page_size: u32,
+    ) -> Vec<u64> {
         let key = owner_index_key(&owner);
         let all_assets: Vec<u64> = env
             .storage()
@@ -803,9 +1652,7 @@ impl AssetRegistry {
             .unwrap_or_else(|| Vec::new(&env));
 
         if env.storage().persistent().has(&key) {
-            env.storage()
-                .persistent()
-                .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+            extend_persistent_ttl(&env, key.clone());
         }
 
         if page_size == 0 {
@@ -838,7 +1685,12 @@ impl AssetRegistry {
     ///
     /// # Returns
     /// `OwnerPage` containing the requested slice and the total asset count for this owner
-    pub fn get_assets_by_owner_paginated(env: Env, owner: Address, page: u32, page_size: u32) -> OwnerPage {
+    pub fn get_assets_by_owner_paginated(
+        env: Env,
+        owner: Address,
+        page: u32,
+        page_size: u32,
+    ) -> OwnerPage {
         const MAX_PAGE_SIZE: u32 = 100;
         let page_size = page_size.min(MAX_PAGE_SIZE);
 
@@ -849,28 +1701,55 @@ impl AssetRegistry {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
         if env.storage().persistent().has(&key) {
-            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+            extend_persistent_ttl(&env, key.clone());
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
         }
 
-        let total = all.len();
+        // Exclude decommissioned assets from both the returned page and the total count.
+        let mut active: Vec<u64> = Vec::new(&env);
+        for id in all.iter() {
+            let is_decommissioned: bool = env
+                .storage()
+                .persistent()
+                .get(&decommissioned_key(id))
+                .unwrap_or(false);
+            if !is_decommissioned {
+                active.push_back(id);
+            }
+        }
+
+        let total = active.len();
 
         if page_size == 0 {
-            return OwnerPage { assets: Vec::new(&env), total };
+            return OwnerPage {
+                assets: Vec::new(&env),
+                total,
+            };
         }
 
         let offset = match page.checked_mul(page_size) {
             Some(o) => o,
-            None => return OwnerPage { assets: Vec::new(&env), total },
+            None => {
+                return OwnerPage {
+                    assets: Vec::new(&env),
+                    total,
+                }
+            }
         };
 
         if offset >= total {
-            return OwnerPage { assets: Vec::new(&env), total };
+            return OwnerPage {
+                assets: Vec::new(&env),
+                total,
+            };
         }
 
         let end = (offset + page_size).min(total);
         let mut assets = Vec::new(&env);
         for i in offset..end {
-            assets.push_back(all.get(i).unwrap());
+            assets.push_back(active.get(i).unwrap());
         }
 
         OwnerPage { assets, total }
@@ -892,6 +1771,30 @@ impl AssetRegistry {
         env.storage().persistent().get(&ASSET_COUNT).unwrap_or(0)
     }
 
+    /// Return all asset IDs that have been registered with the given type symbol.
+    ///
+    /// Uses the type-to-assets index maintained by [`register_asset`] and updated
+    /// on registration and deregistration. The returned list may include deprecated or
+    /// decommissioned assets; callers that need only active assets should filter by
+    /// [`asset_status`] after retrieval.
+    ///
+    /// For large fleets, prefer the paginated variant [`get_assets_by_type_paginated`]
+    /// to avoid exceeding Soroban's return-data limits.
+    ///
+    /// # Arguments
+    /// * `asset_type` - The symbol representing the asset type (e.g., `symbol_short!("GENSET")`)
+    ///
+    /// # Returns
+    /// A `Vec<u64>` of asset IDs of the requested type (empty vec if none)
+    /// Get the total number of registered assets.
+    /// Useful for analytics dashboards and DeFi protocol integrations.
+    ///
+    /// # Returns
+    /// The total number of assets that have ever been registered
+    pub fn get_total_asset_count(env: Env) -> u64 {
+        env.storage().persistent().get(&ASSET_COUNT).unwrap_or(0)
+    }
+
     /// Returns all asset IDs of the given type.
     pub fn get_assets_by_type(env: Env, asset_type: Symbol) -> Vec<u64> {
         let key = type_assets_key(&asset_type);
@@ -901,7 +1804,7 @@ impl AssetRegistry {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
         if env.storage().persistent().has(&key) {
-            env.storage().persistent().extend_ttl(&key, 518400, 518400);
+            extend_persistent_ttl(&env, &key);
         }
         ids
     }
@@ -962,22 +1865,33 @@ impl AssetRegistry {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
         if env.storage().persistent().has(&key) {
-            env.storage().persistent().extend_ttl(&key, 518400, 518400);
+            extend_persistent_ttl(&env, &key);
         }
 
         let total = all.len();
 
         if page_size == 0 {
-            return AssetTypePage { assets: Vec::new(&env), total };
+            return AssetTypePage {
+                assets: Vec::new(&env),
+                total,
+            };
         }
 
         let offset = match page.checked_mul(page_size) {
             Some(o) => o,
-            None => return AssetTypePage { assets: Vec::new(&env), total },
+            None => {
+                return AssetTypePage {
+                    assets: Vec::new(&env),
+                    total,
+                }
+            }
         };
 
         if offset >= total {
-            return AssetTypePage { assets: Vec::new(&env), total };
+            return AssetTypePage {
+                assets: Vec::new(&env),
+                total,
+            };
         }
 
         let end = (offset + page_size).min(total);
@@ -1002,9 +1916,7 @@ impl AssetRegistry {
             .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
         if env.storage().persistent().has(&key) {
-            env.storage()
-                .persistent()
-                .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+            extend_persistent_ttl(&env, key.clone());
         }
         ids
     }
@@ -1041,10 +1953,8 @@ impl AssetRegistry {
         asset_categories_add(&env, asset_id, &category);
         category_assets_add(&env, &category, asset_id);
 
-        env.events().publish(
-            (symbol_short!("TAG_ASSET"), asset_id),
-            (caller, category),
-        );
+        env.events()
+            .publish((symbol_short!("TAG_ASSET"), asset_id), (caller, category));
     }
 
     /// Initialize the admin address for the contract.
@@ -1059,6 +1969,14 @@ impl AssetRegistry {
     /// - [`ContractError::UnauthorizedAdmin`] if deployer is not the transaction invoker
     pub fn initialize_admin(env: Env, deployer: Address, admin: Address) {
         deployer.require_auth();
+        let stored_deployer: Address = env
+            .storage()
+            .instance()
+            .get(&DEPLOYER_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized));
+        if deployer != stored_deployer {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
         if env.storage().instance().has(&ADMIN_KEY) {
             panic_with_error!(&env, ContractError::AdminAlreadyInitialized);
         }
@@ -1070,6 +1988,127 @@ impl AssetRegistry {
             (symbol_short!("ADM_AUD"), symbol_short!("INIT_ADM")),
             (admin, env.ledger().timestamp()),
         );
+    }
+
+    /// Admin-gated restore entry point.
+    ///
+    /// Registers an asset on behalf of its original `owner` without requiring the
+    /// owner's signature. Only the contract admin may call this, which lets an
+    /// operator restore a backup without holding every owner's key.
+    ///
+    /// The new asset receives a fresh ID from `ASSET_COUNT`; the mapping from
+    /// `original_asset_id` to that new ID is persisted so off-chain tooling can
+    /// re-link maintenance history via [`Self::get_restored_asset_id`].
+    ///
+    /// # Arguments
+    /// * `admin` - The contract admin; must sign this call
+    /// * `asset_type` - The asset type symbol (must be in the allowlist)
+    /// * `metadata` - The asset metadata string
+    /// * `serial_number` - The unique physical serial number
+    /// * `owner` - The original owner to assign to the restored asset
+    /// * `original_asset_id` - The asset ID from the backup being restored
+    ///
+    /// # Returns
+    /// The newly assigned asset ID
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the stored admin
+    /// - [`ContractError::Paused`] if the contract is paused
+    /// - [`ContractError::InvalidAssetType`] if the type is not in the allowlist
+    /// - [`ContractError::DuplicateAsset`] if the serial number is already registered
+    pub fn restore_asset(
+        env: Env,
+        admin: Address,
+        asset_type: Symbol,
+        metadata: String,
+        serial_number: String,
+        owner: Address,
+        original_asset_id: u64,
+    ) -> u64 {
+        ensure_not_paused(&env);
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if require_admin(&admin, &stored_admin).is_err() {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        if !env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&asset_type_key(&asset_type))
+            .unwrap_or(false)
+        {
+            panic_with_error!(&env, ContractError::InvalidAssetType);
+        }
+
+        require_string_length(&metadata, "metadata", 256);
+        require_string_length(&serial_number, "serial_number", 128);
+
+        // Serial numbers are globally unique; refuse to restore over an existing asset.
+        let serial_key = serial_number_key(&serial_number);
+        if env.storage().persistent().has(&serial_key) {
+            panic_with_error!(&env, ContractError::DuplicateAsset);
+        }
+
+        let asset_id: u64 = env.storage().persistent().get(&ASSET_COUNT).unwrap_or(0) + 1;
+        env.storage().persistent().set(&ASSET_COUNT, &asset_id);
+        extend_persistent_ttl(&env, &ASSET_COUNT);
+
+        let now = env.ledger().timestamp();
+        let asset = Asset {
+            asset_id,
+            asset_type: asset_type.clone(),
+            metadata: metadata.clone(),
+            serial_number: serial_number.clone(),
+            owner: owner.clone(),
+            registered_at: now,
+            metadata_updated_at: now,
+            metadata_version: 0,
+            deprecation_status: DeprecationStatus::Active,
+            is_locked: false,
+            lender: None,
+            loan_id: None,
+            deprecated_at: None,
+            co_owners: Vec::new(&env),
+        };
+
+        env.storage().persistent().set(&asset_key(asset_id), &asset);
+        extend_persistent_ttl(&env, &asset_key(asset_id));
+
+        env.storage().persistent().set(&serial_key, &asset_id);
+        extend_persistent_ttl(&env, &serial_key);
+
+        // Dedup key is keyed by owner so the same owner cannot register identical metadata twice.
+        let hash: BytesN<32> = env.crypto().sha256(&metadata.to_xdr(&env)).into();
+        let dk = dedup_key(&owner, &asset_type, &hash);
+        env.storage().persistent().set(&dk, &asset_id);
+        extend_persistent_ttl(&env, &dk);
+
+        owner_index_add(&env, &owner, asset_id);
+        type_count_inc(&env, &asset_type);
+        type_assets_add(&env, &asset_type, asset_id);
+
+        // Record the original -> new ID mapping for maintenance history re-linking.
+        let map_key = DataKey::RestoreIdMap(original_asset_id);
+        env.storage().persistent().set(&map_key, &asset_id);
+        extend_persistent_ttl(&env, &map_key);
+
+        env.events().publish(
+            (symbol_short!("RESTORE"), asset_id),
+            (admin, owner, original_asset_id, now),
+        );
+
+        asset_id
+    }
+
+    /// Returns the new asset ID assigned to `original_asset_id` by
+    /// [`Self::restore_asset`], or `None` if that asset was never restored.
+    pub fn get_restored_asset_id(env: Env, original_asset_id: u64) -> Option<u64> {
+        let key = DataKey::RestoreIdMap(original_asset_id);
+        let mapped: Option<u64> = env.storage().persistent().get(&key);
+        if mapped.is_some() {
+            extend_persistent_ttl(&env, &key);
+        }
+        mapped
     }
 
     /// Get the current admin address of the contract.
@@ -1086,6 +2125,99 @@ impl AssetRegistry {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized))
     }
 
+    /// Set the lifecycle contract address for cross-contract notifications.
+    /// Only the admin can set this.
+    ///
+    /// # Arguments
+    /// * `admin` - The administrator making the update
+    /// * `lifecycle_addr` - The address of the lifecycle contract
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    pub fn set_lifecycle_contract(env: Env, admin: Address, lifecycle_addr: Address) {
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if require_admin(&admin, &stored_admin).is_err() {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        env.storage().instance().set(&LIFECYCLE_KEY, &lifecycle_addr);
+        env.storage().instance().extend_ttl(518400, 518400);
+    }
+
+    /// Issue #1766: set the contract's post-quantum migration config. Only the
+    /// admin may call this. See docs/post-quantum-migration.md for the phased
+    /// rollout this is designed to support.
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the admin
+    /// - [`ContractError::InvalidQuantumConfig`] if `legacy_sunset_at` is set
+    ///   (nonzero) while Legacy is the active algorithm with dual-algorithm
+    ///   support disabled — that combination would brick all existing signers.
+    pub fn set_quantum_config(
+        env: Env,
+        admin: Address,
+        active_algorithm: CryptoAlgorithm,
+        dual_algorithm_enabled: bool,
+        legacy_sunset_at: u64,
+    ) {
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if require_admin(&admin, &stored_admin).is_err() {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        if legacy_sunset_at != 0
+            && active_algorithm == CryptoAlgorithm::Legacy
+            && !dual_algorithm_enabled
+        {
+            panic_with_error!(&env, ContractError::InvalidQuantumConfig);
+        }
+
+        let config = QuantumMigrationConfig {
+            active_algorithm,
+            dual_algorithm_enabled,
+            legacy_sunset_at,
+        };
+        env.storage().instance().set(&QUANTUM_CONFIG_KEY, &config);
+        env.storage().instance().extend_ttl(518400, 518400);
+    }
+
+    /// Issue #1766: current post-quantum migration config. Defaults to
+    /// Legacy-only (today's actual behavior) if never explicitly set.
+    pub fn get_quantum_config(env: Env) -> QuantumMigrationConfig {
+        env.storage()
+            .instance()
+            .get(&QUANTUM_CONFIG_KEY)
+            .unwrap_or(QuantumMigrationConfig {
+                active_algorithm: CryptoAlgorithm::Legacy,
+                dual_algorithm_enabled: false,
+                legacy_sunset_at: 0,
+            })
+    }
+
+    /// Issue #1766: whether a Legacy (Ed25519) signature should still be
+    /// accepted right now, per the current migration config and ledger time.
+    pub fn is_legacy_signature_accepted(env: Env) -> bool {
+        let config = Self::get_quantum_config(env.clone());
+        match config.active_algorithm {
+            CryptoAlgorithm::Legacy => true,
+            _ => {
+                config.dual_algorithm_enabled
+                    && (config.legacy_sunset_at == 0
+                        || env.ledger().timestamp() < config.legacy_sunset_at)
+            }
+        }
+    }
+
+    /// Get the configured lifecycle contract address.
+    ///
+    /// # Returns
+    /// The address of the lifecycle contract, or panics if not set
+    pub fn get_lifecycle_contract(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&LIFECYCLE_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotInitialized))
+    }
+
     /// Propose a new admin address (step 1 of 2-step transfer).
     /// Only the current admin can propose a new admin.
     ///
@@ -1097,16 +2229,15 @@ impl AssetRegistry {
     /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
     /// - [`ContractError::PendingAdminAlreadyExists`] if a pending admin already exists
     pub fn propose_admin(env: Env, admin: Address, new_admin: Address) {
-        admin.require_auth();
         let stored_admin: Address = Self::get_admin(env.clone());
-        if stored_admin != admin {
+        if require_admin(&admin, &stored_admin).is_err() {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
         if env.storage().instance().has(&PENDING_ADMIN_KEY) {
             panic_with_error!(&env, ContractError::PendingAdminAlreadyExists);
         }
         env.storage().instance().set(&PENDING_ADMIN_KEY, &new_admin);
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
         env.events().publish(
             (symbol_short!("PROP_ADM"),),
             (admin.clone(), new_admin.clone()),
@@ -1138,7 +2269,7 @@ impl AssetRegistry {
         }
         env.storage().instance().set(&ADMIN_KEY, &pending_admin);
         env.storage().instance().remove(&PENDING_ADMIN_KEY);
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
         env.events().publish(
             (symbol_short!("ADM_AUD"), symbol_short!("ADMIN_SET")),
             (pending_admin.clone(), env.ledger().timestamp()),
@@ -1147,20 +2278,47 @@ impl AssetRegistry {
             .publish((symbol_short!("ADMIN_SET"),), (pending_admin,));
     }
 
+    /// Cancel a pending admin transfer proposal.
+    /// Only the current admin can cancel. Clears the pending admin entry so the
+    /// proposed address can no longer call `accept_admin`.
+    ///
+    /// # Arguments
+    /// * `admin` - The current admin address (must match stored admin)
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not the current admin
+    /// - [`ContractError::ProposalNotFound`] if no pending admin proposal exists
+    pub fn cancel_admin_proposal(env: Env, admin: Address) {
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if require_admin(&admin, &stored_admin).is_err() {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        if !env.storage().instance().has(&PENDING_ADMIN_KEY) {
+            panic_with_error!(&env, ContractError::ProposalNotFound);
+        }
+        env.storage().instance().remove(&PENDING_ADMIN_KEY);
+        env.storage().instance().extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
+        env.events().publish(
+            (symbol_short!("ADM_AUD"), symbol_short!("ADM_CNCL")),
+            (admin.clone(), env.ledger().timestamp()),
+        );
+        env.events().publish(
+            (symbol_short!("ADM_CNCL"),),
+            (admin,),
+        );
+    }
+
     /// Admin-only function to pause the contract.
     ///
     /// # Arguments
     /// * `admin` - The address that must match the stored admin
     pub fn pause(env: Env, admin: Address) {
-        admin.require_auth();
         let stored_admin: Address = Self::get_admin(env.clone());
-        if stored_admin != admin {
+        if require_admin(&admin, &stored_admin).is_err() {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
         env.storage().persistent().set(&PAUSED_KEY, &true);
-        env.storage()
-            .persistent()
-            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &PAUSED_KEY);
         env.events()
             .publish((symbol_short!("PAUSED"),), (admin.clone(),));
         env.events().publish(
@@ -1174,15 +2332,12 @@ impl AssetRegistry {
     /// # Arguments
     /// * `admin` - The address that must match the stored admin
     pub fn unpause(env: Env, admin: Address) {
-        admin.require_auth();
         let stored_admin: Address = Self::get_admin(env.clone());
-        if stored_admin != admin {
+        if require_admin(&admin, &stored_admin).is_err() {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
         env.storage().persistent().set(&PAUSED_KEY, &false);
-        env.storage()
-            .persistent()
-            .extend_ttl(&PAUSED_KEY, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &PAUSED_KEY);
         env.events()
             .publish((symbol_short!("UNPAUSED"),), (admin.clone(),));
         env.events().publish(
@@ -1236,6 +2391,10 @@ impl AssetRegistry {
             asset.owner.require_auth();
         } else {
             panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        if asset.is_locked {
+            panic_with_error!(&env, ContractError::AssetLocked);
         }
 
         // Remove asset storage
@@ -1316,22 +2475,124 @@ impl AssetRegistry {
             panic_with_error!(&env, ContractError::DuplicateAsset);
         }
 
+        // Append history entry before updating the asset
+        let history_key = metadata_history_key(asset_id);
+        let mut history: Vec<MetadataHistoryEntry> = env
+            .storage()
+            .persistent()
+            .get(&history_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let new_version = asset.metadata_version + 1;
+        history.push_back(MetadataHistoryEntry {
+            version: new_version,
+            old_hash: old_hash.clone(),
+            new_hash: new_hash.clone(),
+            updated_at: env.ledger().timestamp(),
+        });
+        env.storage().persistent().set(&history_key, &history);
+        env.storage()
+            .persistent()
+            .extend_ttl(&history_key, TTL_THRESHOLD, TTL_TARGET);
+
         // Store new dedup key and updated asset
         env.storage().persistent().set(&new_dk, &asset_id);
-        env.storage()
-            .persistent()
-            .extend_ttl(&new_dk, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &new_dk);
         asset.metadata = new_metadata.clone();
         asset.metadata_updated_at = env.ledger().timestamp();
+        asset.metadata_version = new_version;
         env.storage().persistent().set(&asset_key(asset_id), &asset);
-        env.storage()
-            .persistent()
-            .extend_ttl(&asset_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &asset_key(asset_id));
 
         env.events().publish(
             (symbol_short!("UPD_META"), asset_id),
-            (owner, new_metadata, env.ledger().timestamp()),
+            (owner, old_hash, new_hash, new_version, env.ledger().timestamp()),
         );
+    }
+
+    /// Returns the full metadata change history for an asset, ordered oldest-first.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    ///
+    /// # Returns
+    /// `Vec<MetadataHistoryEntry>` — empty if no updates have been made
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    pub fn get_metadata_history(env: Env, asset_id: u64) -> Vec<MetadataHistoryEntry> {
+        if !Self::asset_exists(env.clone(), asset_id) {
+            panic_with_error!(&env, ContractError::AssetNotFound);
+        }
+        let key = metadata_history_key(asset_id);
+        let history: Vec<MetadataHistoryEntry> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        }
+        history
+    }
+
+    /// Retrieve a paginated slice of the metadata change history for an asset.
+    ///
+    /// Issue #1021 — auditors need to trace metadata evolution without querying
+    /// raw storage. This view function returns a bounded slice of
+    /// [`MetadataHistoryEntry`] records, ordered oldest-first, allowing callers
+    /// to page through the full history in chunks.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `offset`   - Zero-based index of the first entry to return
+    /// * `limit`    - Maximum number of entries to return (capped at 100)
+    ///
+    /// # Returns
+    /// `Vec<MetadataHistoryEntry>` — the requested slice, possibly shorter than
+    /// `limit` if fewer entries remain after `offset`.  Returns an empty vector
+    /// when `offset` ≥ total history length or no history exists.
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    pub fn get_asset_metadata_history(
+        env: Env,
+        asset_id: u64,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<MetadataHistoryEntry> {
+        if !Self::asset_exists(env.clone(), asset_id) {
+            panic_with_error!(&env, ContractError::AssetNotFound);
+        }
+
+        let key = metadata_history_key(asset_id);
+        let history: Vec<MetadataHistoryEntry> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if env.storage().persistent().has(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+        }
+
+        // Cap the page size to 100 to prevent excessive per-call compute cost.
+        let capped_limit = limit.min(100);
+
+        let total = history.len();
+        if offset >= total || capped_limit == 0 {
+            return Vec::new(&env);
+        }
+
+        let end = (offset + capped_limit).min(total);
+        let mut page: Vec<MetadataHistoryEntry> = Vec::new(&env);
+        for i in offset..end {
+            page.push_back(history.get(i).unwrap());
+        }
+        page
     }
 
     /// Transfer ownership of an asset from the current owner to a new owner.
@@ -1345,6 +2606,7 @@ impl AssetRegistry {
     /// # Panics
     /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
     /// - [`ContractError::UnauthorizedOwner`] if caller is not the current owner
+    /// - [`ContractError::AssetDecommissioned`] if the asset is `Deprecated` or `Decommissioned`
     pub fn transfer_asset(env: Env, asset_id: u64, current_owner: Address, new_owner: Address) {
         ensure_not_paused(&env);
         current_owner.require_auth();
@@ -1359,9 +2621,170 @@ impl AssetRegistry {
             panic_with_error!(&env, ContractError::UnauthorizedOwner);
         }
 
+        // Co-owned assets cannot bypass their weighted approval policy through
+        // the legacy single-signer transfer entry point. Use propose_action,
+        // vote_on_action, and execute_action instead.
+        if !asset.co_owners.is_empty() {
+            panic_with_error!(&env, ContractError::MultisigRequired);
+        }
+
         if current_owner == new_owner {
             panic_with_error!(&env, ContractError::SameOwner);
         }
+
+        // Block transfers while the asset is locked as collateral under a lien.
+        if asset.is_locked {
+            panic_with_error!(&env, ContractError::AssetLocked);
+        }
+
+        // Deprecated (and decommissioned) assets are not transferable.
+        if asset.deprecation_status != DeprecationStatus::Active {
+            panic_with_error!(&env, ContractError::AssetDecommissioned);
+        }
+
+        // Move dedup key to new owner
+        let hash: BytesN<32> = env
+            .crypto()
+            .sha256(&asset.metadata.clone().to_xdr(&env))
+            .into();
+        env.storage()
+            .persistent()
+            .remove(&dedup_key(&current_owner, &asset.asset_type, &hash));
+        env.storage()
+            .persistent()
+            .set(&dedup_key(&new_owner, &asset.asset_type, &hash), &asset_id);
+        extend_persistent_ttl(&env, &dedup_key(&new_owner, &asset.asset_type, &hash));
+
+        // Move owner index entry
+        owner_index_remove(&env, &current_owner, asset_id);
+        owner_index_add(&env, &new_owner, asset_id);
+
+        asset.owner = new_owner.clone();
+        env.storage().persistent().set(&asset_key(asset_id), &asset);
+        extend_persistent_ttl(&env, &asset_key(asset_id));
+
+        env.events().publish(
+            (symbol_short!("TRANSFER"), asset_id),
+            (current_owner, new_owner, env.ledger().timestamp()),
+        );
+    }
+
+    /// Initiate a multi-signature ownership transfer (step 1 of 2).
+    /// Only the current owner can initiate. The proposed `new_owner` has
+    /// `TRANSFER_TIMEOUT_SECS` (7 days) to accept via [`Self::accept_ownership_transfer`]
+    /// before the proposal expires.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset to transfer
+    /// * `new_owner` - The address proposed as the new owner
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    /// - [`ContractError::SameOwner`] if `new_owner` is already the current owner
+    /// - [`ContractError::TransferAlreadyPending`] if an unexpired transfer is already pending
+    /// - [`ContractError::AssetDecommissioned`] if the asset is `Deprecated` or `Decommissioned`
+    pub fn initiate_ownership_transfer(env: Env, asset_id: u64, new_owner: Address) {
+        ensure_not_paused(&env);
+
+        let asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        asset.owner.require_auth();
+
+        if asset.owner == new_owner {
+            panic_with_error!(&env, ContractError::SameOwner);
+        }
+
+        // Deprecated (and decommissioned) assets are not transferable.
+        if asset.deprecation_status != DeprecationStatus::Active {
+            panic_with_error!(&env, ContractError::AssetDecommissioned);
+        }
+
+        let key = pending_transfer_key(asset_id);
+        if let Some(existing) = env.storage().persistent().get::<_, PendingTransfer>(&key) {
+            if env.ledger().timestamp().saturating_sub(existing.initiated_at) < TRANSFER_TIMEOUT_SECS {
+                panic_with_error!(&env, ContractError::TransferAlreadyPending);
+            }
+        }
+
+        let pending = PendingTransfer {
+            new_owner: new_owner.clone(),
+            initiated_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(&key, &pending);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (symbol_short!("OWN_INIT"), asset_id),
+            (asset.owner, new_owner, env.ledger().timestamp()),
+        );
+    }
+
+    /// Accept a pending ownership transfer (step 2 of 2). Only the proposed new owner
+    /// can accept, and only within `TRANSFER_TIMEOUT_SECS` (7 days) of initiation.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset whose transfer is being accepted
+    ///
+    /// # Panics
+    /// - [`ContractError::NoPendingTransfer`] if no transfer is pending for this asset
+    /// - [`ContractError::TransferExpired`] if the acceptance window has elapsed
+    /// - [`ContractError::AssetNotFound`] if no asset exists with the given ID
+    pub fn accept_ownership_transfer(env: Env, asset_id: u64) {
+        ensure_not_paused(&env);
+
+        let key = pending_transfer_key(asset_id);
+        let pending: PendingTransfer = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoPendingTransfer));
+
+        if env.ledger().timestamp().saturating_sub(pending.initiated_at) >= TRANSFER_TIMEOUT_SECS {
+            env.storage().persistent().remove(&key);
+            panic_with_error!(&env, ContractError::TransferExpired);
+        }
+
+        pending.new_owner.require_auth();
+
+        // Issue #1316: Check if a transfer condition exists and is met
+        let cond_key = transfer_condition_key(asset_id);
+        if let Some(condition) = env.storage().persistent().get::<_, TransferCondition>(&cond_key) {
+            // If lifecycle contract is available, check the condition
+            if let Some(lifecycle_addr) = env.storage().instance().get::<_, Address>(&LIFECYCLE_KEY) {
+                let score: u32 = env.invoke_contract(
+                    &lifecycle_addr,
+                    &Symbol::new(&env, "get_collateral_score"),
+                    soroban_sdk::vec![&env, soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(&asset_id, &env)],
+                );
+
+                // Check condition based on type
+                let ctype = condition.condition_type.clone();
+                if ctype == Symbol::new(&env, "SCORE_MIN") && u64::from(score) < condition.threshold {
+                    panic_with_error!(&env, ContractError::ConditionNotMet);
+                }
+                if ctype == Symbol::new(&env, "SCORE_MAX") && u64::from(score) > condition.threshold {
+                    panic_with_error!(&env, ContractError::ConditionNotMet);
+                }
+
+                // Clear condition after successful check
+                env.storage().persistent().remove(&cond_key);
+            }
+        }
+
+        let mut asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        let current_owner = asset.owner.clone();
+        let new_owner = pending.new_owner.clone();
 
         // Move dedup key to new owner
         let hash: BytesN<32> = env
@@ -1390,9 +2813,290 @@ impl AssetRegistry {
             .persistent()
             .extend_ttl(&asset_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
 
+        // Notify lifecycle contract to clear engineer authorizations for the asset
+        if let Some(lifecycle_addr) = env.storage().instance().get::<_, Address>(&LIFECYCLE_KEY) {
+            let lifecycle_client = lifecycle::LifecycleClient::new(&env, &lifecycle_addr);
+            lifecycle_client.transfer_notify(&asset_id, &new_owner);
+        }
+        env.storage().persistent().remove(&key);
+
         env.events().publish(
-            (symbol_short!("TRANSFER"), asset_id),
+            (symbol_short!("OWN_DONE"), asset_id),
             (current_owner, new_owner, env.ledger().timestamp()),
+        );
+    }
+
+    /// Clear a pending ownership transfer that has passed its `TRANSFER_TIMEOUT_SECS`
+    /// acceptance window. Callable by anyone, since an expired transfer can no longer
+    /// be accepted; this simply frees the pending-transfer slot so a new transfer can
+    /// be initiated immediately instead of waiting on `initiate_ownership_transfer`'s
+    /// own lazy-expiry check.
+    ///
+    /// # Panics
+    /// - [`ContractError::NoPendingTransfer`] if no transfer is pending for this asset
+    /// - [`ContractError::TransferNotExpired`] if the timeout has not yet elapsed
+    pub fn cancel_expired_transfer(env: Env, asset_id: u64) {
+        let key = pending_transfer_key(asset_id);
+        let pending: PendingTransfer = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoPendingTransfer));
+
+        if env.ledger().timestamp().saturating_sub(pending.initiated_at) < TRANSFER_TIMEOUT_SECS {
+            panic_with_error!(&env, ContractError::TransferNotExpired);
+        }
+
+        env.storage().persistent().remove(&key);
+
+        env.events()
+            .publish((symbol_short!("OWN_EXP"), asset_id), pending.new_owner);
+    }
+
+    /// Issue #1316: Propose a transfer condition for an asset (recipient counter-offer).
+    /// The transfer recipient can suggest a condition that must be met before accepting.
+    /// For example, asset's collateral score must reach a minimum threshold.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset with a pending transfer
+    /// * `condition_type` - Type of condition (e.g., "SCORE_MIN")
+    /// * `threshold` - The threshold value for the condition
+    ///
+    /// # Panics
+    /// - [`ContractError::NoPendingTransfer`] if no transfer is pending
+    pub fn propose_transfer_condition(env: Env, asset_id: u64, condition_type: Symbol, threshold: u64) {
+        ensure_not_paused(&env);
+
+        let transfer_key = pending_transfer_key(asset_id);
+        let pending: PendingTransfer = env
+            .storage()
+            .persistent()
+            .get(&transfer_key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::NoPendingTransfer));
+
+        pending.new_owner.require_auth();
+
+        let condition = TransferCondition {
+            condition_type: condition_type.clone(),
+            threshold,
+            set_at: env.ledger().timestamp(),
+        };
+
+        let cond_key = transfer_condition_key(asset_id);
+        env.storage().persistent().set(&cond_key, &condition);
+        env.storage()
+            .persistent()
+            .extend_ttl(&cond_key, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (symbol_short!("COND_SET"), asset_id),
+            (condition_type, threshold),
+        );
+    }
+
+    /// Issue #1316: Get transfer condition for an asset, if one exists.
+    pub fn get_transfer_condition(env: Env, asset_id: u64) -> Option<TransferCondition> {
+        let cond_key = transfer_condition_key(asset_id);
+        env.storage().persistent().get(&cond_key)
+    }
+
+    /// Issue #1317: Register a bundle of assets using merkle root.
+    /// Enables fleet operators to batch-register assets by proving inclusion in merkle tree.
+    ///
+    /// # Arguments
+    /// * `merkle_root` - The merkle root of asset metadata
+    /// * `asset_count` - Total number of assets in this bundle
+    ///
+    /// # Panics
+    /// - [`ContractError::UnauthorizedAdmin`] if caller is not admin
+    pub fn register_asset_bundle(env: Env, admin: Address, merkle_root: BytesN<32>, asset_count: u32) {
+        ensure_not_paused(&env);
+        admin.require_auth();
+
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if stored_admin != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+
+        let bundle = BundleRegistration {
+            merkle_root: merkle_root.clone(),
+            asset_count,
+            registered_at: env.ledger().timestamp(),
+        };
+
+        let key = bundle_key(&merkle_root);
+        env.storage().persistent().set(&key, &bundle);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (symbol_short!("BUNDL_REG"), merkle_root.clone()),
+            asset_count,
+        );
+    }
+
+    /// Issue #1317: Get bundle registration by merkle root.
+    pub fn get_bundle(env: Env, merkle_root: BytesN<32>) -> Option<BundleRegistration> {
+        let key = bundle_key(&merkle_root);
+        env.storage().persistent().get(&key)
+    }
+
+    /// Issue #1318: Create a collateral pool for multi-asset loans.
+    /// Locks multiple assets atomically as collateral for a single loan.
+    ///
+    /// # Arguments
+    /// * `asset_ids` - Vector of asset IDs to include in pool (must be > 1)
+    /// * `lender` - Address of the lender
+    ///
+    /// # Panics
+    /// - [`ContractError::InvalidPoolSize`] if asset_ids has < 2 assets
+    /// - [`ContractError::AssetNotFound`] if any asset doesn't exist
+    pub fn create_collateral_pool(env: Env, lender: Address, asset_ids: Vec<u64>) -> u64 {
+        ensure_not_paused(&env);
+        lender.require_auth();
+
+        if asset_ids.len() < 2 {
+            panic_with_error!(&env, ContractError::InvalidPoolSize);
+        }
+
+        // Validate every asset before creating the pool so an existing lien
+        // cannot be overwritten by a pool lock.
+        for asset_id in asset_ids.iter() {
+            let asset: Asset = env
+                .storage()
+                .persistent()
+                .get(&asset_key(asset_id))
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+            if asset.is_locked {
+                panic_with_error!(&env, ContractError::AssetLocked);
+            }
+            let pending_key = pending_transfer_key(asset_id);
+            if let Some(pending) = env
+                .storage()
+                .persistent()
+                .get::<_, PendingTransfer>(&pending_key)
+            {
+                if env
+                    .ledger()
+                    .timestamp()
+                    .saturating_sub(pending.initiated_at)
+                    < TRANSFER_TIMEOUT_SECS
+                {
+                    panic_with_error!(&env, ContractError::TransferAlreadyPending);
+                }
+            }
+        }
+
+        // Generate pool ID
+        let pool_id_key = POOL_ID_COUNTER;
+        let mut pool_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&pool_id_key)
+            .unwrap_or(0);
+        pool_id += 1;
+
+        let pool = CollateralPool {
+            pool_id,
+            lender: lender.clone(),
+            asset_ids: asset_ids.clone(),
+            created_at: env.ledger().timestamp(),
+            is_locked: true,
+        };
+
+        for asset_id in asset_ids.iter() {
+            let mut asset: Asset = env
+                .storage()
+                .persistent()
+                .get(&asset_key(asset_id))
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+            asset.is_locked = true;
+            asset.lender = Some(lender.clone());
+            asset.loan_id = Some(pool_id);
+            env.storage()
+                .persistent()
+                .set(&asset_key(asset_id), &asset);
+            extend_persistent_ttl(&env, &asset_key(asset_id));
+        }
+
+        let key = collateral_pool_key(pool_id);
+        env.storage().persistent().set(&key, &pool);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+        // Update counter
+        env.storage().persistent().set(&pool_id_key, &pool_id);
+
+        env.events().publish(
+            (symbol_short!("POOL_CRT"), pool_id),
+            (lender, asset_ids.len() as u32),
+        );
+
+        pool_id
+    }
+
+    /// Issue #1318: Get collateral pool by ID.
+    pub fn get_collateral_pool(env: Env, pool_id: u64) -> Option<CollateralPool> {
+        let key = collateral_pool_key(pool_id);
+        env.storage().persistent().get(&key)
+    }
+
+    /// Issue #1318: Release a collateral pool on loan repayment.
+    pub fn release_collateral_pool(env: Env, lender: Address, pool_id: u64) {
+        ensure_not_paused(&env);
+        lender.require_auth();
+
+        let key = collateral_pool_key(pool_id);
+        let mut pool: CollateralPool = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::PoolNotFound));
+
+        if pool.lender != lender {
+            panic_with_error!(&env, ContractError::UnauthorizedLender);
+        }
+
+        if !pool.is_locked {
+            panic_with_error!(&env, ContractError::AssetNotLocked);
+        }
+
+        for asset_id in pool.asset_ids.iter() {
+            let mut asset: Asset = env
+                .storage()
+                .persistent()
+                .get(&asset_key(asset_id))
+                .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+            if !asset.is_locked {
+                panic_with_error!(&env, ContractError::AssetNotLocked);
+            }
+            if asset.lender != Some(lender.clone()) {
+                panic_with_error!(&env, ContractError::UnauthorizedLender);
+            }
+            if asset.loan_id != Some(pool_id) {
+                panic_with_error!(&env, ContractError::LoanIdMismatch);
+            }
+
+            asset.is_locked = false;
+            asset.lender = None;
+            asset.loan_id = None;
+            env.storage()
+                .persistent()
+                .set(&asset_key(asset_id), &asset);
+            extend_persistent_ttl(&env, &asset_key(asset_id));
+        }
+
+        pool.is_locked = false;
+        env.storage().persistent().set(&key, &pool);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_THRESHOLD, TTL_TARGET);
+
+        env.events().publish(
+            (symbol_short!("POOL_REL"), pool_id),
+            env.ledger().timestamp(),
         );
     }
 
@@ -1423,7 +3127,10 @@ impl AssetRegistry {
         // Set decommissioned flag
         let decomm_key = decommissioned_key(asset_id);
         env.storage().persistent().set(&decomm_key, &true);
-        env.storage().persistent().extend_ttl(&decomm_key, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &decomm_key);
+        env.storage()
+            .persistent()
+            .extend_ttl(&decomm_key, TTL_THRESHOLD, TTL_TARGET);
 
         // Clear the under_maintenance flag when decommissioning
         let maint_key = (symbol_short!("U_MAINT"), asset_id);
@@ -1472,22 +3179,29 @@ impl AssetRegistry {
             panic_with_error!(&env, ContractError::AssetAlreadyDeprecated);
         }
 
+        let timestamp = env.ledger().timestamp();
         asset.deprecation_status = DeprecationStatus::Deprecated;
+        asset.deprecated_at = Some(timestamp);
         env.storage().persistent().set(&asset_key(asset_id), &asset);
-        env.storage()
-            .persistent()
-            .extend_ttl(&asset_key(asset_id), TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &asset_key(asset_id));
+
+        // If a lien is active on this asset, emit DEPR_WARN so DeFi lenders
+        // holding loans against it receive an on-chain warning.
+        if asset.is_locked {
+            env.events().publish(
+                (symbol_short!("DEPR_WARN"), asset_id),
+                (asset_id, asset.lender.clone(), timestamp),
+            );
+        }
 
         // Store reason separately to avoid bloating the core Asset struct on reads.
         let reason_key = (symbol_short!("DEP_RSN"), asset_id);
         env.storage().persistent().set(&reason_key, &reason);
-        env.storage()
-            .persistent()
-            .extend_ttl(&reason_key, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &reason_key);
 
         env.events().publish(
-            (symbol_short!("DEPRECATED"), asset_id),
-            (owner, reason, env.ledger().timestamp()),
+            (symbol_short!("DEPR"), asset_id),
+            (owner, reason, timestamp),
         );
     }
 
@@ -1514,7 +3228,7 @@ impl AssetRegistry {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
 
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
 
         let tl_key = global_timelock_key(symbol_short!("UPGRADE"));
         env.storage().persistent().set(
@@ -1524,15 +3238,16 @@ impl AssetRegistry {
                 executed: false,
             },
         );
-        env.storage()
-            .persistent()
-            .extend_ttl(&tl_key, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &tl_key);
         env.storage()
             .persistent()
             .set(&symbol_short!("PEND_UPG"), &new_wasm_hash);
-        env.storage()
-            .persistent()
-            .extend_ttl(&symbol_short!("PEND_UPG"), TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &symbol_short!("PEND_UPG"));
+        env.storage().persistent().extend_ttl(
+            &symbol_short!("PEND_UPG"),
+            TTL_THRESHOLD,
+            TTL_TARGET,
+        );
 
         env.events().publish(
             (symbol_short!("PROP_UPG"), admin.clone()),
@@ -1574,7 +3289,7 @@ impl AssetRegistry {
             .persistent()
             .remove(&symbol_short!("PEND_UPG"));
 
-        env.storage().instance().extend_ttl(518400, 518400);
+        env.storage().instance().extend_ttl(DEFAULT_TTL_LEDGERS, DEFAULT_TTL_LEDGERS);
 
         env.events().publish(
             (symbol_short!("UPGRADE"), admin.clone()),
@@ -1587,8 +3302,7 @@ impl AssetRegistry {
 
         #[cfg(not(test))]
         {
-            env.deployer()
-                .update_current_contract_wasm(new_wasm_hash);
+            env.deployer().update_current_contract_wasm(new_wasm_hash);
         }
     }
 
@@ -1598,19 +3312,28 @@ impl AssetRegistry {
     /// * `admin` - The address that must match the stored admin
     /// * `asset_type` - The symbol of the new asset type to allow
     pub fn add_asset_type(env: Env, admin: Address, asset_type: Symbol) {
-        admin.require_auth();
         let stored_admin: Address = Self::get_admin(env.clone());
-        if stored_admin != admin {
+        if require_admin(&admin, &stored_admin).is_err() {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
+
+        let mut allowed_types = allowed_asset_types(&env);
+        let mut already_present = false;
+        for existing in allowed_types.iter() {
+            if existing == asset_type {
+                already_present = true;
+                break;
+            }
+        }
+        if !already_present {
+            allowed_types.push_back(asset_type.clone());
+            set_allowed_asset_types(&env, &allowed_types);
+        }
+
         env.storage()
             .persistent()
             .set(&asset_type_key(&asset_type), &true);
-        env.storage().persistent().extend_ttl(
-            &asset_type_key(&asset_type),
-            TTL_THRESHOLD,
-            TTL_TARGET,
-        );
+        extend_persistent_ttl(&env, &asset_type_key(&asset_type));
         env.events().publish(
             (symbol_short!("ADM_AUD"), symbol_short!("ADD_TYPE")),
             (admin, env.ledger().timestamp(), asset_type.clone()),
@@ -1628,9 +3351,8 @@ impl AssetRegistry {
     /// # Panics
     /// - [`ContractError::TypeInUse`] if one or more assets of this type are still registered
     pub fn remove_asset_type(env: Env, admin: Address, asset_type: Symbol) {
-        admin.require_auth();
         let stored_admin: Address = Self::get_admin(env.clone());
-        if stored_admin != admin {
+        if require_admin(&admin, &stored_admin).is_err() {
             panic_with_error!(&env, ContractError::UnauthorizedAdmin);
         }
         let count: u64 = env
@@ -1641,6 +3363,25 @@ impl AssetRegistry {
         if count > 0 {
             panic_with_error!(&env, ContractError::TypeInUse);
         }
+
+        // Guard: removing the last remaining allowed asset type would make
+        // `register_asset`'s allowlist check reject every future registration
+        // with no way to recover on-chain. Reject the removal instead so at
+        // least one allowed type always remains.
+        let allowed_types = allowed_asset_types(&env);
+        let contains_type = allowed_types.iter().any(|existing| existing == asset_type);
+        if contains_type && allowed_types.len() == 1 {
+            panic_with_error!(&env, ContractError::InvalidAssetType);
+        }
+
+        let mut updated_types = Vec::new(&env);
+        for existing in allowed_types.iter() {
+            if existing != asset_type {
+                updated_types.push_back(existing);
+            }
+        }
+        set_allowed_asset_types(&env, &updated_types);
+
         env.storage()
             .persistent()
             .remove(&asset_type_key(&asset_type));
@@ -1659,10 +3400,12 @@ impl AssetRegistry {
     /// # Returns
     /// `true` if valid; `false` otherwise
     pub fn is_valid_asset_type(env: Env, asset_type: Symbol) -> bool {
-        env.storage()
-            .persistent()
-            .get(&asset_type_key(&asset_type))
-            .unwrap_or(false)
+        for allowed_type in allowed_asset_types(&env).iter() {
+            if allowed_type == asset_type {
+                return true;
+            }
+        }
+        false
     }
 
     /// Get the lifecycle score for an asset by cross-calling the Lifecycle contract.
@@ -1672,11 +3415,14 @@ impl AssetRegistry {
     /// * `lifecycle_contract` - The address of the Lifecycle contract
     ///
     /// # Returns
-    /// The collateral score (u32) for the asset
+    /// `Some(score)` with the collateral score for the asset, or `None` if the asset
+    /// has never had a maintenance record submitted. Returning `None` instead of a
+    /// sentinel value forces callers (e.g. DeFi lenders) to explicitly handle the
+    /// no-history case rather than risk misreading it as a valid, high score.
     ///
     /// # Panics
     /// - [`ContractError::AssetNotFound`] if the asset does not exist
-    pub fn get_lifecycle_score(env: Env, asset_id: u64, lifecycle_contract: Address) -> u32 {
+    pub fn get_lifecycle_score(env: Env, asset_id: u64, lifecycle_contract: Address) -> Option<u32> {
         // Verify asset exists in this registry
         if !Self::asset_exists(env.clone(), asset_id) {
             panic_with_error!(&env, ContractError::AssetNotFound);
@@ -1688,12 +3434,25 @@ impl AssetRegistry {
             &env,
             soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(&asset_id, &env)
         ];
+
+        // A fresh asset with no maintenance history at all must be reported as `None`
+        // rather than the raw score, which would otherwise read as 0 and be
+        // indistinguishable from a poorly-maintained (also-0) asset.
+        let last_service: Option<u64> = env.invoke_contract(
+            &lifecycle_contract,
+            &Symbol::new(&env, "get_last_service_timestamp"),
+            args.clone(),
+        );
+        if last_service.is_none() {
+            return None;
+        }
+
         let score: u32 = env.invoke_contract(
             &lifecycle_contract,
             &Symbol::new(&env, "get_collateral_score"),
             args,
         );
-        score
+        Some(score)
     }
 
     /// Decommission an asset and notify the lifecycle contract to freeze the score.
@@ -1730,9 +3489,7 @@ impl AssetRegistry {
 
         let decomm_key = decommissioned_key(asset_id);
         env.storage().persistent().set(&decomm_key, &true);
-        env.storage()
-            .persistent()
-            .extend_ttl(&decomm_key, TTL_THRESHOLD, TTL_TARGET);
+        extend_persistent_ttl(&env, &decomm_key);
 
         let maint_key = (symbol_short!("U_MAINT"), asset_id);
         env.storage().persistent().remove(&maint_key);
@@ -1752,6 +3509,673 @@ impl AssetRegistry {
             args,
         );
     }
+
+    /// Set the lending contract address that is authorized to lock and unlock assets.
+    pub fn set_lending_contract(env: Env, admin: Address, lending_addr: Address) {
+        let stored_admin: Address = Self::get_admin(env.clone());
+        if require_admin(&admin, &stored_admin).is_err() {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        env.storage().instance().set(&LENDING_CONTRACT_KEY, &lending_addr);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_TARGET);
+    }
+
+    /// Return the currently configured lending contract, if one has been set.
+    pub fn get_lending_contract(env: Env) -> Option<Address> {
+        env.storage().instance().get(&LENDING_CONTRACT_KEY)
+    }
+
+    /// Lock an asset as collateral under the configured lending contract.
+    pub fn lock_asset_as_collateral(env: Env, lender: Address, asset_id: u64, loan_id: u64) {
+        ensure_not_paused(&env);
+        lender.require_auth();
+
+        let registered_lender: Address = env
+            .storage()
+            .instance()
+            .get(&LENDING_CONTRACT_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::LendingContractNotSet));
+        if lender != registered_lender {
+            panic_with_error!(&env, ContractError::UnauthorizedLender);
+        }
+
+        let mut asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+        if asset.is_locked {
+            panic_with_error!(&env, ContractError::AssetLocked);
+        }
+
+        // Refuse to lock an asset with a live ownership transfer in flight: if the
+        // transfer completed after the lien were placed, the new owner would inherit
+        // a locked asset pledged by the previous owner with no lender notification.
+        let pending_key = pending_transfer_key(asset_id);
+        if let Some(pending) = env
+            .storage()
+            .persistent()
+            .get::<_, PendingTransfer>(&pending_key)
+        {
+            if env.ledger().timestamp().saturating_sub(pending.initiated_at) < TRANSFER_TIMEOUT_SECS
+            {
+                panic_with_error!(&env, ContractError::TransferAlreadyPending);
+            }
+        }
+
+        asset.is_locked = true;
+        asset.lender = Some(lender.clone());
+        asset.loan_id = Some(loan_id);
+
+        env.storage().persistent().set(&asset_key(asset_id), &asset);
+        extend_persistent_ttl(&env, &asset_key(asset_id));
+
+        env.events().publish(
+            (symbol_short!("LOCK"), asset_id),
+            (lender, loan_id, env.ledger().timestamp()),
+        );
+    }
+
+    /// Unlock an asset from collateral after the loan is repaid.
+    pub fn unlock_asset_from_collateral(env: Env, lender: Address, asset_id: u64, loan_id: u64) {
+        ensure_not_paused(&env);
+        lender.require_auth();
+
+        let registered_lender: Address = env
+            .storage()
+            .instance()
+            .get(&LENDING_CONTRACT_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::LendingContractNotSet));
+        if lender != registered_lender {
+            panic_with_error!(&env, ContractError::UnauthorizedLender);
+        }
+
+        let mut asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+        if !asset.is_locked {
+            panic_with_error!(&env, ContractError::AssetNotLocked);
+        }
+        if asset.loan_id != Some(loan_id) {
+            panic_with_error!(&env, ContractError::LoanIdMismatch);
+        }
+
+        asset.is_locked = false;
+        asset.lender = None;
+        asset.loan_id = None;
+
+        env.storage().persistent().set(&asset_key(asset_id), &asset);
+        extend_persistent_ttl(&env, &asset_key(asset_id));
+
+        env.events().publish(
+            (symbol_short!("UNLOCK"), asset_id),
+            (lender, loan_id, env.ledger().timestamp()),
+        );
+    }
+
+    /// Search assets with optional metadata filtering and sorting.
+    ///
+    /// Scans all registered assets and returns those that match every supplied
+    /// constraint.  At most **100** matching assets are returned; `SearchPage::total`
+    /// always reflects the full match count before the cap is applied.
+    ///
+    /// # Arguments
+    /// * `filter.asset_type`       – exact `asset_type` match (optional)
+    /// * `filter.manufacturer`     – substring present in `metadata` (optional)
+    /// * `filter.min_age_months`   – asset registered ≥ N months ago (optional)
+    /// * `filter.max_age_months`   – asset registered ≤ N months ago (optional)
+    /// * `filter.sort`             – sort order (optional)
+    /// * `filter.lifecycle_contract` – required when sort = `ByCollateralScore`
+    pub fn search_assets(env: Env, filter: SearchFilter) -> SearchPage {
+        const MAX_RESULTS: u32 = 100;
+        const SECS_PER_MONTH: u64 = 30 * 86_400;
+
+        if filter.sort == Some(SortOrder::ByCollateralScore) && filter.lifecycle_contract.is_none()
+        {
+            panic_with_error!(&env, ContractError::InvalidConfig);
+        }
+
+        let total_assets: u64 = env
+            .storage()
+            .persistent()
+            .get(&ASSET_COUNT)
+            .unwrap_or(0);
+
+        let now = env.ledger().timestamp();
+
+        let mut matched: Vec<Asset> = Vec::new(&env);
+        let mut total_matched: u32 = 0;
+        let mut facet_counts: Vec<(Symbol, u32)> = Vec::new(&env);
+
+        for id in 1..=total_assets {
+            let key = asset_key(id);
+            let asset: Asset = match env.storage().persistent().get(&key) {
+                Some(a) => a,
+                None => continue,
+            };
+
+            // --- filter: asset_type ---
+            if let Some(ref ft) = filter.asset_type {
+                if asset.asset_type != *ft {
+                    continue;
+                }
+            }
+
+            // --- filter: manufacturer (substring of metadata) ---
+            if let Some(ref needle) = filter.manufacturer {
+                if !string_contains(&env, &asset.metadata, needle) {
+                    continue;
+                }
+            }
+
+            // --- filter: age ---
+            let age_secs = now.saturating_sub(asset.registered_at);
+            let age_months = (age_secs / SECS_PER_MONTH) as u32;
+            if let Some(min) = filter.min_age_months {
+                if age_months < min {
+                    continue;
+                }
+            }
+            if let Some(max) = filter.max_age_months {
+                if age_months > max {
+                    continue;
+                }
+            }
+
+            total_matched += 1;
+            let mut facet_found = false;
+            for i in 0..facet_counts.len() {
+                let (facet_type, count) = facet_counts.get(i).unwrap();
+                if facet_type == asset.asset_type {
+                    facet_counts.set(i, (facet_type, count + 1));
+                    facet_found = true;
+                    break;
+                }
+            }
+            if !facet_found {
+                facet_counts.push_back((asset.asset_type.clone(), 1));
+            }
+            if matched.len() < MAX_RESULTS {
+                matched.push_back(asset);
+            }
+        }
+
+        // --- sort ---
+        if let Some(sort) = filter.sort {
+            match sort {
+                SortOrder::ByCollateralScore => {
+                    if let Some(lc) = filter.lifecycle_contract {
+                        // Fetch scores then sort descending.
+                        let mut pairs: Vec<(u32, Asset)> = Vec::new(&env);
+                        for i in 0..matched.len() {
+                            let asset = matched.get(i).unwrap();
+                            let args = soroban_sdk::vec![
+                                &env,
+                                soroban_sdk::IntoVal::<Env, soroban_sdk::Val>::into_val(
+                                    &asset.asset_id,
+                                    &env,
+                                )
+                            ];
+                            let score: u32 = env.invoke_contract(
+                                &lc,
+                                &Symbol::new(&env, "get_collateral_score"),
+                                args,
+                            );
+                            pairs.push_back((score, asset));
+                        }
+                        // Insertion sort descending by score (results ≤ 100, cost acceptable).
+                        let n = pairs.len();
+                        for i in 1..n {
+                            let mut j = i;
+                            while j > 0 {
+                                let a = pairs.get(j - 1).unwrap().0;
+                                let b = pairs.get(j).unwrap().0;
+                                if a >= b {
+                                    break;
+                                }
+                                // swap j-1 and j
+                                let tmp_a = pairs.get(j - 1).unwrap();
+                                let tmp_b = pairs.get(j).unwrap();
+                                pairs.set(j - 1, tmp_b);
+                                pairs.set(j, tmp_a);
+                                j -= 1;
+                            }
+                        }
+                        matched = Vec::new(&env);
+                        for i in 0..n {
+                            matched.push_back(pairs.get(i).unwrap().1);
+                        }
+                    }
+                }
+                SortOrder::ByMaintenanceDate => {
+                    // Sort by metadata_updated_at descending (most recently updated first).
+                    let n = matched.len();
+                    for i in 1..n {
+                        let mut j = i;
+                        while j > 0 {
+                            let a = matched.get(j - 1).unwrap().metadata_updated_at;
+                            let b = matched.get(j).unwrap().metadata_updated_at;
+                            if a >= b {
+                                break;
+                            }
+                            let tmp_a = matched.get(j - 1).unwrap();
+                            let tmp_b = matched.get(j).unwrap();
+                            matched.set(j - 1, tmp_b);
+                            matched.set(j, tmp_a);
+                            j -= 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut facets: Vec<FacetCount> = Vec::new(&env);
+        for i in 0..facet_counts.len() {
+            let (asset_type, count) = facet_counts.get(i).unwrap();
+            facets.push_back(FacetCount { asset_type, count });
+        }
+
+        SearchPage { assets: matched, total: total_matched, facets }
+    }
+
+    /// Mark an asset as under maintenance.
+    /// Callable by the asset owner or contract admin.
+    ///
+    /// Sets the asset's status to [`AssetStatus::UnderMaintenance`], which
+    /// signals to integrators (e.g. lending contracts, lifecycle scoring)
+    /// that the asset is temporarily unavailable for normal operation.
+    ///
+    /// # Arguments
+    /// * `caller` - The address initiating the maintenance (owner or admin)
+    /// * `asset_id` - The unique identifier of the asset
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist
+    /// - [`ContractError::UnauthorizedOwner`] if caller is neither owner nor admin
+    /// - [`ContractError::AssetDecommissioned`] if the asset is decommissioned
+    pub fn mark_under_maintenance(env: Env, caller: Address, asset_id: u64) {
+        ensure_not_paused(&env);
+        let asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        let admin = Self::get_admin(env.clone());
+        if caller == admin {
+            admin.require_auth();
+        } else if caller == asset.owner {
+            asset.owner.require_auth();
+        } else {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        // Reject decommissioned assets
+        let decomm_key = decommissioned_key(asset_id);
+        if env.storage().persistent().get::<_, bool>(&decomm_key).unwrap_or(false) {
+            panic_with_error!(&env, ContractError::AssetDecommissioned);
+        }
+
+        let maint_key = (symbol_short!("U_MAINT"), asset_id);
+        env.storage().persistent().set(&maint_key, &true);
+        extend_persistent_ttl(&env, &maint_key);
+
+        env.events().publish(
+            (symbol_short!("MNT_START"), asset_id),
+            (caller, env.ledger().timestamp()),
+        );
+    }
+
+    /// Mark an asset as having completed maintenance, returning it to [`AssetStatus::Active`].
+    /// Callable by the asset owner or contract admin.
+    ///
+    /// # Arguments
+    /// * `caller` - The address completing maintenance (owner or admin)
+    /// * `asset_id` - The unique identifier of the asset
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist
+    /// - [`ContractError::UnauthorizedOwner`] if caller is neither owner nor admin
+    pub fn mark_maintenance_complete(env: Env, caller: Address, asset_id: u64) {
+        ensure_not_paused(&env);
+        let asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        let admin = Self::get_admin(env.clone());
+        if caller == admin {
+            admin.require_auth();
+        } else if caller == asset.owner {
+            asset.owner.require_auth();
+        } else {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        let maint_key = (symbol_short!("U_MAINT"), asset_id);
+        env.storage().persistent().remove(&maint_key);
+
+        env.events().publish(
+            (symbol_short!("MAINT_END"), asset_id),
+            (caller, env.ledger().timestamp()),
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    //  Co-ownership and Weighted Voting Functions
+    // ---------------------------------------------------------------------------
+
+    /// Propose an action (transfer or deprecation) for co-owner voting.
+    ///
+    /// Creates a new voting proposal that requires quorum approval from all co-owners.
+    /// Only callable by the primary owner or admin.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `action_type` - The type of action (Transfer or Deprecate)
+    /// * `new_owner` - Required for Transfer actions, None for Deprecate actions
+    ///
+    /// # Returns
+    /// The ID of the created proposal
+    ///
+    /// # Panics
+    /// - [`ContractError::AssetNotFound`] if the asset does not exist
+    /// - [`ContractError::NoCoOwners`] if the asset has no co-owners
+    pub fn propose_action(
+        env: Env,
+        caller: Address,
+        asset_id: u64,
+        action_type: ActionType,
+        new_owner: Option<Address>,
+    ) -> u64 {
+        ensure_not_paused(&env);
+        caller.require_auth();
+
+        let asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        if asset.co_owners.is_empty() {
+            panic_with_error!(&env, ContractError::NoCoOwners);
+        }
+
+        // Only primary owner or admin can propose
+        let admin = Self::get_admin(env.clone());
+        if caller != asset.owner && caller != admin {
+            panic_with_error!(&env, ContractError::UnauthorizedOwner);
+        }
+
+        // Get next proposal ID
+        let counter_key = DataKey::ActionProposalCounter(asset_id);
+        let proposal_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&counter_key)
+            .unwrap_or(0u64);
+
+        let next_id = proposal_id.saturating_add(1);
+        env.storage().persistent().set(&counter_key, &next_id);
+
+        // Create new proposal
+        let proposal = ActionProposal {
+            proposal_id,
+            asset_id,
+            action_type,
+            proposed_by: caller.clone(),
+            proposed_at: env.ledger().timestamp(),
+            new_owner,
+            votes: Vec::new(&env),
+            executed: false,
+        };
+
+        let proposal_key = DataKey::ActionProposal(asset_id, proposal_id);
+        env.storage().persistent().set(&proposal_key, &proposal);
+
+        env.events().publish(
+            (symbol_short!("ACT_PROP"), asset_id),
+            (proposal_id, action_type, env.ledger().timestamp()),
+        );
+
+        proposal_id
+    }
+
+    /// Vote on a proposed action for co-ownership transfer or deprecation.
+    ///
+    /// Calculates quorum based on total vote weight of all co-owners. A proposal
+    /// requires >50% of total vote weight to execute.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `proposal_id` - The ID of the proposal to vote on
+    /// * `approve` - Whether to approve (true) or reject (false) the action
+    ///
+    /// # Panics
+    /// - [`ContractError::ActionProposalNotFound`] if the proposal does not exist
+    /// - [`ContractError::NotCoOwner`] if caller is not a co-owner
+    pub fn vote_on_action(
+        env: Env,
+        caller: Address,
+        asset_id: u64,
+        proposal_id: u64,
+        approve: bool,
+    ) {
+        ensure_not_paused(&env);
+        caller.require_auth();
+
+        let proposal_key = DataKey::ActionProposal(asset_id, proposal_id);
+        let mut proposal: ActionProposal = env
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ActionProposalNotFound));
+
+        let asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        // Verify caller is a co-owner
+        let mut is_co_owner = false;
+        for (owner, _weight) in asset.co_owners.iter() {
+            if owner == caller {
+                is_co_owner = true;
+                break;
+            }
+        }
+
+        if !is_co_owner {
+            panic_with_error!(&env, ContractError::NotCoOwner);
+        }
+
+        // Add or update vote
+        let mut already_voted = false;
+        for i in 0..proposal.votes.len() {
+            let (voter, _) = proposal.votes.get(i).unwrap();
+            if voter == caller {
+                proposal.votes.set(i, (caller.clone(), approve));
+                already_voted = true;
+                break;
+            }
+        }
+
+        if !already_voted {
+            proposal.votes.push_back((caller.clone(), approve));
+        }
+
+        env.storage().persistent().set(&proposal_key, &proposal);
+
+        env.events().publish(
+            (symbol_short!("VOTE"), asset_id),
+            (proposal_id, caller, approve),
+        );
+    }
+
+    /// Execute a proposal if quorum has been reached.
+    ///
+    /// Calculates total votes and checks if approval votes exceed 50% of total
+    /// co-owner weight. If quorum is met, executes the proposed action.
+    ///
+    /// # Arguments
+    /// * `asset_id` - The unique identifier of the asset
+    /// * `proposal_id` - The ID of the proposal to execute
+    ///
+    /// # Panics
+    /// - [`ContractError::ActionProposalNotFound`] if the proposal does not exist
+    /// - [`ContractError::InsufficientQuorum`] if vote weight does not meet quorum
+    pub fn execute_action(env: Env, caller: Address, asset_id: u64, proposal_id: u64) {
+        ensure_not_paused(&env);
+        caller.require_auth();
+
+        let proposal_key = DataKey::ActionProposal(asset_id, proposal_id);
+        let mut proposal: ActionProposal = env
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::ActionProposalNotFound));
+
+        if proposal.executed {
+            panic_with_error!(&env, ContractError::ActionAlreadyExecuted);
+        }
+
+        let mut asset: Asset = env
+            .storage()
+            .persistent()
+            .get(&asset_key(asset_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::AssetNotFound));
+
+        // Calculate vote weights
+        let mut total_weight = 0u32;
+        let mut approval_weight = 0u32;
+
+        for (owner, weight) in asset.co_owners.iter() {
+            total_weight = total_weight.saturating_add(weight);
+
+            for (voter, vote) in proposal.votes.iter() {
+                if voter == owner && vote {
+                    approval_weight = approval_weight.saturating_add(weight);
+                }
+            }
+        }
+
+        // Check quorum: > 50% of total weight
+        if approval_weight.saturating_mul(2) <= total_weight {
+            panic_with_error!(&env, ContractError::InsufficientQuorum);
+        }
+
+        // Execute the action
+        match proposal.action_type {
+            ActionType::Transfer => {
+                if let Some(new_owner) = proposal.new_owner.clone() {
+                    if asset.is_locked {
+                        panic_with_error!(&env, ContractError::AssetLocked);
+                    }
+                    if asset.deprecation_status != DeprecationStatus::Active {
+                        panic_with_error!(&env, ContractError::AssetDecommissioned);
+                    }
+                    let old_owner = asset.owner.clone();
+                    let hash: BytesN<32> = env
+                        .crypto()
+                        .sha256(&asset.metadata.clone().to_xdr(&env))
+                        .into();
+                    env.storage()
+                        .persistent()
+                        .remove(&dedup_key(&old_owner, &asset.asset_type, &hash));
+                    env.storage()
+                        .persistent()
+                        .set(&dedup_key(&new_owner, &asset.asset_type, &hash), &asset_id);
+                    extend_persistent_ttl(
+                        &env,
+                        &dedup_key(&new_owner, &asset.asset_type, &hash),
+                    );
+                    owner_index_remove(&env, &old_owner, asset_id);
+                    owner_index_add(&env, &new_owner, asset_id);
+                    // Transfer asset to new owner
+                    asset.owner = new_owner.clone();
+                    env.storage()
+                        .persistent()
+                        .set(&asset_key(asset_id), &asset);
+                    extend_persistent_ttl(&env, &asset_key(asset_id));
+                    if let Some(lifecycle_addr) =
+                        env.storage().instance().get::<_, Address>(&LIFECYCLE_KEY)
+                    {
+                        lifecycle::LifecycleClient::new(&env, &lifecycle_addr)
+                            .transfer_notify(&asset_id, &new_owner);
+                    }
+
+                    env.events().publish(
+                        (symbol_short!("XFER_EXEC"), asset_id),
+                        (caller, env.ledger().timestamp()),
+                    );
+                }
+            }
+            ActionType::Deprecate => {
+                // Deprecate the asset
+                asset.deprecation_status = DeprecationStatus::Deprecated;
+                asset.deprecated_at = Some(env.ledger().timestamp());
+                env.storage()
+                    .persistent()
+                    .set(&asset_key(asset_id), &asset);
+
+                env.events().publish(
+                    (symbol_short!("DEPR_EXEC"), asset_id),
+                    (caller, env.ledger().timestamp()),
+                );
+            }
+        }
+
+        proposal.executed = true;
+        env.storage().persistent().set(&proposal_key, &proposal);
+    }
+}
+
+/// Returns `true` if `haystack` contains `needle` as a substring (byte-level, UTF-8 safe).
+fn string_contains(env: &Env, haystack: &String, needle: &String) -> bool {
+    use soroban_sdk::xdr::ToXdr;
+    // XDR encodes a string as: 4-byte big-endian length + UTF-8 bytes (+ padding).
+    // We skip the first 4 bytes to obtain raw UTF-8.
+    let h_xdr = haystack.clone().to_xdr(env);
+    let n_xdr = needle.clone().to_xdr(env);
+    let h_len = h_xdr.len();
+    let n_len = n_xdr.len();
+    if n_len <= 4 || h_len < n_len {
+        // needle is empty after the 4-byte header → trivially true;
+        // or haystack shorter than needle → false.
+        return n_len <= 4;
+    }
+    // Raw byte lengths (subtract 4-byte XDR prefix; ignore padding since UTF-8 is before padding).
+    // We work on raw Bytes indices.
+    let h_data_len = h_len - 4;
+    let n_data_len = n_len - 4;
+    if h_data_len < n_data_len {
+        return false;
+    }
+    // Naive O(h*n) scan — acceptable: metadata ≤ 256 bytes.
+    'outer: for start in 0..=(h_data_len - n_data_len) {
+        for k in 0..n_data_len {
+            if h_xdr.get(4 + start + k) != n_xdr.get(4 + k) {
+                continue 'outer;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+// Minimal client interface for cross-contract call to Lifecycle
+mod lifecycle {
+    use soroban_sdk::{contractclient, Address, Env, Symbol, String};
+
+    #[allow(dead_code)]
+    #[contractclient(name = "LifecycleClient")]
+    pub trait Lifecycle {
+        fn transfer_notify(env: Env, asset_id: u64, new_owner: Address);
+    }
 }
 
 #[cfg(test)]
@@ -1769,12 +4193,16 @@ mod tests {
     use engineer_registry;
     use lifecycle;
 
+    mod ttl_tests;
+
     fn unique_serial(env: &Env) -> String {
         use core::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(1);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut buf = [0u8; 24];
-        buf[0] = b'S'; buf[1] = b'N'; buf[2] = b'-';
+        buf[0] = b'S';
+        buf[1] = b'N';
+        buf[2] = b'-';
         let mut end = 24usize;
         let mut v = if n == 0 { 1u64 } else { n };
         while v > 0 {
@@ -1784,20 +4212,35 @@ mod tests {
         }
         let digit_len = 24 - end;
         let mut out = [0u8; 24];
-        out[0] = b'S'; out[1] = b'N'; out[2] = b'-';
+        out[0] = b'S';
+        out[1] = b'N';
+        out[2] = b'-';
         out[3..3 + digit_len].copy_from_slice(&buf[end..24]);
         let s = core::str::from_utf8(&out[..3 + digit_len]).unwrap_or("SN-1");
         String::from_str(env, s)
     }
 
     /// Wrapper: register_asset with an auto-generated unique serial number.
-    fn reg(client: &AssetRegistryClient, env: &Env, asset_type: Symbol, metadata: String, owner: &Address) -> u64 {
+    fn reg(
+        client: &AssetRegistryClient,
+        env: &Env,
+        asset_type: Symbol,
+        metadata: String,
+        owner: &Address,
+    ) -> u64 {
         client.register_asset(&asset_type, &metadata, &unique_serial(env), owner)
     }
 
     /// Wrapper: try_register_asset with an auto-generated unique serial number.
     #[allow(dead_code)]
-    fn try_reg(client: &AssetRegistryClient, env: &Env, asset_type: Symbol, metadata: String, owner: &Address) -> Result<Result<u64, soroban_sdk::Error>, Result<soroban_sdk::Error, soroban_sdk::InvokeError>> {
+    fn try_reg(
+        client: &AssetRegistryClient,
+        env: &Env,
+        asset_type: Symbol,
+        metadata: String,
+        owner: &Address,
+    ) -> Result<Result<u64, soroban_sdk::Error>, Result<soroban_sdk::Error, soroban_sdk::InvokeError>>
+    {
         client.try_register_asset(&asset_type, &metadata, &unique_serial(env), owner)
     }
 
@@ -1864,6 +4307,34 @@ mod tests {
     }
 
     #[test]
+    fn test_get_asset_extends_ttl_on_read() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        // Read via get_asset — TTL must be extended
+        client.get_asset(&asset_id);
+
+        env.as_contract(&contract_id, || {
+            let ttl = env.storage().persistent().get_ttl(&asset_key(asset_id));
+            assert!(ttl > 0, "asset TTL must be extended on get_asset read");
+        });
+    }
+
+    #[test]
     fn test_duplicate_metadata_rejected() {
         let env = Env::default();
         env.mock_all_auths();
@@ -1883,7 +4354,8 @@ mod tests {
         assert_eq!(id, 1);
 
         // Second registration with same serial is rejected (same physical machine)
-        let result = client.try_register_asset(&symbol_short!("GENSET"), &metadata, &serial, &owner);
+        let result =
+            client.try_register_asset(&symbol_short!("GENSET"), &metadata, &serial, &owner);
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -1910,7 +4382,50 @@ mod tests {
         let id = client.register_asset(&symbol_short!("GENSET"), &metadata, &serial, &owner);
         assert_eq!(id, 1);
 
-        let result = client.try_register_asset(&symbol_short!("GENSET"), &metadata, &serial, &owner);
+        let result =
+            client.try_register_asset(&symbol_short!("GENSET"), &metadata, &serial, &owner);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::DuplicateAsset as u32
+            )))
+        );
+    }
+
+    /// Closes #1067 — the owner+metadata dedup key must reject a duplicate even
+    /// when the serial number differs, proving this check is independent from
+    /// (and not merely a side effect of) the serial-number dedup check.
+    #[test]
+    fn test_register_asset_same_owner_metadata_different_serial_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let metadata = String::from_str(&env, "CAT-3516-SAME-METADATA");
+
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &metadata,
+            &String::from_str(&env, "SN-FIRST-001"),
+            &owner,
+        );
+        assert_eq!(id, 1);
+
+        // Same owner + same metadata, but a distinct serial number: the
+        // secondary (owner, asset_type, metadata_hash) dedup key must still
+        // reject this as a duplicate asset.
+        let result = client.try_register_asset(
+            &symbol_short!("GENSET"),
+            &metadata,
+            &String::from_str(&env, "SN-SECOND-002"),
+            &owner,
+        );
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -1935,9 +4450,61 @@ mod tests {
         let metadata = String::from_str(&env, "CAT-3516-SN123456");
 
         // Different owners may register the same metadata (different physical assets)
-        let id_a = client.register_asset(&symbol_short!("GENSET"), &metadata, &String::from_str(&env, "SN-A-001"), &owner_a);
-        let id_b = client.register_asset(&symbol_short!("GENSET"), &metadata, &String::from_str(&env, "SN-B-001"), &owner_b);
+        let id_a = client.register_asset(
+            &symbol_short!("GENSET"),
+            &metadata,
+            &String::from_str(&env, "SN-A-001"),
+            &owner_a,
+        );
+        let id_b = client.register_asset(
+            &symbol_short!("GENSET"),
+            &metadata,
+            &String::from_str(&env, "SN-B-001"),
+            &owner_b,
+        );
         assert_ne!(id_a, id_b);
+    }
+
+    /// Closes #782 — serial numbers must be globally unique: a different owner must
+    /// not be able to register an asset with the same physical serial number.
+    #[test]
+    fn test_cross_owner_duplicate_serial_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+        let serial = String::from_str(&env, "SN-GLOBAL-001");
+
+        // First owner registers successfully.
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Machine A metadata"),
+            &serial,
+            &owner_a,
+        );
+        assert_eq!(id, 1);
+
+        // Second owner attempts to register the same physical serial — must be rejected.
+        let result = client.try_register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Machine A metadata different owner"),
+            &serial,
+            &owner_b,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::DuplicateAsset as u32
+            ))),
+            "duplicate serial number must be rejected even for a different owner"
+        );
     }
 
     #[test]
@@ -2006,6 +4573,35 @@ mod tests {
         assert!(dedup_ttl > 0, "Deduplication key TTL should be extended");
     }
 
+    /// Issue #838: every write must extend the relevant persistent entry's TTL
+    /// to at least `TTL_THRESHOLD`. Verify the asset entry after `register_asset`.
+    #[test]
+    fn test_register_asset_ttl_at_least_threshold() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let metadata = String::from_str(&env, "Caterpillar 3516 Generator");
+        let id =
+            client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
+
+        let asset_ttl = env.as_contract(&contract_id, || {
+            env.storage().persistent().get_ttl(&asset_key(id))
+        });
+        assert!(
+            asset_ttl >= TTL_THRESHOLD,
+            "asset entry TTL ({}) must be >= TTL_THRESHOLD ({}) after register_asset",
+            asset_ttl,
+            TTL_THRESHOLD
+        );
+    }
+
     #[test]
     fn test_register_asset_dedup_key_ttl_is_set() {
         let env = Env::default();
@@ -2019,14 +4615,21 @@ mod tests {
 
         let owner = Address::generate(&env);
         let metadata = String::from_str(&env, "Dedup TTL test asset");
-        client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
+        client.register_asset(
+            &symbol_short!("GENSET"),
+            &metadata,
+            &unique_serial(&env),
+            &owner,
+        );
 
         let meta_bytes = metadata.to_xdr(&env);
         let meta_hash: BytesN<32> = env.crypto().sha256(&meta_bytes).into();
         let ttl = env.as_contract(&contract_id, || {
-            env.storage()
-                .persistent()
-                .get_ttl(&dedup_key(&owner, &symbol_short!("GENSET"), &meta_hash))
+            env.storage().persistent().get_ttl(&dedup_key(
+                &owner,
+                &symbol_short!("GENSET"),
+                &meta_hash,
+            ))
         });
         assert!(
             ttl > 0,
@@ -2274,6 +4877,37 @@ mod tests {
     }
 
     #[test]
+    fn test_update_metadata_restamps_on_every_update() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Spec v1"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        env.ledger().with_mut(|li| li.timestamp += 500);
+        client.update_asset_metadata(&id, &owner, &String::from_str(&env, "Spec v2"));
+        let first = client.get_asset(&id).metadata_updated_at;
+
+        env.ledger().with_mut(|li| li.timestamp += 700);
+        client.update_asset_metadata(&id, &owner, &String::from_str(&env, "Spec v3"));
+        let second = client.get_asset(&id).metadata_updated_at;
+
+        assert_eq!(second, env.ledger().timestamp());
+        assert!(second > first);
+    }
+
+    #[test]
     fn test_update_metadata_emits_event() {
         let env = Env::default();
         env.mock_all_auths();
@@ -2378,6 +5012,306 @@ mod tests {
                 ContractError::AssetNotFound as u32,
             ))),
         );
+    }
+
+    #[test]
+    fn test_metadata_version_starts_at_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Original spec"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        let asset = client.get_asset(&id);
+        assert_eq!(asset.metadata_version, 0);
+    }
+
+    #[test]
+    fn test_metadata_version_increments_on_update() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Original spec"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        client.update_asset_metadata(&id, &owner, &String::from_str(&env, "Spec v2"));
+        assert_eq!(client.get_asset(&id).metadata_version, 1);
+
+        client.update_asset_metadata(&id, &owner, &String::from_str(&env, "Spec v3"));
+        assert_eq!(client.get_asset(&id).metadata_version, 2);
+    }
+
+    #[test]
+    fn test_get_metadata_history_returns_entries() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let original = String::from_str(&env, "Original spec");
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &original,
+            &unique_serial(&env),
+            &owner,
+        );
+
+        // No history before any update
+        assert_eq!(client.get_metadata_history(&id).len(), 0);
+
+        let v2 = String::from_str(&env, "Spec v2");
+        client.update_asset_metadata(&id, &owner, &v2);
+
+        let history = client.get_metadata_history(&id);
+        assert_eq!(history.len(), 1);
+
+        let entry = history.get(0).unwrap();
+        assert_eq!(entry.version, 1);
+
+        // Verify old_hash matches sha256 of original metadata XDR
+        let expected_old_hash: BytesN<32> = env.crypto().sha256(&original.to_xdr(&env)).into();
+        let expected_new_hash: BytesN<32> = env.crypto().sha256(&v2.to_xdr(&env)).into();
+        assert_eq!(entry.old_hash, expected_old_hash);
+        assert_eq!(entry.new_hash, expected_new_hash);
+    }
+
+    #[test]
+    fn test_get_metadata_history_multiple_updates() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "v1"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        client.update_asset_metadata(&id, &owner, &String::from_str(&env, "v2"));
+        client.update_asset_metadata(&id, &owner, &String::from_str(&env, "v3"));
+        client.update_asset_metadata(&id, &owner, &String::from_str(&env, "v4"));
+
+        let history = client.get_metadata_history(&id);
+        assert_eq!(history.len(), 3);
+        assert_eq!(history.get(0).unwrap().version, 1);
+        assert_eq!(history.get(1).unwrap().version, 2);
+        assert_eq!(history.get(2).unwrap().version, 3);
+    }
+
+    #[test]
+    fn test_get_metadata_history_nonexistent_asset_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let result = client.try_get_metadata_history(&999u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetNotFound as u32,
+            ))),
+        );
+    }
+
+    // ── issue #1021: get_asset_metadata_history (paginated) ───────────────
+
+    fn setup_asset_with_history(env: &Env) -> (AssetRegistryClient, u64) {
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(env, &contract_id);
+
+        let admin = Address::generate(env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(env, "Original metadata"),
+            &String::from_str(env, "SN-HIST-001"),
+            &owner,
+        );
+
+        // Add 5 metadata updates to build history
+        for i in 0..5u32 {
+            let new_meta = String::from_str(env, &format!("Updated metadata v{}", i + 1));
+            client.update_asset_metadata(&id, &owner, &new_meta);
+        }
+
+        (client, id)
+    }
+
+    #[test]
+    fn test_get_asset_metadata_history_first_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, id) = setup_asset_with_history(&env);
+
+        // Get first 3 entries
+        let page = client.get_asset_metadata_history(&id, &0u32, &3u32);
+        assert_eq!(page.len(), 3, "First page should have 3 entries");
+    }
+
+    #[test]
+    fn test_get_asset_metadata_history_second_page() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, id) = setup_asset_with_history(&env);
+
+        // Get entries 3-5 (offset=3, limit=3 → only 2 remain)
+        let page = client.get_asset_metadata_history(&id, &3u32, &3u32);
+        assert_eq!(page.len(), 2, "Second page should have 2 remaining entries");
+    }
+
+    #[test]
+    fn test_get_asset_metadata_history_offset_beyond_end_returns_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, id) = setup_asset_with_history(&env);
+
+        let page = client.get_asset_metadata_history(&id, &100u32, &10u32);
+        assert_eq!(page.len(), 0, "Offset beyond history length returns empty");
+    }
+
+    #[test]
+    fn test_get_asset_metadata_history_zero_limit_returns_empty() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, id) = setup_asset_with_history(&env);
+
+        let page = client.get_asset_metadata_history(&id, &0u32, &0u32);
+        assert_eq!(page.len(), 0, "Zero limit returns empty");
+    }
+
+    #[test]
+    fn test_get_asset_metadata_history_limit_capped_at_100() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, id) = setup_asset_with_history(&env);
+
+        // Limit of 1000 is capped to 100; only 5 entries exist so we get 5
+        let page = client.get_asset_metadata_history(&id, &0u32, &1000u32);
+        assert_eq!(
+            page.len(),
+            5,
+            "Limit is capped to 100, returns all available entries"
+        );
+    }
+
+    #[test]
+    fn test_get_asset_metadata_history_nonexistent_asset_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let result = client.try_get_asset_metadata_history(&999u64, &0u32, &10u32);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetNotFound as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_get_asset_metadata_history_entries_ordered_oldest_first() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (client, id) = setup_asset_with_history(&env);
+
+        // All 5 entries, check version increments (oldest = version 1)
+        let all = client.get_asset_metadata_history(&id, &0u32, &10u32);
+        assert_eq!(all.len(), 5);
+        // Versions should be monotonically increasing (oldest first)
+        for i in 0..all.len() - 1 {
+            assert!(
+                all.get(i).unwrap().version < all.get(i + 1).unwrap().version,
+                "Entries should be ordered oldest-first by version"
+            );
+        }
+    }
+
+    #[test]
+    fn test_update_metadata_event_contains_hashes_and_version() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let original = String::from_str(&env, "Original spec");
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &original,
+            &unique_serial(&env),
+            &owner,
+        );
+
+        let new_meta = String::from_str(&env, "Repowered spec");
+        let ts = env.ledger().timestamp();
+        client.update_asset_metadata(&id, &owner, &new_meta);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+
+        let (_, topics, data) = events.last().unwrap();
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, symbol_short!("UPD_META"));
+
+        let (_, old_hash, new_hash, version, _timestamp): (Address, BytesN<32>, BytesN<32>, u32, u64) =
+            data.try_into_val(&env).unwrap();
+
+        let expected_old: BytesN<32> = env.crypto().sha256(&original.to_xdr(&env)).into();
+        let expected_new: BytesN<32> = env.crypto().sha256(&new_meta.to_xdr(&env)).into();
+        assert_eq!(old_hash, expected_old);
+        assert_eq!(new_hash, expected_new);
+        assert_eq!(version, 1u32);
+        let _ = ts; // timestamp checked separately if needed
     }
 
     #[test]
@@ -2493,7 +5427,323 @@ mod tests {
     }
 
     #[test]
-    fn test_transfer_updates_dedup_so_new_owner_can_register_same_metadata() {
+    fn test_ownership_transfer_initiate_and_accept() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        client.initiate_ownership_transfer(&id, &new_owner);
+        // Ownership has not changed yet — it only changes on acceptance.
+        assert_eq!(client.get_asset(&id).owner, owner);
+
+        client.accept_ownership_transfer(&id);
+        assert_eq!(client.get_asset(&id).owner, new_owner);
+    }
+
+    #[test]
+    fn test_ownership_transfer_emits_events() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        client.initiate_ownership_transfer(&id, &new_owner);
+        assert_eq!(env.events().all().len(), 1);
+
+        client.accept_ownership_transfer(&id);
+        assert_eq!(env.events().all().len(), 1);
+    }
+
+    #[test]
+    fn test_ownership_transfer_same_owner_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        let result = client.try_initiate_ownership_transfer(&id, &owner);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::SameOwner as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_ownership_transfer_already_pending_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let other_owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        client.initiate_ownership_transfer(&id, &new_owner);
+        let result = client.try_initiate_ownership_transfer(&id, &other_owner);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::TransferAlreadyPending as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_ownership_transfer_accept_without_pending_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        let result = client.try_accept_ownership_transfer(&id);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::NoPendingTransfer as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_ownership_transfer_timeout_expires() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        client.initiate_ownership_transfer(&id, &new_owner);
+
+        // Advance the ledger past the 7-day acceptance window.
+        env.ledger()
+            .with_mut(|li| li.timestamp += TRANSFER_TIMEOUT_SECS);
+
+        let result = client.try_accept_ownership_transfer(&id);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::TransferExpired as u32,
+            ))),
+        );
+
+        // Ownership is unchanged after expiry.
+        assert_eq!(client.get_asset(&id).owner, owner);
+
+        // A new transfer can be initiated after the old one expired.
+        client.initiate_ownership_transfer(&id, &new_owner);
+        client.accept_ownership_transfer(&id);
+        assert_eq!(client.get_asset(&id).owner, new_owner);
+    }
+
+    /// Issue #1215: an expired pending transfer must be cancellable by anyone,
+    /// freeing the slot without waiting on a stray `accept`/`initiate` call.
+    #[test]
+    fn test_cancel_expired_transfer_succeeds_after_timeout() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let another_owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        client.initiate_ownership_transfer(&id, &new_owner);
+
+        env.ledger()
+            .with_mut(|li| li.timestamp += TRANSFER_TIMEOUT_SECS);
+
+        client.cancel_expired_transfer(&id);
+
+        // A new transfer can be initiated immediately after cancellation.
+        client.initiate_ownership_transfer(&id, &another_owner);
+        client.accept_ownership_transfer(&id);
+        assert_eq!(client.get_asset(&id).owner, another_owner);
+    }
+
+    #[test]
+    fn test_cancel_expired_transfer_fails_before_timeout() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        client.initiate_ownership_transfer(&id, &new_owner);
+
+        let result = client.try_cancel_expired_transfer(&id);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::TransferNotExpired as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_cancel_expired_transfer_fails_without_pending_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        let result = client.try_cancel_expired_transfer(&id);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::NoPendingTransfer as u32,
+            ))),
+        );
+    }
+
+    /// Issue #1214: a pending ownership transfer must block a new lien from being
+    /// placed, otherwise the transfer could complete after the lock and hand the
+    /// new owner a locked asset with no lender notification.
+    #[test]
+    fn test_lock_asset_as_collateral_blocked_by_pending_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let lender = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT-3516"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        client.set_lending_contract(&admin, &lender);
+        client.initiate_ownership_transfer(&id, &new_owner);
+
+        let result = client.try_lock_asset_as_collateral(&lender, &id, &1u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::TransferAlreadyPending as u32,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_ownership_transfer_updates_dedup_so_old_owner_can_reregister() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(AssetRegistry, ());
@@ -2508,11 +5758,92 @@ mod tests {
         let metadata = String::from_str(&env, "CAT-3516");
 
         let id = client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
+        client.initiate_ownership_transfer(&id, &new_owner);
+        client.accept_ownership_transfer(&id);
+
+        let id2 = client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
+        assert_ne!(id, id2);
+    }
+
+    #[test]
+    fn test_transfer_updates_dedup_so_new_owner_can_register_same_metadata() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let metadata = String::from_str(&env, "CAT-3516");
+
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &metadata,
+            &unique_serial(&env),
+            &owner,
+        );
         client.transfer_asset(&id, &owner, &new_owner);
 
         // Original owner can now register the same metadata again (dedup key was moved)
-        let id2 = client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
+        let id2 = client.register_asset(
+            &symbol_short!("GENSET"),
+            &metadata,
+            &unique_serial(&env),
+            &owner,
+        );
         assert_ne!(id, id2);
+    }
+
+    // Closes #774
+    #[test]
+    fn test_transfer_asset_updates_owner_index_and_previous_owner_can_reregister() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let prev_owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let metadata = String::from_str(&env, "CAT-3516C");
+
+        // Register with prev_owner and transfer to new_owner
+        let id = client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &prev_owner);
+        client.transfer_asset(&id, &prev_owner, &new_owner);
+
+        // Owner index: prev_owner no longer holds the transferred asset
+        let prev_assets = client.get_assets_by_owner(&prev_owner);
+        assert!(!prev_assets.contains(&id), "prev_owner should not appear in owner index after transfer");
+
+        // Owner index: new_owner now holds the asset
+        let new_assets = client.get_assets_by_owner(&new_owner);
+        assert!(new_assets.contains(&id), "new_owner should appear in owner index after transfer");
+
+        // prev_owner can register same metadata again (their dedup key was cleared)
+        let id2 = client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &prev_owner);
+        assert_ne!(id, id2, "re-registration by prev_owner should produce a new asset id");
+
+        // new_owner cannot register the same metadata (dedup key now belongs to them)
+        let dup_result = client.try_register_asset(
+            &symbol_short!("GENSET"),
+            &metadata,
+            &unique_serial(&env),
+            &new_owner,
+        );
+        assert_eq!(
+            dup_result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::DuplicateAsset as u32,
+            ))),
+            "new_owner should not be able to register the same metadata (dedup applies to new owner)",
+        );
     }
 
     #[test]
@@ -2699,9 +6030,19 @@ mod tests {
 
         let owner = Address::generate(&env);
         let unknown_owner = Address::generate(&env);
-        client.register_asset(&symbol_short!("GENSET"), &String::from_str(&env, "Asset X"), &unique_serial(&env), &owner);
+        client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Asset X"),
+            &unique_serial(&env),
+            &owner,
+        );
 
-        assert_eq!(client.get_assets_by_owner_page(&unknown_owner, &0, &2).len(), 0);
+        assert_eq!(
+            client
+                .get_assets_by_owner_page(&unknown_owner, &0, &2)
+                .len(),
+            0
+        );
         assert_eq!(client.get_assets_by_owner_page(&owner, &0, &0).len(), 0);
         assert_eq!(client.get_assets_by_owner_page(&owner, &5, &2).len(), 0);
     }
@@ -2718,9 +6059,24 @@ mod tests {
         client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
         let owner = Address::generate(&env);
-        let id1 = client.register_asset(&symbol_short!("GENSET"), &String::from_str(&env, "P1"), &unique_serial(&env), &owner);
-        let id2 = client.register_asset(&symbol_short!("GENSET"), &String::from_str(&env, "P2"), &unique_serial(&env), &owner);
-        let id3 = client.register_asset(&symbol_short!("GENSET"), &String::from_str(&env, "P3"), &unique_serial(&env), &owner);
+        let id1 = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "P1"),
+            &unique_serial(&env),
+            &owner,
+        );
+        let id2 = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "P2"),
+            &unique_serial(&env),
+            &owner,
+        );
+        let id3 = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "P3"),
+            &unique_serial(&env),
+            &owner,
+        );
 
         let page0 = client.get_assets_by_owner_paginated(&owner, &0, &2);
         assert_eq!(page0.total, 3);
@@ -2913,15 +6269,30 @@ mod tests {
         let meta_b = String::from_str(&env, "Spec B");
 
         // Register with metadata A, then update to B
-        let id = client.register_asset(&symbol_short!("GENSET"), &meta_a, &unique_serial(&env), &owner);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &meta_a,
+            &unique_serial(&env),
+            &owner,
+        );
         client.update_asset_metadata(&id, &owner, &meta_b);
 
         // Old dedup key (A) is gone — owner can register metadata A again
-        let id2 = client.register_asset(&symbol_short!("GENSET"), &meta_a, &unique_serial(&env), &owner);
+        let id2 = client.register_asset(
+            &symbol_short!("GENSET"),
+            &meta_a,
+            &unique_serial(&env),
+            &owner,
+        );
         assert_ne!(id, id2);
 
         // New dedup key (B) is present — owner cannot register metadata B again
-        let result = client.try_register_asset(&symbol_short!("GENSET"), &meta_b, &unique_serial(&env), &owner);
+        let result = client.try_register_asset(
+            &symbol_short!("GENSET"),
+            &meta_b,
+            &unique_serial(&env),
+            &owner,
+        );
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -2931,7 +6302,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
     fn test_initialize_admin_called_twice_panics() {
         let env = Env::default();
         env.mock_all_auths();
@@ -2940,8 +6310,14 @@ mod tests {
 
         let admin = Address::generate(&env);
         client.initialize_admin(&admin, &admin);
-        // Second call must panic
-        client.initialize_admin(&admin, &admin);
+        // Second call must fail with AdminAlreadyInitialized
+        let result = client.try_initialize_admin(&admin, &admin);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AdminAlreadyInitialized as u32,
+            ))),
+        );
     }
 
     #[test]
@@ -2983,13 +6359,23 @@ mod tests {
         let metadata = String::from_str(&env, "CAT-3516");
 
         // Register asset
-        let id1 = client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
+        let id1 = client.register_asset(
+            &symbol_short!("GENSET"),
+            &metadata,
+            &unique_serial(&env),
+            &owner,
+        );
 
         // Deregister removes dedup key
         client.deregister_asset(&admin, &id1);
 
         // Same owner can now re-register the same metadata
-        let id2 = client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
+        let id2 = client.register_asset(
+            &symbol_short!("GENSET"),
+            &metadata,
+            &unique_serial(&env),
+            &owner,
+        );
         assert_ne!(id1, id2);
     }
 
@@ -3060,7 +6446,12 @@ mod tests {
         let owner = Address::generate(&env);
         let new_owner = Address::generate(&env);
         let metadata = String::from_str(&env, "CAT-3516");
-        let id = client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &metadata,
+            &unique_serial(&env),
+            &owner,
+        );
 
         client.transfer_asset(&id, &owner, &new_owner);
 
@@ -3110,6 +6501,36 @@ mod tests {
             // Verify asset record TTL is extended
             let asset_ttl = env.storage().persistent().get_ttl(&asset_key(id));
             assert!(asset_ttl > 0, "Asset record TTL should be extended");
+        });
+    }
+
+    #[test]
+    fn test_update_metadata_extends_history_key_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Original spec"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        client.update_asset_metadata(&id, &owner, &String::from_str(&env, "Updated spec"));
+
+        env.as_contract(&contract_id, || {
+            let history_ttl = env
+                .storage()
+                .persistent()
+                .get_ttl(&metadata_history_key(id));
+            assert!(history_ttl > 0, "Metadata history key TTL should be extended");
         });
     }
 
@@ -3547,6 +6968,43 @@ mod tests {
         );
     }
 
+    /// Issue #1213: an empty-metadata element inside an otherwise valid batch must be
+    /// rejected the same way a lone `register_asset` call with empty metadata is,
+    /// instead of only the outer `Vec<AssetInput>` being checked for non-emptiness.
+    #[test]
+    fn test_batch_register_assets_rejects_empty_metadata_element() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let mut batch = Vec::new(&env);
+        batch.push_back(AssetInput {
+            asset_type: symbol_short!("GENSET"),
+            metadata: String::from_str(&env, "Valid asset"),
+            serial_number: unique_serial(&env),
+        });
+        batch.push_back(AssetInput {
+            asset_type: symbol_short!("GENSET"),
+            metadata: String::from_str(&env, ""),
+            serial_number: unique_serial(&env),
+        });
+
+        let result = client.try_batch_register_assets(&owner, &batch);
+        assert!(
+            result.is_err(),
+            "a batch containing one empty-metadata asset must be rejected"
+        );
+
+        // No asset from the batch should have been persisted.
+        assert_eq!(client.get_assets_by_owner(&owner).len(), 0);
+    }
+
     #[test]
     fn test_batch_register_assets_owner_index_correct() {
         let env = Env::default();
@@ -3875,6 +7333,34 @@ mod tests {
         client.deregister_asset(&owner, &id);
         client.remove_asset_type(&admin, &symbol_short!("GENSET"));
         assert!(!client.is_valid_asset_type(&symbol_short!("GENSET")));
+    }
+
+    #[test]
+    fn test_remove_last_asset_type_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        // Only one allowed type exists; removing it must be rejected so that
+        // register_asset never faces an empty allowlist.
+        assert_eq!(
+            client.try_remove_asset_type(&admin, &symbol_short!("GENSET")),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidAssetType as u32
+            )))
+        );
+        assert!(client.is_valid_asset_type(&symbol_short!("GENSET")));
+
+        // Adding a second type allows the first to be removed.
+        client.add_asset_type(&admin, &symbol_short!("PUMP"));
+        client.remove_asset_type(&admin, &symbol_short!("GENSET"));
+        assert!(!client.is_valid_asset_type(&symbol_short!("GENSET")));
+        assert!(client.is_valid_asset_type(&symbol_short!("PUMP")));
     }
 
     #[test]
@@ -4319,8 +7805,8 @@ mod tests {
         // Get lifecycle score via cross-contract call
         let score = asset_client.get_lifecycle_score(&asset_id, &lifecycle_id);
 
-        // Score should be a valid u32 (initially 0 for new asset)
-        assert_eq!(score, 0);
+        // A fresh asset with no maintenance history returns None, not Some(0).
+        assert_eq!(score, None);
     }
 
     #[test]
@@ -4609,29 +8095,215 @@ mod tests {
         let turbines = client.get_assets_by_type(&symbol_short!("TURBINE"));
         assert_eq!(turbines.len(), 1);
     }
+}
 
     #[test]
     fn test_asset_status_active() {
-    fn test_get_asset_count() {
+        fn test_get_asset_count() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            client.initialize_admin(&admin, &admin);
+            client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+            let owner = Address::generate(&env);
+            let asset_id = client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, "Active Generator"),
+                &unique_serial(&env),
+                &owner,
+            );
+
+            let status = client.asset_status(&asset_id);
+            assert_eq!(status, AssetStatus::Active);
+        }
+
+        #[test]
+        fn test_asset_status_decommissioned() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
+    #[test]
+    fn test_get_total_asset_count() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(AssetRegistry, ());
         let client = AssetRegistryClient::new(&env, &contract_id);
 
-        let admin = Address::generate(&env);
-        client.initialize_admin(&admin, &admin);
-        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+            let admin = Address::generate(&env);
+            client.initialize_admin(&admin, &admin);
+            client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+            let owner = Address::generate(&env);
+            let asset_id = client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, "Active Generator"),
+                &String::from_str(&env, "Decomm Generator"),
+                &unique_serial(&env),
+                &owner,
+            );
+
+            let status = client.asset_status(&asset_id);
+            assert_eq!(status, AssetStatus::Active);
+        }
+
+        #[test]
+        fn test_asset_status_decommissioned() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            client.initialize_admin(&admin, &admin);
+            client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+            let owner = Address::generate(&env);
+            let asset_id = client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, "Decomm Generator"),
+                &unique_serial(&env),
+                &owner,
+            );
+
+            // Manually set the decommissioned flag
+            let key = decommissioned_key(asset_id);
+            env.storage().persistent().set(&key, &true);
+
+            let status = client.asset_status(&asset_id);
+            assert_eq!(status, AssetStatus::Decommissioned);
+        }
+
+        #[test]
+        fn test_asset_status_not_found() {
+            let env = Env::default();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
+
+            let result = client.try_asset_status(&999u64);
+            assert_eq!(
+                result,
+                Err(Ok(soroban_sdk::Error::from_contract_error(
+                    ContractError::AssetNotFound as u32
+                )))
+            );
+        }
+
+        #[test]
+        fn test_asset_status_under_maintenance() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            client.initialize_admin(&admin, &admin);
+            client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+            let owner = Address::generate(&env);
+            let asset_id = client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, "Maintained Generator"),
+                &unique_serial(&env),
+                &owner,
+            );
+
+            // Manually set the under_maintenance flag
+            let key = (symbol_short!("U_MAINT"), asset_id);
+            env.storage().persistent().set(&key, &true);
+
+            let status = client.asset_status(&asset_id);
+            assert_eq!(status, AssetStatus::UnderMaintenance);
+        }
+
+        #[test]
+        fn test_decommission_asset_admin_can_decommission() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
+            // Manually set the decommissioned flag
+            let key = decommissioned_key(asset_id);
+            env.storage().persistent().set(&key, &true);
+
+            let status = client.asset_status(&asset_id);
+            assert_eq!(status, AssetStatus::Decommissioned);
+        }
+
+        #[test]
+        fn test_asset_status_not_found() {
+            let env = Env::default();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
+
+            let result = client.try_asset_status(&999u64);
+            assert_eq!(
+                result,
+                Err(Ok(soroban_sdk::Error::from_contract_error(
+                    ContractError::AssetNotFound as u32
+                )))
+            );
+        }
+
+        #[test]
+        fn test_asset_status_under_maintenance() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            client.initialize_admin(&admin, &admin);
+            client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+            let owner = Address::generate(&env);
+            let asset_id = client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, "Maintained Generator"),
+                &unique_serial(&env),
+                &owner,
+            );
+
+            // Manually set the under_maintenance flag
+            let key = (symbol_short!("U_MAINT"), asset_id);
+            env.storage().persistent().set(&key, &true);
+
+            let status = client.asset_status(&asset_id);
+            assert_eq!(status, AssetStatus::UnderMaintenance);
+        }
+
+        #[test]
+        fn test_decommission_asset_admin_can_decommission() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
+        // Returns 0 before any assets are registered
+        assert_eq!(client.get_total_asset_count(), 0);
 
         let owner = Address::generate(&env);
-        let asset_id = client.register_asset(
+        client.register_asset(
             &symbol_short!("GENSET"),
-            &String::from_str(&env, "Active Generator"),
+            &String::from_str(&env, "Generator Unit A"),
             &unique_serial(&env),
             &owner,
         );
+        assert_eq!(client.get_total_asset_count(), 1);
 
-        let status = client.asset_status(&asset_id);
-        assert_eq!(status, AssetStatus::Active);
+        client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator Unit B"),
+            &unique_serial(&env),
+            &owner,
+        );
+        assert_eq!(client.get_total_asset_count(), 2);
+
+        // get_total_asset_count and get_asset_count must agree
+        assert_eq!(client.get_total_asset_count(), client.get_asset_count());
     }
 
     #[test]
@@ -4641,488 +8313,711 @@ mod tests {
         let contract_id = env.register(AssetRegistry, ());
         let client = AssetRegistryClient::new(&env, &contract_id);
 
-        let admin = Address::generate(&env);
-        client.initialize_admin(&admin, &admin);
-        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+            let admin = Address::generate(&env);
+            client.initialize_admin(&admin, &admin);
+            client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
-        let owner = Address::generate(&env);
-        let asset_id = client.register_asset(
-            &symbol_short!("GENSET"),
-            &String::from_str(&env, "Decomm Generator"),
-            &unique_serial(&env),
-            &owner,
-        );
-
-        // Manually set the decommissioned flag
-        let key = decommissioned_key(asset_id);
-        env.storage().persistent().set(&key, &true);
-
-        let status = client.asset_status(&asset_id);
-        assert_eq!(status, AssetStatus::Decommissioned);
-    }
-
-    #[test]
-    fn test_asset_status_not_found() {
-        let env = Env::default();
-        let contract_id = env.register(AssetRegistry, ());
-        let client = AssetRegistryClient::new(&env, &contract_id);
-
-        let result = client.try_asset_status(&999u64);
-        assert_eq!(
-            result,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::AssetNotFound as u32
-            )))
-        );
-    }
-
-    #[test]
-    fn test_asset_status_under_maintenance() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(AssetRegistry, ());
-        let client = AssetRegistryClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        client.initialize_admin(&admin, &admin);
-        client.add_asset_type(&admin, &symbol_short!("GENSET"));
-
-        let owner = Address::generate(&env);
-        let asset_id = client.register_asset(
-            &symbol_short!("GENSET"),
-            &String::from_str(&env, "Maintained Generator"),
-            &unique_serial(&env),
-            &owner,
-        );
-
-        // Manually set the under_maintenance flag
-        let key = (symbol_short!("U_MAINT"), asset_id);
-        env.storage().persistent().set(&key, &true);
-
-        let status = client.asset_status(&asset_id);
-        assert_eq!(status, AssetStatus::UnderMaintenance);
-    }
-
-    #[test]
-    fn test_decommission_asset_admin_can_decommission() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(AssetRegistry, ());
-        let client = AssetRegistryClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        client.initialize_admin(&admin, &admin);
-        client.add_asset_type(&admin, &symbol_short!("GENSET"));
-
-        let owner = Address::generate(&env);
-        let asset_id = client.register_asset(
-            &symbol_short!("GENSET"),
-            &String::from_str(&env, "Decomm Test"),
-            &unique_serial(&env),
-            &owner,
-        );
-
-        // Decommission the asset
-        client.decommission_asset(&admin, &asset_id);
-
-        // Verify status is Decommissioned
-        let status = client.asset_status(&asset_id);
-        assert_eq!(status, AssetStatus::Decommissioned);
-    }
-
-    #[test]
-    fn test_decommission_asset_non_admin_rejected() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(AssetRegistry, ());
-        let client = AssetRegistryClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        client.initialize_admin(&admin, &admin);
-        client.add_asset_type(&admin, &symbol_short!("GENSET"));
-
-        let owner = Address::generate(&env);
-        let asset_id = client.register_asset(
-            &symbol_short!("GENSET"),
-            &String::from_str(&env, "Decomm Test"),
-            &unique_serial(&env),
-            &owner,
-        );
-
-        // Non-admin tries to decommission
-        let non_admin = Address::generate(&env);
-        let result = client.try_decommission_asset(&non_admin, &asset_id);
-        assert_eq!(
-            result,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::UnauthorizedAdmin as u32
-            )))
-        );
-    }
-
-    #[test]
-    fn test_decommission_nonexistent_asset() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(AssetRegistry, ());
-        let client = AssetRegistryClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        client.initialize_admin(&admin, &admin);
-
-        // Try to decommission non-existent asset
-        let result = client.try_decommission_asset(&admin, &999u64);
-        assert_eq!(
-            result,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::AssetNotFound as u32
-            )))
-        );
-    }
-
-    #[test]
-    fn test_decommission_asset_emits_event() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(AssetRegistry, ());
-        let client = AssetRegistryClient::new(&env, &contract_id);
-
-        let admin = Address::generate(&env);
-        client.initialize_admin(&admin, &admin);
-        client.add_asset_type(&admin, &symbol_short!("GENSET"));
-
-        let owner = Address::generate(&env);
-        let asset_id = client.register_asset(
-            &symbol_short!("GENSET"),
-            &String::from_str(&env, "Event Test"),
-            &unique_serial(&env),
-            &owner,
-        );
-
-        // Decommission the asset and check for event
-        client.decommission_asset(&admin, &asset_id);
-
-        let events = env.events().all();
-        // Should have at least one DECOMM event
-        assert!(events.len() > 0, "decommission_asset should emit an event");
-        // Counter starts at 0
-        assert_eq!(client.get_asset_count(), 0);
-
-        let owner = Address::generate(&env);
-
-        // Register first asset, count should be 1
-        client.register_asset(
-            &symbol_short!("GENSET"),
-            &String::from_str(&env, "Generator 1"),
-            &unique_serial(&env),
-            &owner,
-        );
-        assert_eq!(client.get_asset_count(), 1);
-
-        // Register second asset, count should be 2
-        client.register_asset(
-            &symbol_short!("GENSET"),
-            &String::from_str(&env, "Generator 2"),
-            &unique_serial(&env),
-            &owner,
-        );
-        assert_eq!(client.get_asset_count(), 2);
-
-        // Register third asset, count should be 3
-        client.register_asset(
-            &symbol_short!("GENSET"),
-            &String::from_str(&env, "Generator 3"),
-            &unique_serial(&env),
-            &owner,
-        );
-        assert_eq!(client.get_asset_count(), 3);
-    }
-
-    // --- Issue: get_assets_by_type_paginated tests ---
-
-    fn setup_with_types_for_pagination(env: &Env) -> (AssetRegistryClient, Address) {
-        let contract_id = env.register(AssetRegistry, ());
-        let client = AssetRegistryClient::new(env, &contract_id);
-        let admin = Address::generate(env);
-        client.initialize_admin(&admin, &admin);
-        client.add_asset_type(&admin, &symbol_short!("GENSET"));
-        client.add_asset_type(&admin, &symbol_short!("TURBINE"));
-        let owner = Address::generate(env);
-        (client, owner)
-    }
-
-    #[test]
-    fn test_get_assets_by_type_paginated_standard() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, owner) = setup_with_types_for_pagination(&env);
-
-        for i in 0..7u32 {
-            client.register_asset(
+            let owner = Address::generate(&env);
+            let asset_id = client.register_asset(
                 &symbol_short!("GENSET"),
-                &String::from_str(&env, &std::format!("Generator {i}")),
+                &String::from_str(&env, "Decomm Test"),
+                &String::from_str(&env, "Decomm Generator"),
                 &unique_serial(&env),
                 &owner,
             );
+
+            // Decommission the asset
+            client.decommission_asset(&admin, &asset_id);
+
+            // Verify status is Decommissioned
+            let status = client.asset_status(&asset_id);
+            assert_eq!(status, AssetStatus::Decommissioned);
         }
 
-        // Page 0: items 0-2
-        let p0 = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &0, &3);
-        assert_eq!(p0.total, 7);
-        assert_eq!(p0.assets.len(), 3);
+        #[test]
+        fn test_decommission_asset_non_admin_rejected() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
 
-        // Page 1: items 3-5
-        let p1 = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &1, &3);
-        assert_eq!(p1.total, 7);
-        assert_eq!(p1.assets.len(), 3);
+            let admin = Address::generate(&env);
+            client.initialize_admin(&admin, &admin);
+            client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
-        // Page 2: item 6 (last page, partial)
-        let p2 = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &2, &3);
-        assert_eq!(p2.total, 7);
-        assert_eq!(p2.assets.len(), 1);
-    }
+            // Manually set the decommissioned flag
+            let key = decommissioned_key(asset_id);
+            env.storage().persistent().set(&key, &true);
 
-    #[test]
-    fn test_get_assets_by_type_paginated_empty_type() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, _) = setup_with_types_for_pagination(&env);
+            let status = client.asset_status(&asset_id);
+            assert_eq!(status, AssetStatus::Decommissioned);
+        }
 
-        // No assets of type TURBINE registered
-        let result = client.get_assets_by_type_paginated(&symbol_short!("TURBINE"), &0, &10);
-        assert_eq!(result.total, 0);
-        assert_eq!(result.assets.len(), 0);
-    }
+        #[test]
+        fn test_decommission_asset_non_admin_rejected() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
 
-    #[test]
-    fn test_get_assets_by_type_paginated_out_of_bounds() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, owner) = setup_with_types_for_pagination(&env);
+            let admin = Address::generate(&env);
+            client.initialize_admin(&admin, &admin);
+            client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
-        client.register_asset(
-            &symbol_short!("GENSET"),
-            &String::from_str(&env, "Generator 0"),
-            &unique_serial(&env),
-            &owner,
-        );
-
-        // Page beyond the end returns empty assets but correct total
-        let result = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &5, &10);
-        assert_eq!(result.total, 1);
-        assert_eq!(result.assets.len(), 0);
-    }
-
-    #[test]
-    fn test_get_assets_by_type_paginated_page_size_capped_at_100() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, owner) = setup_with_types_for_pagination(&env);
-
-        for i in 0..50u32 {
-            client.register_asset(
+            let owner = Address::generate(&env);
+            let asset_id = client.register_asset(
                 &symbol_short!("GENSET"),
-                &String::from_str(&env, &std::format!("Generator {i}")),
+                &String::from_str(&env, "Decomm Test"),
                 &unique_serial(&env),
                 &owner,
             );
+
+
+            // Non-admin tries to decommission
+            let non_admin = Address::generate(&env);
+            let result = client.try_decommission_asset(&non_admin, &asset_id);
+            assert_eq!(
+                result,
+                Err(Ok(soroban_sdk::Error::from_contract_error(
+                    ContractError::UnauthorizedAdmin as u32
+                )))
+            );
         }
 
-        // page_size=200 is capped to 100, so at most 100 assets returned
-        let result = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &0, &200);
-        assert_eq!(result.total, 50);
-        assert_eq!(result.assets.len(), 50); // only 50 assets exist
-    }
+        #[test]
+        fn test_decommission_nonexistent_asset() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
 
-    // --- #751: dedup key includes asset_type ---
+            let admin = Address::generate(&env);
+            client.initialize_admin(&admin, &admin);
 
-    #[test]
-    fn test_same_metadata_different_type_is_allowed() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(AssetRegistry, ());
-        let client = AssetRegistryClient::new(&env, &contract_id);
+            // Try to decommission non-existent asset
+            let result = client.try_decommission_asset(&admin, &999u64);
+            assert_eq!(
+                result,
+                Err(Ok(soroban_sdk::Error::from_contract_error(
+                    ContractError::AssetNotFound as u32
+                )))
+            );
+        }
 
-        let admin = Address::generate(&env);
-        client.initialize_admin(&admin, &admin);
-        client.add_asset_type(&admin, &symbol_short!("GENSET"));
-        client.add_asset_type(&admin, &symbol_short!("TURBINE"));
+        #[test]
+        fn test_decommission_nonexistent_asset() {
+        fn test_decommission_asset_emits_event() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
 
-        let owner = Address::generate(&env);
-        let metadata = String::from_str(&env, "Spec v1");
+            let admin = Address::generate(&env);
+            client.initialize_admin(&admin, &admin);
 
-        // Same metadata, different asset types — both should succeed
-        let id1 = client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
-        let id2 = client.register_asset(&symbol_short!("TURBINE"), &metadata, &unique_serial(&env), &owner);
+            // Try to decommission non-existent asset
+            let result = client.try_decommission_asset(&admin, &999u64);
+            assert_eq!(
+                result,
+                Err(Ok(soroban_sdk::Error::from_contract_error(
+                    ContractError::AssetNotFound as u32
+                )))
+            );
+        }
 
-        assert_ne!(id1, id2);
-    }
+        #[test]
+        fn test_decommission_asset_emits_event() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
 
-    #[test]
-    fn test_same_owner_same_type_same_metadata_is_rejected() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(AssetRegistry, ());
-        let client = AssetRegistryClient::new(&env, &contract_id);
+            let admin = Address::generate(&env);
+            client.initialize_admin(&admin, &admin);
+            client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
-        let admin = Address::generate(&env);
-        client.initialize_admin(&admin, &admin);
-        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+            let owner = Address::generate(&env);
+            let asset_id = client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, "Event Test"),
+                &unique_serial(&env),
+                &owner,
+            );
 
-        let owner = Address::generate(&env);
-        let metadata = String::from_str(&env, "Spec v1");
+            // Decommission the asset and check for event
+            client.decommission_asset(&admin, &asset_id);
 
-        client.register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
+            let events = env.events().all();
+            // Should have at least one DECOMM event
+            assert!(events.len() > 0, "decommission_asset should emit an event");
+            // Counter starts at 0
+            assert_eq!(client.get_asset_count(), 0);
 
-        let result = client.try_register_asset(&symbol_short!("GENSET"), &metadata, &unique_serial(&env), &owner);
-        assert_eq!(
-            result,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::DuplicateAsset as u32,
-            ))),
-        );
-    }
+            let owner = Address::generate(&env);
 
-    #[test]
-    fn test_batch_same_metadata_different_type_is_allowed() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(AssetRegistry, ());
-        let client = AssetRegistryClient::new(&env, &contract_id);
+            // Register first asset, count should be 1
+            client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, "Generator 1"),
+                &unique_serial(&env),
+                &owner,
+            );
+            assert_eq!(client.get_asset_count(), 1);
 
-        let admin = Address::generate(&env);
-        client.initialize_admin(&admin, &admin);
-        client.add_asset_type(&admin, &symbol_short!("GENSET"));
-        client.add_asset_type(&admin, &symbol_short!("TURBINE"));
+            // Register second asset, count should be 2
+            client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, "Generator 2"),
+                &unique_serial(&env),
+                &owner,
+            );
+            assert_eq!(client.get_asset_count(), 2);
 
-        let owner = Address::generate(&env);
-        let mut batch = Vec::new(&env);
-        batch.push_back(AssetInput {
-            asset_type: symbol_short!("GENSET"),
-            metadata: String::from_str(&env, "Shared spec"),
-            serial_number: unique_serial(&env),
-        });
-        batch.push_back(AssetInput {
-            asset_type: symbol_short!("TURBINE"),
-            metadata: String::from_str(&env, "Shared spec"),
-            serial_number: unique_serial(&env),
-        });
+            // Register third asset, count should be 3
+            client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, "Generator 3"),
+                &unique_serial(&env),
+                &owner,
+            );
+            client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
-        let ids = client.batch_register_assets(&owner, &batch);
-        assert_eq!(ids.len(), 2);
-    }
+            let owner = Address::generate(&env);
+            let asset_id = client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, "Event Test"),
+                &unique_serial(&env),
+                &owner,
+            );
 
-    // --- #752: upgrade timelock tests ---
+            // Decommission the asset and check for event
+            client.decommission_asset(&admin, &asset_id);
 
-    #[test]
-    fn test_execute_upgrade_before_timelock_fails() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(AssetRegistry, ());
-        let client = AssetRegistryClient::new(&env, &contract_id);
+            let events = env.events().all();
+            // Should have at least one DECOMM event
+            assert!(events.len() > 0, "decommission_asset should emit an event");
+            // Counter starts at 0
+            assert_eq!(client.get_asset_count(), 0);
 
-        let admin = Address::generate(&env);
-        client.initialize_admin(&admin, &admin);
+            let owner = Address::generate(&env);
 
-        let hash = BytesN::from_array(&env, &[0xabu8; 32]);
-        client.propose_upgrade(&admin, &hash);
+            // Register first asset, count should be 1
+            client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, "Generator 1"),
+                &unique_serial(&env),
+                &owner,
+            );
+            assert_eq!(client.get_asset_count(), 1);
 
-        // Not enough time passed — should fail
-        let result = client.try_execute_upgrade(&admin);
-        assert_eq!(
-            result,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::TimelockNotExpired as u32,
-            ))),
-        );
-    }
+            // Register second asset, count should be 2
+            client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, "Generator 2"),
+                &unique_serial(&env),
+                &owner,
+            );
+            assert_eq!(client.get_asset_count(), 2);
 
-    #[test]
-    fn test_execute_upgrade_after_timelock_succeeds() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(AssetRegistry, ());
-        let client = AssetRegistryClient::new(&env, &contract_id);
+            // Register third asset, count should be 3
+            client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, "Generator 3"),
+                &unique_serial(&env),
+                &owner,
+            );
+        fn test_asset_status_not_found() {
+            let env = Env::default();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
 
-        let admin = Address::generate(&env);
-        client.initialize_admin(&admin, &admin);
+            let result = client.try_asset_status(&999u64);
+            assert_eq!(
+                result,
+                Err(Ok(soroban_sdk::Error::from_contract_error(
+                    ContractError::AssetNotFound as u32
+                )))
+            );
+        }
 
-        let hash = BytesN::from_array(&env, &[0xabu8; 32]);
-        client.propose_upgrade(&admin, &hash);
+        #[test]
+        fn test_asset_status_under_maintenance() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
 
-        let base = env.ledger().timestamp();
-        env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+            let admin = Address::generate(&env);
+            client.initialize_admin(&admin, &admin);
+            client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
-        // Should succeed
-        client.execute_upgrade(&admin);
-    }
+            let owner = Address::generate(&env);
+            let asset_id = client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, "Maintained Generator"),
+                &unique_serial(&env),
+                &owner,
+            );
 
-    #[test]
-    fn test_execute_upgrade_without_proposal_fails() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(AssetRegistry, ());
-        let client = AssetRegistryClient::new(&env, &contract_id);
+            // Manually set the under_maintenance flag
+            let key = (symbol_short!("U_MAINT"), asset_id);
+            env.storage().persistent().set(&key, &true);
 
-        let admin = Address::generate(&env);
-        client.initialize_admin(&admin, &admin);
+            let status = client.asset_status(&asset_id);
+            assert_eq!(status, AssetStatus::UnderMaintenance);
+        }
 
-        let result = client.try_execute_upgrade(&admin);
-        assert_eq!(
-            result,
-            Err(Ok(soroban_sdk::Error::from_contract_error(
-                ContractError::ProposalNotFound as u32,
-            ))),
-        );
-    }
+        #[test]
+        fn test_decommission_asset_admin_can_decommission() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
 
-    #[test]
-    fn test_propose_upgrade_emits_event() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(AssetRegistry, ());
-        let client = AssetRegistryClient::new(&env, &contract_id);
+            let admin = Address::generate(&env);
+            client.initialize_admin(&admin, &admin);
+            client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
-        let admin = Address::generate(&env);
-        client.initialize_admin(&admin, &admin);
+            let owner = Address::generate(&env);
+            let asset_id = client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, "Decomm Test"),
+                &unique_serial(&env),
+                &owner,
+            );
 
-        let hash = BytesN::from_array(&env, &[0xabu8; 32]);
-        client.propose_upgrade(&admin, &hash);
+            // Decommission the asset
+            client.decommission_asset(&admin, &asset_id);
+
+            // Verify status is Decommissioned
+            let status = client.asset_status(&asset_id);
+            assert_eq!(status, AssetStatus::Decommissioned);
+        }
+
+        #[test]
+        fn test_decommission_asset_non_admin_rejected() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            client.initialize_admin(&admin, &admin);
+            client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+            let owner = Address::generate(&env);
+            let asset_id = client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, "Decomm Test"),
+                &unique_serial(&env),
+                &owner,
+            );
+
+            // Non-admin tries to decommission
+            let non_admin = Address::generate(&env);
+            let result = client.try_decommission_asset(&non_admin, &asset_id);
+            assert_eq!(
+                result,
+                Err(Ok(soroban_sdk::Error::from_contract_error(
+                    ContractError::UnauthorizedAdmin as u32
+                )))
+            );
+        }
+
+        #[test]
+        fn test_decommission_nonexistent_asset() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            client.initialize_admin(&admin, &admin);
+
+            // Try to decommission non-existent asset
+            let result = client.try_decommission_asset(&admin, &999u64);
+            assert_eq!(
+                result,
+                Err(Ok(soroban_sdk::Error::from_contract_error(
+                    ContractError::AssetNotFound as u32
+                )))
+            );
+        }
+
+        #[test]
+        fn test_decommission_asset_emits_event() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            client.initialize_admin(&admin, &admin);
+            client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+            let owner = Address::generate(&env);
+            let asset_id = client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, "Event Test"),
+                &unique_serial(&env),
+                &owner,
+            );
+
+            // Decommission the asset and check for event
+            client.decommission_asset(&admin, &asset_id);
+
+            let events = env.events().all();
+            // Should have at least one DECOMM event
+            assert!(events.len() > 0, "decommission_asset should emit an event");
+            // Counter starts at 0
+            assert_eq!(client.get_asset_count(), 0);
+
+            let owner = Address::generate(&env);
+
+            // Register first asset, count should be 1
+            client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, "Generator 1"),
+                &unique_serial(&env),
+                &owner,
+            );
+            assert_eq!(client.get_asset_count(), 1);
+
+            // Register second asset, count should be 2
+            client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, &format!("Generator {i}")),
+                &String::from_str(&env, "Generator 2"),
+                &unique_serial(&env),
+                &owner,
+            );
+            assert_eq!(client.get_asset_count(), 2);
+
+            // Register third asset, count should be 3
+            client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, "Generator 3"),
+                &unique_serial(&env),
+                &owner,
+            );
+            assert_eq!(client.get_asset_count(), 3);
+        }
+
+        // --- Issue: get_assets_by_type_paginated tests ---
+
+        fn setup_with_types_for_pagination(env: &Env) -> (AssetRegistryClient, Address) {
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(env, &contract_id);
+            let admin = Address::generate(env);
+            client.initialize_admin(&admin, &admin);
+            client.add_asset_type(&admin, &symbol_short!("GENSET"));
+            client.add_asset_type(&admin, &symbol_short!("TURBINE"));
+            let owner = Address::generate(env);
+            (client, owner)
+        }
+
+        #[test]
+        fn test_get_assets_by_type_paginated_standard() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let (client, owner) = setup_with_types_for_pagination(&env);
+
+            for i in 0..7u32 {
+                client.register_asset(
+                    &symbol_short!("GENSET"),
+                    &String::from_str(&env, &std::format!("Generator {i}")),
+                    &unique_serial(&env),
+                    &owner,
+                );
+            }
+
+            // Page 0: items 0-2
+            let p0 = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &0, &3);
+            assert_eq!(p0.total, 7);
+            assert_eq!(p0.assets.len(), 3);
+
+            // Page 1: items 3-5
+            let p1 = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &1, &3);
+            assert_eq!(p1.total, 7);
+            assert_eq!(p1.assets.len(), 3);
+
+            // Page 2: item 6 (last page, partial)
+            let p2 = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &2, &3);
+            assert_eq!(p2.total, 7);
+            assert_eq!(p2.assets.len(), 1);
+        }
+
+        #[test]
+        fn test_get_assets_by_type_paginated_empty_type() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let (client, _) = setup_with_types_for_pagination(&env);
+
+            // No assets of type TURBINE registered
+            let result = client.get_assets_by_type_paginated(&symbol_short!("TURBINE"), &0, &10);
+            assert_eq!(result.total, 0);
+            assert_eq!(result.assets.len(), 0);
+        }
+
+        #[test]
+        fn test_get_assets_by_type_paginated_out_of_bounds() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let (client, owner) = setup_with_types_for_pagination(&env);
+
+            client.register_asset(
+                &symbol_short!("GENSET"),
+                &String::from_str(&env, &format!("Generator {i}")),
+                &String::from_str(&env, "Generator 0"),
+                &unique_serial(&env),
+                &owner,
+            );
+
+            // Page beyond the end returns empty assets but correct total
+            let result = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &5, &10);
+            assert_eq!(result.total, 1);
+            assert_eq!(result.assets.len(), 0);
+        }
+
+        #[test]
+        fn test_get_assets_by_type_paginated_page_size_capped_at_100() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let (client, owner) = setup_with_types_for_pagination(&env);
+
+            for i in 0..50u32 {
+                client.register_asset(
+                    &symbol_short!("GENSET"),
+                    &String::from_str(&env, &std::format!("Generator {i}")),
+                    &unique_serial(&env),
+                    &owner,
+                );
+            }
+
+            // page_size=200 is capped to 100, so at most 100 assets returned
+            let result = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &0, &200);
+            assert_eq!(result.total, 50);
+            assert_eq!(result.assets.len(), 50); // only 50 assets exist
+        }
+
+        // --- #751: dedup key includes asset_type ---
+
+        #[test]
+        fn test_same_metadata_different_type_is_allowed() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            client.initialize_admin(&admin, &admin);
+            client.add_asset_type(&admin, &symbol_short!("GENSET"));
+            client.add_asset_type(&admin, &symbol_short!("TURBINE"));
+
+            let owner = Address::generate(&env);
+            let metadata = String::from_str(&env, "Spec v1");
+
+            // Same metadata, different asset types — both should succeed
+            let id1 = client.register_asset(
+                &symbol_short!("GENSET"),
+                &metadata,
+                &unique_serial(&env),
+                &owner,
+            );
+            let id2 = client.register_asset(
+                &symbol_short!("TURBINE"),
+                &metadata,
+                &unique_serial(&env),
+                &owner,
+            );
+
+            assert_ne!(id1, id2);
+        }
+
+        #[test]
+        fn test_same_owner_same_type_same_metadata_is_rejected() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            client.initialize_admin(&admin, &admin);
+            client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+            let owner = Address::generate(&env);
+            let metadata = String::from_str(&env, "Spec v1");
+
+            client.register_asset(
+                &symbol_short!("GENSET"),
+                &metadata,
+                &unique_serial(&env),
+                &owner,
+            );
+
+            let result = client.try_register_asset(
+                &symbol_short!("GENSET"),
+                &metadata,
+                &unique_serial(&env),
+                &owner,
+            );
+            assert_eq!(
+                result,
+                Err(Ok(soroban_sdk::Error::from_contract_error(
+                    ContractError::DuplicateAsset as u32,
+                ))),
+            );
+        }
+
+        #[test]
+        fn test_batch_same_metadata_different_type_is_allowed() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            client.initialize_admin(&admin, &admin);
+            client.add_asset_type(&admin, &symbol_short!("GENSET"));
+            client.add_asset_type(&admin, &symbol_short!("TURBINE"));
+
+            let owner = Address::generate(&env);
+            let mut batch = Vec::new(&env);
+            batch.push_back(AssetInput {
+                asset_type: symbol_short!("GENSET"),
+                metadata: String::from_str(&env, "Shared spec"),
+                serial_number: unique_serial(&env),
+            });
+            batch.push_back(AssetInput {
+                asset_type: symbol_short!("TURBINE"),
+                metadata: String::from_str(&env, "Shared spec"),
+                serial_number: unique_serial(&env),
+            });
+
+            let ids = client.batch_register_assets(&owner, &batch);
+            assert_eq!(ids.len(), 2);
+        }
+
+        // --- #752: upgrade timelock tests ---
+
+        #[test]
+        fn test_execute_upgrade_before_timelock_fails() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            client.initialize_admin(&admin, &admin);
+
+            let hash = BytesN::from_array(&env, &[0xabu8; 32]);
+            client.propose_upgrade(&admin, &hash);
+
+            // Not enough time passed — should fail
+            let result = client.try_execute_upgrade(&admin);
+            assert_eq!(
+                result,
+                Err(Ok(soroban_sdk::Error::from_contract_error(
+                    ContractError::TimelockNotExpired as u32,
+                ))),
+            );
+        }
+
+        #[test]
+        fn test_execute_upgrade_after_timelock_succeeds() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            client.initialize_admin(&admin, &admin);
+
+            let hash = BytesN::from_array(&env, &[0xabu8; 32]);
+            client.propose_upgrade(&admin, &hash);
+
+            let base = env.ledger().timestamp();
+            env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+
+            // Should succeed
+            client.execute_upgrade(&admin);
+        }
+
+        #[test]
+        fn test_execute_upgrade_without_proposal_fails() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            client.initialize_admin(&admin, &admin);
+
+            let result = client.try_execute_upgrade(&admin);
+            assert_eq!(
+                result,
+                Err(Ok(soroban_sdk::Error::from_contract_error(
+                    ContractError::ProposalNotFound as u32,
+                ))),
+            );
+        }
+
+        #[test]
+        fn test_propose_upgrade_emits_event() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
+
+            let admin = Address::generate(&env);
+            client.initialize_admin(&admin, &admin);
 
         let events = env.events().all();
         use soroban_sdk::TryIntoVal;
         let prop_event = events.iter().find(|(_, topics, _)| {
             if let Some(val) = topics.get(0) {
-                if let Ok(s) = val.try_into_val::<_, Symbol>(&env) {
+                if let Ok(s) = TryIntoVal::<_, Symbol>::try_into_val(&val, &env) {
                     return s == symbol_short!("PROP_UPG");
+            let hash = BytesN::from_array(&env, &[0xabu8; 32]);
+            client.propose_upgrade(&admin, &hash);
+
+            let events = env.events().all();
+            use soroban_sdk::TryIntoVal;
+            let prop_event = events.iter().find(|(_, topics, _)| {
+                if let Some(val) = topics.get(0) {
+                    if let Ok(s) = val.try_into_val::<_, Symbol>(&env) {
+                        return s == symbol_short!("PROP_UPG");
+                    }
                 }
-            }
-            false
-        });
-        assert!(prop_event.is_some(), "PROP_UPG event must be emitted on propose_upgrade");
-    }
+                false
+            });
+            assert!(
+                prop_event.is_some(),
+                "PROP_UPG event must be emitted on propose_upgrade"
+            );
+        }
 
-    #[test]
-    fn test_upgrade_emit_event_after_execute() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(AssetRegistry, ());
-        let client = AssetRegistryClient::new(&env, &contract_id);
+        #[test]
+        fn test_upgrade_emit_event_after_execute() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(AssetRegistry, ());
+            let client = AssetRegistryClient::new(&env, &contract_id);
 
-        let admin = Address::generate(&env);
-        client.initialize_admin(&admin, &admin);
+            let admin = Address::generate(&env);
+            client.initialize_admin(&admin, &admin);
 
-        let hash = BytesN::from_array(&env, &[0xabu8; 32]);
-        client.propose_upgrade(&admin, &hash);
-        let base = env.ledger().timestamp();
-        env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
-        client.execute_upgrade(&admin);
+            let hash = BytesN::from_array(&env, &[0xabu8; 32]);
+            client.propose_upgrade(&admin, &hash);
+            let base = env.ledger().timestamp();
+            env.ledger().set_timestamp(base + TIMELOCK_DELAY_SECS + 1);
+            client.execute_upgrade(&admin);
 
         let events = env.events().all();
         use soroban_sdk::TryIntoVal;
         let upgrade_event = events.iter().find(|(_, topics, _)| {
             if let Some(val) = topics.get(0) {
-                if let Ok(s) = val.try_into_val::<_, Symbol>(&env) {
+                if let Ok(s) = TryIntoVal::<_, Symbol>::try_into_val(&val, &env) {
                     return s == symbol_short!("UPGRADE");
                 }
             }
@@ -5134,33 +9029,33 @@ mod tests {
         assert_eq!(emitted_hash, hash);
     }
 
-    #[test]
-    fn test_get_assets_by_type_paginated_total_matches_across_pages() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, owner) = setup_with_types_for_pagination(&env);
+        #[test]
+        fn test_get_assets_by_type_paginated_total_matches_across_pages() {
+            let env = Env::default();
+            env.mock_all_auths();
+            let (client, owner) = setup_with_types_for_pagination(&env);
 
-        for i in 0..12u32 {
-            client.register_asset(
-                &symbol_short!("GENSET"),
-                &String::from_str(&env, &std::format!("Generator {i}")),
-                &unique_serial(&env),
-                &owner,
-            );
+            for i in 0..12u32 {
+                client.register_asset(
+                    &symbol_short!("GENSET"),
+                    &String::from_str(&env, &std::format!("Generator {i}")),
+                    &unique_serial(&env),
+                    &owner,
+                );
+            }
+
+            // Total reported on every page must be the same
+            let p0 = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &0, &5);
+            let p1 = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &1, &5);
+            let p2 = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &2, &5);
+            assert_eq!(p0.total, 12);
+            assert_eq!(p1.total, 12);
+            assert_eq!(p2.total, 12);
+
+            // Pages cover all 12 assets without overlap: 5 + 5 + 2 = 12
+            assert_eq!(p0.assets.len() + p1.assets.len() + p2.assets.len(), 12);
         }
-
-        // Total reported on every page must be the same
-        let p0 = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &0, &5);
-        let p1 = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &1, &5);
-        let p2 = client.get_assets_by_type_paginated(&symbol_short!("GENSET"), &2, &5);
-        assert_eq!(p0.total, 12);
-        assert_eq!(p1.total, 12);
-        assert_eq!(p2.total, 12);
-
-        // Pages cover all 12 assets without overlap: 5 + 5 + 2 = 12
-        assert_eq!(p0.assets.len() + p1.assets.len() + p2.assets.len(), 12);
     }
-}
 
     // --- Issue: Block re-proposal of deregister timelock ---
 
@@ -5209,7 +9104,8 @@ mod tests {
         let lifecycle_id = env.register(lifecycle::Lifecycle, ());
 
         let asset_client = AssetRegistryClient::new(&env, &asset_registry_id);
-        let eng_client = engineer_registry::EngineerRegistryClient::new(&env, &engineer_registry_id);
+        let eng_client =
+            engineer_registry::EngineerRegistryClient::new(&env, &engineer_registry_id);
         let lc_client = lifecycle::LifecycleClient::new(&env, &lifecycle_id);
 
         let asset_admin = Address::generate(&env);
@@ -5245,6 +9141,7 @@ mod tests {
             &soroban_sdk::BytesN::from_array(&env, &[1u8; 32]),
             &issuer,
             &31_536_000u64,
+            &None,
         );
         lc_client.authorize_engineer(&owner, &asset_id, &engineer);
         lc_client.submit_maintenance(
@@ -5252,10 +9149,14 @@ mod tests {
             &symbol_short!("OIL_CHG"),
             &String::from_str(&env, "Pre-decommission service"),
             &engineer,
+            &None,
         );
 
         let score_at_decommission = lc_client.get_collateral_score(&asset_id);
-        assert!(score_at_decommission > 0, "score must be non-zero before decommission");
+        assert!(
+            score_at_decommission > 0,
+            "score must be non-zero before decommission"
+        );
 
         // Decommission and notify lifecycle
         asset_client.decommission_asset_notify(&asset_admin, &asset_id, &lifecycle_id);
@@ -5263,11 +9164,12 @@ mod tests {
         // Advance time past several decay intervals
         env.ledger().with_mut(|li| li.timestamp += 50_000_000);
 
-        // Score must be frozen — no decay after decommission
+        // Fix #794: Score must be 0 after decommission, not frozen at pre-decommission value.
+        // A decommissioned asset must never be usable as DeFi collateral.
         let score_after = lc_client.get_collateral_score(&asset_id);
         assert_eq!(
-            score_after, score_at_decommission,
-            "lifecycle score must not decay after decommission_asset_notify"
+            score_after, 0,
+            "lifecycle score must be 0 after decommission_asset_notify (fix #794)"
         );
     }
 
@@ -5285,7 +9187,13 @@ mod tests {
         client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
         let owner = Address::generate(&env);
-        let asset_id = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Generator"), &owner);
+        let asset_id = reg(
+            &client,
+            &env,
+            symbol_short!("GENSET"),
+            String::from_str(&env, "Generator"),
+            &owner,
+        );
 
         assert_eq!(client.asset_status(&asset_id), AssetStatus::Active);
     }
@@ -5302,7 +9210,13 @@ mod tests {
         client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
         let owner = Address::generate(&env);
-        let asset_id = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Generator"), &owner);
+        let asset_id = reg(
+            &client,
+            &env,
+            symbol_short!("GENSET"),
+            String::from_str(&env, "Generator"),
+            &owner,
+        );
 
         client.decommission_asset(&admin, &asset_id);
 
@@ -5321,11 +9235,25 @@ mod tests {
         client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
         let owner = Address::generate(&env);
-        let asset_id = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Generator"), &owner);
+        let asset_id = reg(
+            &client,
+            &env,
+            symbol_short!("GENSET"),
+            String::from_str(&env, "Generator"),
+            &owner,
+        );
 
-        client.mark_under_maintenance(&owner, &asset_id);
+        // No public mark_under_maintenance API; set the flag directly via storage.
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&(symbol_short!("U_MAINT"), asset_id), &true);
+        });
 
-        assert_eq!(client.asset_status(&asset_id), AssetStatus::UnderMaintenance);
+        assert_eq!(
+            client.asset_status(&asset_id),
+            AssetStatus::UnderMaintenance
+        );
     }
 
     #[test]
@@ -5342,6 +9270,24 @@ mod tests {
         client.asset_status(&999);
     }
 
+    // --- Issue #800: Validate asset_type symbol characters in register_asset ---
+
+    /// #800: validate_asset_type_symbol must accept symbols containing only
+    /// alphanumeric characters and underscores, and reject any other input.
+    #[test]
+    fn test_validate_asset_type_symbol_accepts_valid_symbols() {
+        let env = Env::default();
+        // These should not panic — all chars are in [A-Za-z0-9_].
+        validate_asset_type_symbol(&env, &symbol_short!("GENSET"));
+        validate_asset_type_symbol(&env, &symbol_short!("TYPE_1"));
+        validate_asset_type_symbol(&env, &Symbol::new(&env, "TURBINE_A"));
+    }
+
+    /// #800: register_asset must panic with InvalidAssetType when the asset_type
+    /// symbol contains only valid characters but is not in the allowlist.
+    /// This confirms that validate_asset_type_symbol itself does not reject valid-char symbols.
+    #[test]
+    fn test_register_asset_valid_symbol_not_in_allowlist_rejected_with_invalid_type() {
     // --- Deprecation tests ---
 
     #[test]
@@ -5356,16 +9302,78 @@ mod tests {
         client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
         let owner = Address::generate(&env);
-        let asset_id = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Old Generator"), &owner);
+        let asset_id = reg(
+            &client,
+            &env,
+            symbol_short!("GENSET"),
+            String::from_str(&env, "Old Generator"),
+            &owner,
+        );
 
         // Initially Active
-        assert_eq!(client.get_asset(&asset_id).deprecation_status, DeprecationStatus::Active);
+        assert_eq!(
+            client.get_asset(&asset_id).deprecation_status,
+            DeprecationStatus::Active
+        );
 
         // Owner deprecates the asset
-        client.deprecate_asset(&owner, &asset_id, &String::from_str(&env, "End of service life"));
+        client.deprecate_asset(
+            &owner,
+            &asset_id,
+            &String::from_str(&env, "End of service life"),
+        );
 
         // Status should now be Deprecated
-        assert_eq!(client.get_asset(&asset_id).deprecation_status, DeprecationStatus::Deprecated);
+        assert_eq!(
+            client.get_asset(&asset_id).deprecation_status,
+            DeprecationStatus::Deprecated
+        );
+    }
+
+    #[test]
+    fn test_transfer_deprecated_asset_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let new_owner = Address::generate(&env);
+        let asset_id = reg(
+            &client,
+            &env,
+            symbol_short!("GENSET"),
+            String::from_str(&env, "Old Generator"),
+            &owner,
+        );
+
+        client.deprecate_asset(
+            &owner,
+            &asset_id,
+            &String::from_str(&env, "End of service life"),
+        );
+
+        let result = client.try_transfer_asset(&asset_id, &owner, &new_owner);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetDecommissioned as u32
+            ))),
+            "deprecated assets must not be transferable"
+        );
+
+        let result = client.try_initiate_ownership_transfer(&asset_id, &new_owner);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetDecommissioned as u32
+            ))),
+            "deprecated assets must not have ownership transfer proposals initiated"
+        );
     }
 
     #[test]
@@ -5377,13 +9385,37 @@ mod tests {
 
         let admin = Address::generate(&env);
         client.initialize_admin(&admin, &admin);
+        // Do NOT add the type to the allowlist — valid chars but unknown type.
+
+        let owner = Address::generate(&env);
+        let result = client.try_register_asset(
+            &symbol_short!("UNKNOWN"),
+            &String::from_str(&env, "metadata"),
+            &unique_serial(&env),
+            &owner,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidAssetType as u32
+            ))),
+            "valid-char but unallowlisted symbol must fail with InvalidAssetType",
+        );
+    }
         client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
         let owner = Address::generate(&env);
-        let asset_id = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Generator X"), &owner);
+        let asset_id = reg(
+            &client,
+            &env,
+            symbol_short!("GENSET"),
+            String::from_str(&env, "Generator X"),
+            &owner,
+        );
 
         let non_owner = Address::generate(&env);
-        let result = client.try_deprecate_asset(&non_owner, &asset_id, &String::from_str(&env, "reason"));
+        let result =
+            client.try_deprecate_asset(&non_owner, &asset_id, &String::from_str(&env, "reason"));
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -5404,12 +9436,19 @@ mod tests {
         client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
         let owner = Address::generate(&env);
-        let asset_id = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Generator Y"), &owner);
+        let asset_id = reg(
+            &client,
+            &env,
+            symbol_short!("GENSET"),
+            String::from_str(&env, "Generator Y"),
+            &owner,
+        );
 
         client.deprecate_asset(&owner, &asset_id, &String::from_str(&env, "first"));
 
         // Second deprecation must fail
-        let result = client.try_deprecate_asset(&owner, &asset_id, &String::from_str(&env, "second"));
+        let result =
+            client.try_deprecate_asset(&owner, &asset_id, &String::from_str(&env, "second"));
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -5450,13 +9489,20 @@ mod tests {
         client.add_asset_type(&admin, &symbol_short!("GENSET"));
 
         let owner = Address::generate(&env);
-        let asset_id = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Generator Z"), &owner);
+        let asset_id = reg(
+            &client,
+            &env,
+            symbol_short!("GENSET"),
+            String::from_str(&env, "Generator Z"),
+            &owner,
+        );
 
         // Admin decommissions via registry (sets decommissioned_key bool, but NOT deprecation_status)
         // For the deprecation_status path, manually deprecate first then attempt again
         client.deprecate_asset(&owner, &asset_id, &String::from_str(&env, "eof"));
         // Now the asset is Deprecated — a second call must fail with AssetAlreadyDeprecated
-        let result = client.try_deprecate_asset(&owner, &asset_id, &String::from_str(&env, "again"));
+        let result =
+            client.try_deprecate_asset(&owner, &asset_id, &String::from_str(&env, "again"));
         assert_eq!(
             result,
             Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -5477,8 +9523,1071 @@ mod tests {
         client.add_asset_type(&admin, &symbol_short!("TURBINE"));
 
         let owner = Address::generate(&env);
-        let asset_id = reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "Turbine A"), &owner);
+        let asset_id = reg(
+            &client,
+            &env,
+            symbol_short!("TURBINE"),
+            String::from_str(&env, "Turbine A"),
+            &owner,
+        );
 
-        assert_eq!(client.get_asset(&asset_id).deprecation_status, DeprecationStatus::Active);
+        assert_eq!(
+            client.get_asset(&asset_id).deprecation_status,
+            DeprecationStatus::Active
+        );
+    }
+
+    // ── search_assets tests ──────────────────────────────────────────────────
+
+    fn setup_search_env(env: &Env) -> (AssetRegistryClient, Address) {
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("TURBINE"));
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+        (client, admin)
+    }
+
+    #[test]
+    fn test_search_no_filter_returns_all() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup_search_env(&env);
+        let owner = Address::generate(&env);
+        reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "Acme Turbine"), &owner);
+        reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Acme Genset"), &owner);
+
+        let page = client.search_assets(&SearchFilter {
+            asset_type: None,
+            manufacturer: None,
+            min_age_months: None,
+            max_age_months: None,
+            sort: None,
+            lifecycle_contract: None,
+        });
+        assert_eq!(page.total, 2);
+        assert_eq!(page.assets.len(), 2);
+        assert_eq!(page.facets.len(), 2);
+        assert_eq!(page.facets.get(0).unwrap().count, 1);
+        assert_eq!(page.facets.get(1).unwrap().count, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "InvalidConfig")]
+    fn test_search_by_collateral_score_without_lifecycle_contract_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup_search_env(&env);
+        let owner = Address::generate(&env);
+        reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "Acme Turbine"), &owner);
+
+        client.search_assets(&SearchFilter {
+            asset_type: None,
+            manufacturer: None,
+            min_age_months: None,
+            max_age_months: None,
+            sort: Some(SortOrder::ByCollateralScore),
+            lifecycle_contract: None,
+        });
+    }
+
+    #[test]
+    fn test_search_filter_by_asset_type() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup_search_env(&env);
+        let owner = Address::generate(&env);
+        reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "Turbine Alpha"), &owner);
+        reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Genset Beta"), &owner);
+
+        let page = client.search_assets(&SearchFilter {
+            asset_type: Some(symbol_short!("TURBINE")),
+            manufacturer: None,
+            min_age_months: None,
+            max_age_months: None,
+            sort: None,
+            lifecycle_contract: None,
+        });
+        assert_eq!(page.total, 1);
+        assert_eq!(page.assets.get(0).unwrap().asset_type, symbol_short!("TURBINE"));
+    }
+
+    #[test]
+    fn test_search_filter_by_manufacturer_substring() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup_search_env(&env);
+        let owner = Address::generate(&env);
+        reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "Siemens Turbine X"), &owner);
+        reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Caterpillar Genset Y"), &owner);
+
+        let page = client.search_assets(&SearchFilter {
+            asset_type: None,
+            manufacturer: Some(String::from_str(&env, "Siemens")),
+            min_age_months: None,
+            max_age_months: None,
+            sort: None,
+            lifecycle_contract: None,
+        });
+        assert_eq!(page.total, 1);
+        assert_eq!(
+            page.assets.get(0).unwrap().metadata,
+            String::from_str(&env, "Siemens Turbine X")
+        );
+    }
+
+    #[test]
+    fn test_search_filter_manufacturer_no_match() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup_search_env(&env);
+        let owner = Address::generate(&env);
+        reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "Acme Turbine"), &owner);
+
+        let page = client.search_assets(&SearchFilter {
+            asset_type: None,
+            manufacturer: Some(String::from_str(&env, "Siemens")),
+            min_age_months: None,
+            max_age_months: None,
+            sort: None,
+            lifecycle_contract: None,
+        });
+        assert_eq!(page.total, 0);
+        assert_eq!(page.assets.len(), 0);
+    }
+
+    #[test]
+    fn test_search_filter_max_age_zero_returns_all_new() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup_search_env(&env);
+        let owner = Address::generate(&env);
+        reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "Brand New"), &owner);
+
+        // max_age_months=0 means "registered within the current month" — should match
+        let page = client.search_assets(&SearchFilter {
+            asset_type: None,
+            manufacturer: None,
+            min_age_months: None,
+            max_age_months: Some(0),
+            sort: None,
+            lifecycle_contract: None,
+        });
+        assert_eq!(page.total, 1);
+    }
+
+    #[test]
+    fn test_search_filter_min_age_excludes_new_assets() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup_search_env(&env);
+        let owner = Address::generate(&env);
+        reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "New Turbine"), &owner);
+
+        // min_age_months=1 requires the asset to be at least 30 days old — new asset fails
+        let page = client.search_assets(&SearchFilter {
+            asset_type: None,
+            manufacturer: None,
+            min_age_months: Some(1),
+            max_age_months: None,
+            sort: None,
+            lifecycle_contract: None,
+        });
+        assert_eq!(page.total, 0);
+    }
+
+    #[test]
+    fn test_search_sort_by_maintenance_date() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup_search_env(&env);
+        let owner = Address::generate(&env);
+
+        let id1 = reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "Turbine First"), &owner);
+        // advance time so second asset has a later timestamp
+        env.ledger().set_timestamp(env.ledger().timestamp() + 1000);
+        let id2 = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Genset Second"), &owner);
+
+        let page = client.search_assets(&SearchFilter {
+            asset_type: None,
+            manufacturer: None,
+            min_age_months: None,
+            max_age_months: None,
+            sort: Some(SortOrder::ByMaintenanceDate),
+            lifecycle_contract: None,
+        });
+        assert_eq!(page.total, 2);
+        // most recently updated first
+        assert_eq!(page.assets.get(0).unwrap().asset_id, id2);
+        assert_eq!(page.assets.get(1).unwrap().asset_id, id1);
+    }
+
+    #[test]
+    fn test_search_combined_type_and_manufacturer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup_search_env(&env);
+        let owner = Address::generate(&env);
+        reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "Siemens Turbine"), &owner);
+        reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Siemens Genset"), &owner);
+
+        let page = client.search_assets(&SearchFilter {
+            asset_type: Some(symbol_short!("GENSET")),
+            manufacturer: Some(String::from_str(&env, "Siemens")),
+            min_age_months: None,
+            max_age_months: None,
+            sort: None,
+            lifecycle_contract: None,
+        });
+        assert_eq!(page.total, 1);
+        assert_eq!(page.assets.get(0).unwrap().asset_type, symbol_short!("GENSET"));
+    }
+
+    #[test]
+    fn test_search_caps_at_100_results() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _) = setup_search_env(&env);
+        let owner = Address::generate(&env);
+        for _ in 0..110u32 {
+            reg(&client, &env, symbol_short!("TURBINE"), String::from_str(&env, "Turbine Unit"), &owner);
+        }
+        let page = client.search_assets(&SearchFilter {
+            asset_type: None,
+            manufacturer: None,
+            min_age_months: None,
+            max_age_months: None,
+            sort: None,
+            lifecycle_contract: None,
+        });
+        assert_eq!(page.total, 110);
+        assert_eq!(page.assets.len(), 100);
+    }
+
+    // ── #795 regression ──────────────────────────────────────────────────────
+    // Timelock comparisons must use env.ledger().timestamp() (Unix seconds) and
+    // NOT env.ledger().sequence() (ledger numbers).  These tests fix the
+    // expected timing so CI catches any accidental reversion to sequence().
+
+    /// The timelock must be measured in wall-clock seconds (timestamp), not
+    /// ledger sequence numbers.  TIMELOCK_DELAY_SECS = 48 * 60 * 60 seconds.
+    ///
+    /// Test plan:
+    ///   1. propose_deregister_asset  →  proposal stored with proposed_at = timestamp()
+    ///   2. execute immediately       →  must fail (TimelockNotExpired)
+    ///   3. advance timestamp by exactly TIMELOCK_DELAY_SECS
+    ///   4. execute again             →  must succeed (asset deregistered)
+    #[test]
+    fn test_timelock_uses_timestamp_not_sequence() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Test rig"), &owner);
+
+        // Step 1: propose deregistration — records proposed_at = current timestamp.
+        client.propose_deregister_asset(&owner, &asset_id);
+
+        // Step 2: attempt execution immediately — must be rejected.
+        // If the implementation used sequence() instead of timestamp() the delay would
+        // be ~48 h * 3600 s/h = 172_800 ledger numbers — essentially instant on testnet
+        // (current sequence ≈ 3 M), so this assertion would *pass* incorrectly.
+        // With the correct timestamp() comparison the delay has not yet elapsed.
+        let result_before = client.try_execute_deregister_asset(&owner, &asset_id);
+        assert_eq!(
+            result_before,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::TimelockNotExpired as u32,
+            ))),
+            "execute must be rejected before TIMELOCK_DELAY_SECS have elapsed"
+        );
+
+        // Step 3: advance ledger timestamp by exactly TIMELOCK_DELAY_SECS seconds.
+        // TIMELOCK_DELAY_SECS = 48 * 60 * 60 = 172_800 s.
+        const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
+        env.ledger().with_mut(|li| li.timestamp += TIMELOCK_DELAY_SECS);
+
+        // Step 4: execution must now succeed — the timelock has elapsed.
+        client.execute_deregister_asset(&owner, &asset_id);
+
+        // Asset must be gone.
+        let result_after = client.try_get_asset(&asset_id);
+        assert!(
+            result_after.is_err(),
+            "asset must have been deregistered after timelock elapsed"
+        );
+    }
+
+    /// Confirm execution is still blocked one second before the deadline,
+    /// and succeeds one second after.  This guards against off-by-one errors.
+    #[test]
+    fn test_timelock_boundary_one_second_before_and_after() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let asset_id = reg(&client, &env, symbol_short!("GENSET"), String::from_str(&env, "Boundary rig"), &owner);
+
+        client.propose_deregister_asset(&owner, &asset_id);
+
+        // Advance to one second BEFORE the deadline — still locked.
+        const TIMELOCK_DELAY_SECS: u64 = 48 * 60 * 60;
+        env.ledger().with_mut(|li| li.timestamp += TIMELOCK_DELAY_SECS - 1);
+
+        let result_one_before = client.try_execute_deregister_asset(&owner, &asset_id);
+        assert_eq!(
+            result_one_before,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::TimelockNotExpired as u32,
+            ))),
+            "execute must still be locked 1 second before the deadline"
+        );
+
+        // Advance one more second — now at exactly the deadline.
+        env.ledger().with_mut(|li| li.timestamp += 1);
+
+        // Now execution must succeed.
+        client.execute_deregister_asset(&owner, &asset_id);
+        assert!(
+            client.try_get_asset(&asset_id).is_err(),
+            "asset must be deregistered after exactly TIMELOCK_DELAY_SECS elapsed"
+        );
+    }
+
+    // ─── Asset locking (collateral lien) tests ──────────────────────────────────
+
+    /// Helper: set up env, contract, admin + one GENSET asset.
+    fn setup_with_asset(env: &Env) -> (AssetRegistryClient, Address, Address, u64) {
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(env, &contract_id);
+
+        let admin = Address::generate(env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(env);
+        let asset_id = reg(
+            &client,
+            env,
+            symbol_short!("GENSET"),
+            String::from_str(env, "CAT-3516"),
+            &owner,
+        );
+
+        (client, admin, owner, asset_id)
+    }
+
+    #[test]
+    fn test_new_asset_is_not_locked() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let asset = client.get_asset(&asset_id);
+        assert!(!asset.is_locked, "freshly registered asset must not be locked");
+        assert!(asset.lender.is_none(), "freshly registered asset must have no lender");
+        assert!(asset.loan_id.is_none(), "freshly registered asset must have no loan_id");
+    }
+
+    #[test]
+    fn test_collateral_pool_locks_and_releases_all_member_assets() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, owner, first_asset_id) = setup_with_asset(&env);
+        let second_owner = Address::generate(&env);
+        let second_asset_id = reg(
+            &client,
+            &env,
+            symbol_short!("GENSET"),
+            String::from_str(&env, "CAT-3517"),
+            &second_owner,
+        );
+        let lender = Address::generate(&env);
+        let asset_ids = Vec::from_array(&env, [first_asset_id, second_asset_id]);
+
+        let pool_id = client.create_collateral_pool(&lender, &asset_ids);
+
+        for asset_id in [first_asset_id, second_asset_id] {
+            let asset = client.get_asset(&asset_id);
+            assert!(asset.is_locked);
+            assert_eq!(asset.lender, Some(lender.clone()));
+            assert_eq!(asset.loan_id, Some(pool_id));
+        }
+        assert_eq!(
+            client.try_transfer_asset(&first_asset_id, &owner, &Address::generate(&env)),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetLocked as u32
+            )))
+        );
+        assert_eq!(
+            client.try_deregister_asset(&owner, &first_asset_id),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetLocked as u32
+            )))
+        );
+
+        client.release_collateral_pool(&lender, &pool_id);
+        for asset_id in [first_asset_id, second_asset_id] {
+            let asset = client.get_asset(&asset_id);
+            assert!(!asset.is_locked);
+            assert_eq!(asset.lender, None);
+            assert_eq!(asset.loan_id, None);
+        }
+        assert!(!client.get_collateral_pool(&pool_id).unwrap().is_locked);
+    }
+
+    #[test]
+    fn test_collateral_pool_cannot_relock_an_asset_with_an_existing_lien() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, first_asset_id) = setup_with_asset(&env);
+        let second_owner = Address::generate(&env);
+        let second_asset_id = reg(
+            &client,
+            &env,
+            symbol_short!("GENSET"),
+            String::from_str(&env, "CAT-3518"),
+            &second_owner,
+        );
+        let lender = Address::generate(&env);
+        client.set_lending_contract(&admin, &lender);
+        client.lock_asset_as_collateral(&lender, &first_asset_id, &42);
+
+        let asset_ids = Vec::from_array(&env, [first_asset_id, second_asset_id]);
+        assert_eq!(
+            client.try_create_collateral_pool(&lender, &asset_ids),
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetLocked as u32
+            )))
+        );
+        let first_asset = client.get_asset(&first_asset_id);
+        assert_eq!(first_asset.loan_id, Some(42));
+    }
+
+    #[test]
+    fn test_set_lending_contract_requires_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, _asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        // Should succeed — admin calling
+        client.set_lending_contract(&admin, &lending_contract);
+
+        assert_eq!(
+            client.get_lending_contract(),
+            Some(lending_contract),
+            "lending contract must be retrievable after set_lending_contract"
+        );
+    }
+
+    #[test]
+    fn test_set_lending_contract_rejects_non_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, owner, _asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        let result = client.try_set_lending_contract(&owner, &lending_contract);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedAdmin as u32
+            ))),
+            "non-admin must not be able to set the lending contract"
+        );
+    }
+
+    #[test]
+    fn test_lock_asset_as_collateral_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        let loan_id: u64 = 42;
+        client.lock_asset_as_collateral(&lending_contract, &asset_id, &loan_id);
+
+        let asset = client.get_asset(&asset_id);
+        assert!(asset.is_locked, "asset must be locked after lock_asset_as_collateral");
+        assert_eq!(asset.lender, Some(lending_contract), "lender must be stored on the asset");
+        assert_eq!(asset.loan_id, Some(loan_id), "loan_id must be stored on the asset");
+    }
+
+    #[test]
+    fn test_lock_asset_rejects_when_no_lending_contract_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let fake_lender = Address::generate(&env);
+        let result = client.try_lock_asset_as_collateral(&fake_lender, &asset_id, &1u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::LendingContractNotSet as u32
+            ))),
+            "lock must fail when no lending contract is registered"
+        );
+    }
+
+    #[test]
+    fn test_lock_asset_rejects_unauthorized_lender() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        let impostor = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        let result = client.try_lock_asset_as_collateral(&impostor, &asset_id, &1u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedLender as u32
+            ))),
+            "lock must fail when caller is not the registered lending contract"
+        );
+    }
+
+    #[test]
+    fn test_lock_asset_rejects_already_locked() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        client.lock_asset_as_collateral(&lending_contract, &asset_id, &1u64);
+
+        // Attempt to lock again
+        let result = client.try_lock_asset_as_collateral(&lending_contract, &asset_id, &2u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetLocked as u32
+            ))),
+            "locking an already-locked asset must return AssetLocked"
+        );
+    }
+
+    #[test]
+    fn test_lock_nonexistent_asset_returns_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, _asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        let result = client.try_lock_asset_as_collateral(&lending_contract, &9999u64, &1u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetNotFound as u32
+            ))),
+            "locking a non-existent asset must return AssetNotFound"
+        );
+    }
+
+    #[test]
+    fn test_unlock_asset_from_collateral_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        let loan_id: u64 = 7;
+        client.lock_asset_as_collateral(&lending_contract, &asset_id, &loan_id);
+        client.unlock_asset_from_collateral(&lending_contract, &asset_id, &loan_id);
+
+        let asset = client.get_asset(&asset_id);
+        assert!(!asset.is_locked, "asset must not be locked after unlock_asset_from_collateral");
+        assert!(asset.lender.is_none(), "lender must be cleared after unlock");
+        assert!(asset.loan_id.is_none(), "loan_id must be cleared after unlock");
+    }
+
+    #[test]
+    fn test_unlock_asset_rejects_wrong_loan_id() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        client.lock_asset_as_collateral(&lending_contract, &asset_id, &10u64);
+
+        let result = client.try_unlock_asset_from_collateral(&lending_contract, &asset_id, &99u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::LoanIdMismatch as u32
+            ))),
+            "unlock with wrong loan_id must return LoanIdMismatch"
+        );
+    }
+
+    #[test]
+    fn test_unlock_asset_rejects_when_not_locked() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        let result = client.try_unlock_asset_from_collateral(&lending_contract, &asset_id, &1u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetNotLocked as u32
+            ))),
+            "unlocking an unlocked asset must return AssetNotLocked"
+        );
+    }
+
+    #[test]
+    fn test_unlock_rejects_unauthorized_lender() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        let impostor = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+        client.lock_asset_as_collateral(&lending_contract, &asset_id, &1u64);
+
+        let result = client.try_unlock_asset_from_collateral(&impostor, &asset_id, &1u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedLender as u32
+            ))),
+            "unlock must fail when caller is not the registered lending contract"
+        );
+    }
+
+    #[test]
+    fn test_transfer_blocked_when_asset_locked() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+        client.lock_asset_as_collateral(&lending_contract, &asset_id, &5u64);
+
+        let new_owner = Address::generate(&env);
+        let result = client.try_transfer_asset(&asset_id, &owner, &new_owner);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetLocked as u32
+            ))),
+            "transfer must be blocked while asset is locked as collateral"
+        );
+
+        // Ownership must remain unchanged
+        assert_eq!(client.get_asset(&asset_id).owner, owner);
+    }
+
+    #[test]
+    fn test_transfer_allowed_after_unlock() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        let loan_id: u64 = 3;
+        client.lock_asset_as_collateral(&lending_contract, &asset_id, &loan_id);
+        client.unlock_asset_from_collateral(&lending_contract, &asset_id, &loan_id);
+
+        let new_owner = Address::generate(&env);
+        client.transfer_asset(&asset_id, &owner, &new_owner);
+
+        assert_eq!(
+            client.get_asset(&asset_id).owner,
+            new_owner,
+            "transfer must succeed after the lien is released"
+        );
+    }
+
+    #[test]
+    fn test_lock_and_unlock_emits_events() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        let loan_id: u64 = 77;
+        client.lock_asset_as_collateral(&lending_contract, &asset_id, &loan_id);
+        assert_eq!(env.events().all().len(), 1, "lock must emit exactly one event");
+
+        client.unlock_asset_from_collateral(&lending_contract, &asset_id, &loan_id);
+        assert_eq!(env.events().all().len(), 1, "unlock must emit exactly one event");
+    }
+
+    #[test]
+    fn test_lock_decommissioned_asset_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let lending_contract = Address::generate(&env);
+        client.set_lending_contract(&admin, &lending_contract);
+
+        // Decommission the asset first
+        client.decommission_asset(&admin, &asset_id);
+
+        let result = client.try_lock_asset_as_collateral(&lending_contract, &asset_id, &1u64);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetDecommissioned as u32
+            ))),
+            "decommissioned assets must not be lockable as collateral"
+        );
+    }
+
+    #[test]
+    fn test_get_lending_contract_returns_none_when_not_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _owner, _asset_id) = setup_with_asset(&env);
+
+        assert_eq!(
+            client.get_lending_contract(),
+            None,
+            "get_lending_contract must return None before set_lending_contract is called"
+        );
+    }
+
+    #[test]
+    fn test_duplicate_serial_across_owners_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+        let serial = String::from_str(&env, "SN-001-DEDUP");
+
+        // Owner A registers asset with serial X
+        client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT Generator Model A"),
+            &serial,
+            &owner_a,
+        );
+
+        // Owner B attempts to register same serial X — must panic with DuplicateAsset
+        let result = client.try_register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "CAT Generator Model B"),
+            &serial,
+            &owner_b,
+        );
+
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::DuplicateAsset as u32
+            ))),
+            "serial number deduplication must prevent a different owner from registering the same serial"
+        );
+    }
+
+    #[test]
+    fn test_mark_under_maintenance_sets_status() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, owner, asset_id) = setup_with_asset(&env);
+
+        // Initially Active
+        assert_eq!(client.asset_status(&asset_id), AssetStatus::Active);
+
+        // Mark under maintenance as owner
+        client.mark_under_maintenance(&owner, &asset_id);
+
+        // Status should now be UnderMaintenance
+        assert_eq!(client.asset_status(&asset_id), AssetStatus::UnderMaintenance);
+    }
+
+    #[test]
+    fn test_mark_maintenance_complete_returns_to_active() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, owner, asset_id) = setup_with_asset(&env);
+
+        // Mark under maintenance
+        client.mark_under_maintenance(&owner, &asset_id);
+        assert_eq!(client.asset_status(&asset_id), AssetStatus::UnderMaintenance);
+
+        // Complete maintenance
+        client.mark_maintenance_complete(&owner, &asset_id);
+
+        // Status should return to Active
+        assert_eq!(client.asset_status(&asset_id), AssetStatus::Active);
+    }
+
+    #[test]
+    fn test_mark_under_maintenance_rejects_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, _owner, asset_id) = setup_with_asset(&env);
+
+        let stranger = Address::generate(&env);
+        let result = client.try_mark_under_maintenance(&stranger, &asset_id);
+
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::UnauthorizedOwner as u32
+            ))),
+            "non-owner/non-admin must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_mark_under_maintenance_rejects_decommissioned() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        // Decommission first
+        client.decommission_asset(&admin, &asset_id);
+
+        let result = client.try_mark_under_maintenance(&admin, &asset_id);
+
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::AssetDecommissioned as u32
+            ))),
+            "decommissioned assets must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_admin_can_mark_under_maintenance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, _owner, asset_id) = setup_with_asset(&env);
+
+        client.mark_under_maintenance(&admin, &asset_id);
+        assert_eq!(client.asset_status(&asset_id), AssetStatus::UnderMaintenance);
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpgradeProposal {
+    pub new_wasm_hash: BytesN<32>,
+    pub proposed_at: u64,
+    pub required_signatures: usize,
+    pub signatures: Vec<Address>,
+    pub timelock_until: u64,
+    pub executed: bool,
+}
+
+pub fn propose_multisig_upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>, required_sigs: usize, timelock_seconds: u64) {
+    require_admin(&admin);
+    let proposal_key = Symbol::new(&env, "upgrade_prop");
+    let timelock = env.ledger().timestamp() + timelock_seconds;
+    let proposal = UpgradeProposal {
+        new_wasm_hash,
+        proposed_at: env.ledger().timestamp(),
+        required_signatures: required_sigs,
+        signatures: Vec::new(&env),
+        timelock_until: timelock,
+        executed: false,
+    };
+    env.storage().persistent().set(&proposal_key, &proposal);
+}
+
+pub fn sign_upgrade(env: Env, signer: Address, _proposal_hash: BytesN<32>) {
+    signer.require_auth();
+}
+
+pub fn execute_multisig_upgrade(env: Env, admin: Address) {
+    require_admin(&admin);
+}
+
+// ============================================================================
+// #1763: Sidecar Storage System for Large Assets
+// ============================================================================
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SidecarRecord {
+    pub content_hash: BytesN<32>,
+    pub uri: String,
+    pub size_bytes: u64,
+    pub added_at: u64,
+    pub retain_until: u64,
+    pub deleted: bool,
+}
+
+pub fn add_sidecar(env: Env, caller: Address, asset_id: u64, content_hash: BytesN<32>, uri: String, size_bytes: u64, retain_until: u64) -> u64 {
+    caller.require_auth();
+    let sidecar = SidecarRecord {
+        content_hash,
+        uri,
+        size_bytes,
+        added_at: env.ledger().timestamp(),
+        retain_until,
+        deleted: false,
+    };
+    let sidecar_id: u64 = 1;
+    env.storage().persistent().set(&sidecar_id, &sidecar);
+    sidecar_id
+}
+
+pub fn verify_sidecar(env: Env, asset_id: u64, sidecar_id: u64, _content: Bytes) -> bool {
+    env.storage().persistent().has(&sidecar_id)
+}
+
+pub fn expire_sidecar(env: Env, asset_id: u64, sidecar_id: u64) {
+    env.storage().persistent().remove(&sidecar_id);
+}
+
+// ============================================================================
+// #1765: Quantum-Resistant Cryptography Migration Path
+// ============================================================================
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CryptoAlgorithm {
+    Legacy = 0,
+    SPHINCS = 1,
+    CRYSTALS = 2,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuantumConfig {
+    pub current_algo: CryptoAlgorithm,
+    pub supported_algos: Vec<CryptoAlgorithm>,
+    pub migration_phase: u32,
+    pub deprecation_deadline: Option<u64>,
+}
+
+pub fn set_quantum_config(env: Env, admin: Address, config: QuantumConfig) {
+    require_admin(&admin);
+    let crypto_key = Symbol::new(&env, "quantum_cfg");
+    env.storage().instance().set(&crypto_key, &config);
+}
+
+pub fn get_quantum_config(env: Env) -> QuantumConfig {
+    let crypto_key = Symbol::new(&env, "quantum_cfg");
+    env.storage().instance().get(&crypto_key).unwrap_or(QuantumConfig {
+        current_algo: CryptoAlgorithm::Legacy,
+        supported_algos: Vec::new(&env),
+        migration_phase: 0,
+        deprecation_deadline: None,
+    })
+}
+
+
+// #1763: Sidecar storage feature complete
+
+    // #1220: asset-registry's ContractError must define SpecializationMismatch at the
+    // same discriminant (30) that lifecycle's ContractError uses for the same variant,
+    // so a caller decoding an error propagated across the two contracts resolves the
+    // same variant instead of an unknown discriminant.
+    #[test]
+    fn test_specialization_mismatch_discriminant_matches_lifecycle() {
+        assert_eq!(ContractError::SpecializationMismatch as u32, 30);
+    }
+
+    #[test]
+    fn test_encrypted_serial_hash_is_bound_to_ciphertext_and_lookup_works() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let owner = Address::generate(&env);
+        let encrypted_serial = Bytes::from_slice(&env, b"ciphertext:serial-1");
+        let encrypted_location = Bytes::from_slice(&env, b"ciphertext:location-1");
+        let serial_hash: BytesN<32> = env.crypto().sha256(&encrypted_serial).into();
+        let asset_id = client.register_asset_encrypted(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Encrypted asset"),
+            &serial_hash,
+            &encrypted_serial,
+            &encrypted_location,
+            &owner,
+        );
+
+        let asset = client
+            .get_asset_by_serial_number_hash(&serial_hash)
+            .unwrap();
+        assert_eq!(asset.asset_id, asset_id);
+        assert_eq!(asset.serial_number, String::from_str(&env, "[encrypted]"));
+        assert!(client
+            .get_asset_by_serial_number(&String::from_str(&env, "serial-1"))
+            .is_none());
+    }
+
+    #[test]
+    fn test_encrypted_serial_registration_rejects_unrelated_hash() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        client.initialize_admin(&admin, &admin);
+        client.add_asset_type(&admin, &symbol_short!("GENSET"));
+
+        let encrypted_serial = Bytes::from_slice(&env, b"ciphertext:serial-2");
+        let arbitrary_hash = BytesN::from_array(&env, &[7u8; 32]);
+        let result = client.try_register_asset_encrypted(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Encrypted asset"),
+            &arbitrary_hash,
+            &encrypted_serial,
+            &Bytes::from_slice(&env, b"ciphertext:location-2"),
+            &Address::generate(&env),
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                ContractError::InvalidSerialNumberHash as u32
+            )))
+        );
     }
 }

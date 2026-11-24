@@ -1,7 +1,7 @@
 #![no_std]
 
 use crate::errors::ContractError;
-use crate::types::{Config, MaintenanceRecord, ScoreEntry};
+use crate::types::{Config, DataKey, MaintenanceRecord, ScoreEntry};
 use soroban_sdk::{panic_with_error, symbol_short, Env, Symbol, Vec};
 
 pub fn score_history_push(env: &Env, asset_id: u64, entry: ScoreEntry, max_history: u32) {
@@ -17,34 +17,62 @@ pub fn score_history_push(env: &Env, asset_id: u64, entry: ScoreEntry, max_histo
     // inflating history length and skewing trend analysis.
     let last_idx = history.len().saturating_sub(1);
     if !history.is_empty() {
-        let last = history.get(last_idx).unwrap();
+        let last = history.get(last_idx).unwrap_or_else(|| panic_with_error!(env, ContractError::IndexOutOfBounds));
         if last.timestamp == entry.timestamp {
             history.set(last_idx, entry);
             env.storage().persistent().set(&key, &history);
-            env.storage()
-                .persistent()
-                .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
+            shared::extend_persistent_ttl(&env, &key);
             return;
         }
     }
 
-    if max_history > 0 && history.len() >= max_history {
-        history.remove(0);
-    }
     history.push_back(entry);
     env.storage().persistent().set(&key, &history);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, super::TTL_THRESHOLD, super::TTL_TARGET);
+    shared::extend_persistent_ttl(&env, &key);
 }
 
-pub fn get_task_weight(env: &Env, task_type: &Symbol, config: &Config) -> u32 {
+pub fn valuation_history_push(env: &Env, asset_id: u64, timestamp: u64, value: u64, max_history: u32) {
+    let key = DataKey::CollateralValuationHistory(asset_id);
+    let mut history: Vec<(u64, u64)> = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| Vec::new(env));
+
+    let last_idx = history.len().saturating_sub(1);
+    if !history.is_empty() {
+        let last = history.get(last_idx).unwrap_or_else(|| panic_with_error!(env, ContractError::IndexOutOfBounds));
+        if last.0 == timestamp {
+            history.set(last_idx, (timestamp, value));
+            env.storage().persistent().set(&key, &history);
+            shared::extend_persistent_ttl(&env, &key);
+            return;
+        }
+    }
+
+    // Treat max_history == 0 as "use contract default" so callers that pass
+    // zero (e.g. during initialisation before config is set) never leave the
+    // history vector unbounded.  Fixes #1198.
+    let effective_max = if max_history == 0 {
+        super::DEFAULT_MAX_HISTORY
+    } else {
+        max_history
+    };
+    if history.len() >= effective_max {
+        history.remove(0);
+    }
+    history.push_back((timestamp, value));
+    env.storage().persistent().set(&key, &history);
+    shared::extend_persistent_ttl(&env, &key);
+}
+
+pub fn get_task_weight(_env: &Env, task_type: &Symbol, config: &Config) -> u32 {
     // First check if task type has a configured weight
     if let Some(weight) = config.task_weights.get(task_type.clone()) {
         return weight;
     }
 
-    // Fall back to default hardcoded weights
+    // Fall back to hardcoded built-in weights
     if task_type == &symbol_short!("OIL_CHG")
         || task_type == &symbol_short!("LUBE")
         || task_type == &symbol_short!("INSPECT")
@@ -61,9 +89,18 @@ pub fn get_task_weight(env: &Env, task_type: &Symbol, config: &Config) -> u32 {
         || task_type == &symbol_short!("OVERHAUL")
         || task_type == &symbol_short!("REBUILD")
     {
-        return 10;
+        return super::MAX_BUILT_IN_TASK_WEIGHT;
     }
-    panic_with_error!(env, ContractError::InvalidTaskType);
+
+    // Unknown task type: return the configurable default weight instead of
+    // panicking. A zero value in `config.default_task_weight` means "use the
+    // contract-level constant", so operators never accidentally configure a
+    // silent no-op weight (see issue #1200).
+    if config.default_task_weight > 0 {
+        config.default_task_weight
+    } else {
+        super::DEFAULT_TASK_WEIGHT
+    }
 }
 
 pub fn compute_decay(env: &Env, asset_id: u64) -> u32 {
@@ -87,7 +124,26 @@ pub fn compute_decay(env: &Env, asset_id: u64) -> u32 {
     let current_ledger = current_time_seconds / 5;
     let mut total_score: u32 = 0;
 
+    // Load duplicate record timestamps for this asset and skip them during scoring
+    let duplicates: Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::DuplicateRecords(asset_id))
+        .unwrap_or_else(|| Vec::new(env));
+
     for record in history.iter() {
+        // Skip records marked as duplicates
+        let mut is_duplicate = false;
+        for d in 0..duplicates.len() {
+            if duplicates.get(d).unwrap_or_else(|| panic_with_error!(env, ContractError::IndexOutOfBounds)) == record.timestamp {
+                is_duplicate = true;
+                break;
+            }
+        }
+        if is_duplicate {
+            continue;
+        }
+
         let record_ledger = record.timestamp / 5;
         let age_ledgers = current_ledger.saturating_sub(record_ledger);
         let recency_weight = if age_ledgers >= super::MAX_AGE_LEDGERS {
@@ -97,11 +153,20 @@ pub fn compute_decay(env: &Env, asset_id: u64) -> u32 {
         };
         let base_score = config.score_increment as u64;
         let contribution = (base_score * recency_weight) / super::MAX_AGE_LEDGERS;
+
+        // The externally visible score is capped, so stop before adding a
+        // contribution that reaches or crosses the cap. Besides avoiding work
+        // over the remainder of a large history, this guarantees the summation
+        // cannot overflow even when score_increment is configured near u32::MAX.
+        if contribution >= (super::MAX_COLLATERAL_SCORE - total_score) as u64 {
+            return super::MAX_COLLATERAL_SCORE;
+        }
+
         total_score = total_score
             .checked_add(contribution as u32)
             .unwrap_or_else(|| panic_with_error!(env, ContractError::ScoreOverflow));
     }
-    total_score.min(100)
+    total_score
 }
 
 pub fn apply_decay(
@@ -118,14 +183,33 @@ pub fn apply_decay(
         .unwrap_or(0u32);
 
     if current_score == 0 {
-        if env.storage().persistent().has(&super::last_update_key(asset_id)) {
+        // Even if the stored score is already 0, apply the floor: if the asset has
+        // maintenance history it must score at least MIN_SCORE_WITH_HISTORY.
+        let zero_has_history = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<MaintenanceRecord>>(&super::history_key(asset_id))
+            .map(|h: Vec<MaintenanceRecord>| !h.is_empty())
+            .unwrap_or(false);
+        if zero_has_history {
+            let floor = super::MIN_SCORE_WITH_HISTORY;
+            env.storage()
+                .persistent()
+                .set(&super::score_key(asset_id), &floor);
             env.storage().persistent().extend_ttl(
-                &super::last_update_key(asset_id),
+                &super::score_key(asset_id),
                 super::TTL_THRESHOLD,
                 super::TTL_TARGET,
             );
         }
-        return 0;
+        if env.storage().persistent().has(&super::last_update_key(asset_id)) {
+            shared::extend_persistent_ttl(&env, &super::last_update_key(asset_id));
+        }
+        return if zero_has_history {
+            super::MIN_SCORE_WITH_HISTORY
+        } else {
+            0
+        };
     }
 
     let last_update: u64 = env
@@ -144,32 +228,38 @@ pub fn apply_decay(
     let time_elapsed = current_time.saturating_sub(last_update);
     let decay_intervals = time_elapsed / config.decay_interval;
     if decay_intervals == 0 && !update_on_zero_interval {
-        env.storage()
-            .persistent()
-            .extend_ttl(&super::score_key(asset_id), super::TTL_THRESHOLD, super::TTL_TARGET);
-        env.storage().persistent().extend_ttl(
-            &super::last_update_key(asset_id),
-            super::TTL_THRESHOLD,
-            super::TTL_TARGET,
-        );
+        shared::extend_persistent_ttl(&env, &super::score_key(asset_id));
+        shared::extend_persistent_ttl(&env, &super::last_update_key(asset_id));
         return current_score;
     }
 
     let total_decay = (decay_intervals as u32) * config.decay_rate;
-    let new_score = current_score.saturating_sub(total_decay);
+    let raw_score = current_score.saturating_sub(total_decay);
+
+    // Enforce floor: an asset with at least one maintenance record must never score
+    // below MIN_SCORE_WITH_HISTORY (= 1) so it remains distinguishable from an asset
+    // that has never been maintained.  Check the maintenance history, not the score
+    // history, so the floor is tied to real maintenance events.
+    let has_history = env
+        .storage()
+        .persistent()
+        .get::<_, Vec<MaintenanceRecord>>(&super::history_key(asset_id))
+        .map(|h: Vec<MaintenanceRecord>| !h.is_empty())
+        .unwrap_or(false);
+    let new_score = if has_history && raw_score < super::MIN_SCORE_WITH_HISTORY {
+        super::MIN_SCORE_WITH_HISTORY
+    } else {
+        raw_score
+    };
 
     env.storage()
         .persistent()
         .set(&super::score_key(asset_id), &new_score);
-    env.storage()
-        .persistent()
-        .extend_ttl(&super::score_key(asset_id), super::TTL_THRESHOLD, super::TTL_TARGET);
+    shared::extend_persistent_ttl(&env, &super::score_key(asset_id));
     env.storage()
         .persistent()
         .set(&super::last_update_key(asset_id), &current_time);
-    env.storage()
-        .persistent()
-        .extend_ttl(&super::last_update_key(asset_id), super::TTL_THRESHOLD, super::TTL_TARGET);
+    shared::extend_persistent_ttl(&env, &super::last_update_key(asset_id));
 
     score_history_push(
         env,

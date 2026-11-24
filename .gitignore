@@ -47,6 +47,7 @@ Cargo.lock
 .soroban/
 stellar-cli-output/
 .stellar/
+terraform/network.auto.tfvars.json
 
 # Temporary files
 *.tmp
@@ -82,3 +83,6 @@ tarpaulin-report.html
 # Misc editor artifacts
 *.orig
 *.rej
+
+# FinOps cost ledger (operational data; keep out of git)
+costs/
