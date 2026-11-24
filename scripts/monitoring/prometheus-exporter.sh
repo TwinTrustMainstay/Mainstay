@@ -12,6 +12,8 @@
 #   CONTRACT_ASSET_REGISTRY     - Asset Registry contract ID
 #   CONTRACT_ENGINEER_REGISTRY  - Engineer Registry contract ID
 #   CONTRACT_LIFECYCLE          - Lifecycle contract ID
+#   CONTRACT_MARKETPLACE        - Marketplace contract ID (optional; enables
+#                                 the auction and dispute metrics)
 #   STELLAR_NETWORK             - Stellar network
 #   STELLAR_RPC_URL             - Stellar RPC endpoint
 #   EXPORTER_PORT               - HTTP port (default: 9600)
@@ -39,14 +41,15 @@ load_env_file() {
         [[ "$line" =~ ^[[:space:]]*$ ]] && continue
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
         # Strip a trailing CR (CRLF files) and surrounding whitespace
-        line="${line%$'\r'}"
+        line="${line%$'
+'}"
         line="${line#"${line%%[![:space:]]*}"}"
         line="${line%"${line##*[![:space:]]}"}"
         if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
             k="${BASH_REMATCH[1]}"
             v="${BASH_REMATCH[2]}"
             # Strip matching single or double quotes around the value
-            if [[ "$v" =~ ^\"(.*)\"$ ]] || [[ "$v" =~ ^\'(.*)\'$ ]]; then
+            if [[ "$v" =~ ^"(.*)"$ ]] || [[ "$v" =~ ^'(.*)'$ ]]; then
                 v="${BASH_REMATCH[1]}"
             fi
             export "$k=$v"
@@ -72,10 +75,15 @@ METRICS_FILE=""
 # Number of chain reads that failed during the current collection cycle.
 CHAIN_READ_ERRORS=0
 
-# Per-call RPC telemetry. Each invoke_read appends one line "<exit_code> <seconds>".
+# RPC telemetry counters. Each invoke_read appends one line "<exit_code> <seconds>".
 # A file is used instead of shell variables because invoke_read runs inside
 # $(...) subshells, where counter updates would be lost.
 RPC_LOG="${METRICS_FILE}.rpc"
+
+# Metrics emitted at end of each collection cycle.
+MAINSTAY_RPC_REQUESTS_LAST_SCRAPE=0
+MAINSTAY_RPC_ERRORS_LAST_SCRAPE=0
+MAINSTAY_RPC_REQUEST_DURATION_SECONDS_SUM=0
 
 # ---------------------------------------------------------------------------
 # Query helpers
@@ -86,15 +94,27 @@ RPC_LOG="${METRICS_FILE}.rpc"
 # nothing, increments CHAIN_READ_ERRORS and returns 1.
 invoke_read() {
     local output
+    local start_ts
+    start_ts="$(date +%s.%N)"
     if output="$(stellar contract invoke \
         --id "$1" \
         --network "$STELLAR_NETWORK" \
         --source any \
         -- "${@:2}" 2>/dev/null)"; then
-        printf '%s\n' "$output"
+        local exit_code=$?
+        local end_ts
+        end_ts="$(date +%s.%N)"
+        local duration
+        duration="$(echo "$end_ts - $start_ts" | bc)"
+        printf '%s %s
+' "$exit_code" "$duration" >> "$RPC_LOG"
+        printf '%s
+' "$output"
         return 0
     fi
     CHAIN_READ_ERRORS=$((CHAIN_READ_ERRORS + 1))
+    printf '1 0
+' >> "$RPC_LOG"
     return 1
 }
 
@@ -102,7 +122,8 @@ invoke_read() {
 invoke_read_number() {
     local value
     if value="$(invoke_read "$@")"; then
-        printf '%s\n' "$value"
+        printf '%s
+' "$value"
     else
         echo "0"
     fi
@@ -129,11 +150,13 @@ history_len_from_view() {
     local raw="$1"
     local trimmed="${raw//[[:space:]]/}"
     if [[ "$trimmed" =~ ^[0-9]+$ ]]; then
-        printf '%s\n' "$trimmed"
+        printf '%s
+' "$trimmed"
         return 0
     fi
-    local without="${raw//\"asset_id\"/}"
-    printf '%s\n' "$(( (${#raw} - ${#without}) / 10 ))"
+    local without="${raw//"asset_id"/}"
+    printf '%s
+' "$(( (${#raw} - ${#without}) / 10 ))"
 }
 
 # ---------------------------------------------------------------------------
@@ -202,17 +225,17 @@ EOF
             fi
 
             # Export per-asset collateral score metric
-            echo "mainstay_collateral_score{asset_id=\"$id\"} $score" >> "$tmp_file"
+            echo "mainstay_collateral_score{asset_id="$id"} $score" >> "$tmp_file"
 
             # Calculate days since last service
             local last_service_ts
             last_service_ts="$(invoke_read_number "$CONTRACT_LIFECYCLE" get_last_service_timestamp --asset_id "$id")"
             if [[ "$last_service_ts" -gt 0 ]]; then
                 local days_since=$((($ts - $last_service_ts) / 86400))
-                echo "mainstay_days_since_last_service{asset_id=\"$id\"} $days_since" >> "$tmp_file"
+                echo "mainstay_days_since_last_service{asset_id="$id"} $days_since" >> "$tmp_file"
             else
                 # Asset has never been serviced
-                echo "mainstay_days_since_last_service{asset_id=\"$id\"} -1" >> "$tmp_file"
+                echo "mainstay_days_since_last_service{asset_id="$id"} -1" >> "$tmp_file"
             fi
         done
     fi
@@ -239,6 +262,85 @@ mainstay_scored_assets_count $scored_assets
 # HELP mainstay_chain_read_errors_total Number of chain reads that failed during the last collection.
 # TYPE mainstay_chain_read_errors_total gauge
 mainstay_chain_read_errors_total $CHAIN_READ_ERRORS
+EOF
+
+    # --- Marketplace auction metrics ---
+    # Skipped when no marketplace is configured so that deployments without
+    # auctions do not report misleading zeroed series.
+    if [[ -n "${CONTRACT_MARKETPLACE:-}" ]]; then
+        local total_auctions
+        total_auctions="$(invoke_read_number "$CONTRACT_MARKETPLACE" get_auction_count)"
+
+        # Counts by AuctionStatus discriminant:
+        # 0=open, 1=unawarded, 2=awarded, 3=disputed, 4=resolved.
+        local open_auctions=0
+        local unawarded_auctions=0
+        local awarded_auctions=0
+        local disputed_auctions=0
+        local resolved_auctions=0
+        local total_bids=0
+
+        local auction_id status bid_count
+        for (( auction_id=1; auction_id<=total_auctions; auction_id++ )); do
+            status="$(invoke_read_number "$CONTRACT_MARKETPLACE" get_auction_status --auction_id "$auction_id")"
+            case "$status" in
+                0) open_auctions=$((open_auctions + 1)) ;;
+                1) unawarded_auctions=$((unawarded_auctions + 1)) ;;
+                2) awarded_auctions=$((awarded_auctions + 1)) ;;
+                3) disputed_auctions=$((disputed_auctions + 1)) ;;
+                4) resolved_auctions=$((resolved_auctions + 1)) ;;
+            esac
+            bid_count="$(invoke_read_number "$CONTRACT_MARKETPLACE" get_bid_count --auction_id "$auction_id")"
+            total_bids=$((total_bids + bid_count))
+        done
+
+        cat >> "$tmp_file" <<EOF
+
+# HELP mainstay_auctions_total Number of auctions by lifecycle status.
+# TYPE mainstay_auctions_total gauge
+mainstay_auctions_total{status="open"} $open_auctions
+mainstay_auctions_total{status="unawarded"} $unawarded_auctions
+mainstay_auctions_total{status="awarded"} $awarded_auctions
+mainstay_auctions_total{status="disputed"} $disputed_auctions
+mainstay_auctions_total{status="resolved"} $resolved_auctions
+
+# HELP mainstay_auction_bids_total Number of valid bids across all auctions.
+# TYPE mainstay_auction_bids_total gauge
+mainstay_auction_bids_total $total_bids
+
+# HELP mainstay_auction_disputes_total Number of auction disputes by state (an auction is disputed while it waits for admin resolution and resolved once the admin has ruled).
+# TYPE mainstay_auction_disputes_total gauge
+mainstay_auction_disputes_total{state="open"} $disputed_auctions
+mainstay_auction_disputes_total{state="resolved"} $resolved_auctions
+EOF
+    fi
+
+    # --- Compute RPC metrics from the log ---
+    local rpc_requests=0
+    local rpc_errors=0
+    local rpc_duration_sum=0
+    if [[ -f "$RPC_LOG" ]]; then
+        rpc_requests="$(wc -l < "$RPC_LOG")"
+        rpc_errors="$(grep -c '^1 ' "$RPC_LOG" || true)"
+        rpc_duration_sum="$(awk '{sum += $2} END {print sum+0}' "$RPC_LOG" || true)"
+    fi
+    MAINSTAY_RPC_REQUESTS_LAST_SCRAPE=$rpc_requests
+    MAINSTAY_RPC_ERRORS_LAST_SCRAPE=$rpc_errors
+    MAINSTAY_RPC_REQUEST_DURATION_SECONDS_SUM=$rpc_duration_sum
+
+    cat >> "$tmp_file" <<EOF
+
+# HELP mainstay_rpc_requests_last_scrape Number of read-only RPC calls made in the latest collection.
+# TYPE mainstay_rpc_requests_last_scrape gauge
+mainstay_rpc_requests_last_scrape $rpc_requests
+
+# HELP mainstay_rpc_errors_last_scrape Number of read-only RPC calls that failed in the latest collection.
+# TYPE mainstay_rpc_errors_last_scrape gauge
+mainstay_rpc_errors_last_scrape $rpc_errors
+
+# HELP mainstay_rpc_request_duration_seconds_sum Total read-only RPC call time in the latest collection (response time = sum / requests).
+# TYPE mainstay_rpc_request_duration_seconds_sum gauge
+mainstay_rpc_request_duration_seconds_sum $rpc_duration_sum
 EOF
 
     if [[ "$CHAIN_READ_ERRORS" -eq 0 ]]; then
@@ -299,7 +401,10 @@ serve_http() {
     if command -v socat &> /dev/null; then
         echo "[$(date -u +%H:%M:%S)] Using socat for HTTP server"
         socat TCP-LISTEN:"$port",bind="$bind_addr",reuseaddr,fork \
-            EXEC:"printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n'; cat $METRICS_FILE"
+            EXEC:"printf 'HTTP/1.1 200 OK
+Content-Type: text/plain
+
+'; cat $METRICS_FILE"
     elif command -v python3 &> /dev/null; then
         echo "[$(date -u +%H:%M:%S)] Using Python for HTTP server"
         python3 -c "
@@ -316,12 +421,14 @@ class MetricsHandler(http.server.BaseHTTPRequestHandler):
                 with open(METRICS_FILE) as f:
                     self.wfile.write(f.read().encode())
             except FileNotFoundError:
-                self.wfile.write(b'# Metrics not yet collected\n')
+                self.wfile.write(b'# Metrics not yet collected
+')
         elif self.path == '/health':
             self.send_response(200)
             self.send_header('Content-Type', 'text/plain')
             self.end_headers()
-            self.wfile.write(b'OK\n')
+            self.wfile.write(b'OK
+')
         else:
             self.send_response(404)
             self.end_headers()

@@ -43,6 +43,7 @@ STELLAR_RPC_URL=https://rpc.stellar.org   # RPC endpoint URL
 CONTRACT_ASSET_REGISTRY=CXXXXXXX...
 CONTRACT_ENGINEER_REGISTRY=CXXXXXXX...
 CONTRACT_LIFECYCLE=CXXXXXXX...
+CONTRACT_MARKETPLACE=CXXXXXXX...          # optional: enables auction metrics
 
 # Exporter settings
 EXPORTER_PORT=9600                         # Private HTTP port for /metrics (not exposed via ALB)
@@ -138,6 +139,50 @@ mainstay_days_since_last_service{asset_id="3"} 23
 - Identify overdue maintenance (days_since > expected_interval)
 - Find assets that have never been serviced
 - Schedule preventive maintenance
+
+### Marketplace Metrics
+
+These metrics are collected only when `CONTRACT_MARKETPLACE` is set. They
+cover the maintenance auctions implemented by the marketplace contract; the
+status values match the `AuctionStatus` enum (`open`, `unawarded`, `awarded`,
+`disputed`, `resolved`).
+
+#### `mainstay_auctions_total` (gauge)
+Number of auctions by lifecycle status. Labeled by `status`.
+
+```
+mainstay_auctions_total{status="open"} 4
+mainstay_auctions_total{status="unawarded"} 1
+mainstay_auctions_total{status="awarded"} 12
+mainstay_auctions_total{status="disputed"} 1
+mainstay_auctions_total{status="resolved"} 3
+```
+
+**Usage**: Spot auctions that stay open (bidding or finalization stalled),
+disputed awards waiting on an admin, and the ratio of unawarded auctions.
+
+#### `mainstay_auction_bids_total` (gauge)
+Number of valid bids across all auctions. Sealed bids count once they are
+revealed.
+
+```
+mainstay_auction_bids_total 87
+```
+
+**Usage**: Track marketplace demand (bid volume) alongside auction counts.
+
+#### `mainstay_auction_disputes_total` (gauge)
+Number of auction disputes by `state`: `open` while an awarded auction waits for
+admin resolution, `resolved` once the admin has ruled and the winning bid is
+final.
+
+```
+mainstay_auction_disputes_total{state="open"} 1
+mainstay_auction_disputes_total{state="resolved"} 3
+```
+
+**Usage**: Alert on disputes that stay open, and track the share of awards that
+are contested.
 
 ### System Metrics
 

@@ -35,9 +35,17 @@ is no longer emitted, or if an emitted metric is missing from the catalog.
 | Gas usage      | `mainstay:operation_gas_stroops:rate1h`       | rule    | Per-operation gas spend per hour |
 | Gas (raw)      | `mainstay_operation_gas_stroops_total`        | counter | Labels: `operation`, `department` |
 | Throughput     | `mainstay_rpc_requests_last_scrape`           | gauge   | Read-only calls in the last collection |
+| Auctions       | `mainstay_auctions_total`                     | gauge   | Labels: `status` (`open`, `unawarded`, `awarded`, `disputed`, `resolved`) |
+| Bid volume     | `mainstay_auction_bids_total`                 | gauge   | Valid bids across all auctions |
+| Disputes       | `mainstay_auction_disputes_total`             | gauge   | Labels: `state` (`open`, `resolved`) |
 
 Contract-health metrics (`mainstay_assets_total`, `mainstay_collateral_score`,
 and others) are unchanged. The full list is in the catalog.
+
+The marketplace auction metrics are collected only when
+`CONTRACT_MARKETPLACE` is configured. The exporter reads the auction count and
+then each auction's status and bid count, so collection cost grows linearly
+with the number of auctions; increase `SCRAPE_INTERVAL` for busy marketplaces.
 
 ### Why per-scrape counters?
 

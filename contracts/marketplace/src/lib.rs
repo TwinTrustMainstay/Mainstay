@@ -1012,6 +1012,33 @@ impl Marketplace {
     pub fn get_bids(env: Env, auction_id: u64) -> Vec<Bid> {
         load_bids(&env, auction_id)
     }
+
+    /// Number of auctions created so far. Auction ids run from 1 to this value.
+    pub fn get_auction_count(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::NextAuctionId)
+            .unwrap_or(1u64)
+            .saturating_sub(1)
+    }
+
+    /// Status of an auction as its [`AuctionStatus`] discriminant:
+    /// `0` open, `1` unawarded, `2` awarded, `3` disputed, `4` resolved.
+    ///
+    /// The numeric form keeps off-chain monitoring scripts from having to parse
+    /// the contracttype enum.
+    ///
+    /// # Panics
+    /// - [`ContractError::AuctionNotFound`] if the auction does not exist
+    pub fn get_auction_status(env: Env, auction_id: u64) -> u32 {
+        load_auction(&env, auction_id).status as u32
+    }
+
+    /// Number of valid bids recorded for an auction. For sealed auctions this
+    /// counts revealed bids only.
+    pub fn get_bid_count(env: Env, auction_id: u64) -> u32 {
+        load_bids(&env, auction_id).len()
+    }
 }
 
 #[cfg(test)]
