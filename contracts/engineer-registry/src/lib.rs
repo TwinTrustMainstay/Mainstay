@@ -280,6 +280,7 @@ const CE_REQUIREMENT_KEY: Symbol = symbol_short!("CE_REQ");
 const ON_CALL_KEY: Symbol = symbol_short!("ON_CALL");
 const NEXT_ON_CALL_ID_KEY: Symbol = symbol_short!("NXT_OC");
 const AVAILABILITY_KEY: Symbol = symbol_short!("AVAIL");
+const AVAILABILITY_SET_TOPIC: Symbol = symbol_short!("AVAIL_SET");
 const WORKLOAD_KEY: Symbol = symbol_short!("WORK");
 const NEXT_ASSIGNMENT_ID_KEY: Symbol = symbol_short!("NXT_ASG");
 /// Default reputation decay interval: 90 days in seconds (#1315)
@@ -2110,7 +2111,7 @@ impl EngineerRegistry {
         if ends_at <= starts_at || max_assignments == 0 {
             panic_with_error!(&env, ContractError::InvalidWorkWindow);
         }
-        let key = (AVAILABILITY_KEY, engineer);
+        let key = (AVAILABILITY_KEY, engineer.clone());
         env.storage().persistent().set(
             &key,
             &AvailabilityWindow {
@@ -2120,6 +2121,10 @@ impl EngineerRegistry {
             },
         );
         extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (AVAILABILITY_SET_TOPIC, engineer.clone()),
+            (engineer, starts_at, ends_at, max_assignments),
+        );
     }
 
     /// Assign work only when the engineer has declared availability and
@@ -2666,6 +2671,41 @@ mod tests {
         assert_eq!(emitted_hash, hash);
         assert_eq!(emitted_revoked_by, issuer);
         assert_eq!(emitted_timestamp, revoked_at);
+    }
+
+    #[test]
+    fn test_set_availability_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let starts_at = 1_000u64;
+        let ends_at = 2_000u64;
+        let max_assignments = 3u32;
+
+        client.set_availability(&engineer, &starts_at, &ends_at, &max_assignments);
+
+        let events = env.events().all();
+        let (_, topics, data) = events.last().unwrap();
+
+        use soroban_sdk::TryIntoVal;
+        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(topic, AVAILABILITY_SET_TOPIC);
+        let emitted_engineer: Address =
+            topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(emitted_engineer, engineer);
+
+        let (emitted_engineer, emitted_starts, emitted_ends, emitted_max): (
+            Address,
+            u64,
+            u64,
+            u32,
+        ) = data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_engineer, engineer);
+        assert_eq!(emitted_starts, starts_at);
+        assert_eq!(emitted_ends, ends_at);
+        assert_eq!(emitted_max, max_assignments);
     }
 
     #[test]
