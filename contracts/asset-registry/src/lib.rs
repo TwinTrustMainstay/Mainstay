@@ -511,6 +511,8 @@ const COLLATERAL_POOL_PREFIX: Symbol = symbol_short!("POOL");
 const POOL_ID_COUNTER: Symbol = symbol_short!("POOL_ID");
 
 pub const DEREG_TOPIC: Symbol = symbol_short!("DEREG");
+/// Issue #2019: propose deregistration event topic
+pub const PROP_DEREG_TOPIC: Symbol = symbol_short!("PROP_DRG");
 pub const ADD_TYPE_TOPIC: Symbol = symbol_short!("ADD_TYPE");
 pub const RM_TYPE_TOPIC: Symbol = symbol_short!("RM_TYPE");
 /// Issue #2020: configuration setter event topics
@@ -940,7 +942,14 @@ fn validate_asset_type_symbol(env: &Env, asset_type: &Symbol) {
         // Empty symbol — treat as invalid.
         panic_with_error!(env, ContractError::InvalidAssetType);
     }
-    for i in header_len..total {
+    let sym_len = ((xdr_bytes.get(4).unwrap_or(0) as u32) << 24)
+        | ((xdr_bytes.get(5).unwrap_or(0) as u32) << 16)
+        | ((xdr_bytes.get(6).unwrap_or(0) as u32) << 8)
+        | (xdr_bytes.get(7).unwrap_or(0) as u32);
+    if sym_len == 0 || header_len + sym_len > total {
+        panic_with_error!(env, ContractError::InvalidAssetType);
+    }
+    for i in header_len..(header_len + sym_len) {
         let b = xdr_bytes.get(i).unwrap_or(0);
         let valid = (b >= b'A' && b <= b'Z')
             || (b >= b'a' && b <= b'z')
@@ -1110,14 +1119,21 @@ impl AssetRegistry {
                 panic_with_error!(&env, ContractError::ProposalAlreadyExists);
             }
         }
+        let now = env.ledger().timestamp();
+        let execution_time = now + TIMELOCK_DELAY_SECS;
         env.storage().persistent().set(
             &key,
             &TimelockProposal {
-                proposed_at: env.ledger().timestamp(),
+                proposed_at: now,
                 executed: false,
             },
         );
         extend_persistent_ttl(&env, &key);
+
+        env.events().publish(
+            (PROP_DEREG_TOPIC, asset_id),
+            (asset_id, execution_time),
+        );
     }
 
     /// Execute a previously proposed asset deregistration after the timelock expires.
@@ -8314,5 +8330,67 @@ mod tests {
         assert_eq!(new_cfg2.active_algorithm, CryptoAlgorithm::Sphincs);
         assert_eq!(new_cfg2.dual_algorithm_enabled, false);
         assert_eq!(new_cfg2.legacy_sunset_at, 0);
+    }
+
+    // ── issue #2019: propose_deregister_asset event ─────────────────────────
+
+    #[test]
+    fn test_propose_deregister_asset_emits_event() {
+        use soroban_sdk::TryIntoVal;
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _admin, owner) = setup_with_types(&env);
+
+        let asset_id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Generator for Deregistration"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        let now = env.ledger().timestamp();
+        let expected_execution_time = now + TIMELOCK_DELAY_SECS;
+
+        client.propose_deregister_asset(&owner, &asset_id);
+
+        let events = env.events().all();
+        let (_, topics, data) = events.last().unwrap();
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, PROP_DEREG_TOPIC);
+        let t1: u64 = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t1, asset_id);
+        let (emitted_asset_id, emitted_exec_time): (u64, u64) = data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_asset_id, asset_id);
+        assert_eq!(emitted_exec_time, expected_execution_time);
+    }
+
+    #[test]
+    fn test_admin_propose_deregister_asset_emits_event() {
+        use soroban_sdk::TryIntoVal;
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin, owner) = setup_with_types(&env);
+
+        let asset_id = client.register_asset(
+            &symbol_short!("GENSET"),
+            &String::from_str(&env, "Admin Dereg Generator"),
+            &unique_serial(&env),
+            &owner,
+        );
+
+        let now = env.ledger().timestamp();
+        let expected_execution_time = now + TIMELOCK_DELAY_SECS;
+
+        client.propose_deregister_asset(&admin, &asset_id);
+
+        let events = env.events().all();
+        let (_, topics, data) = events.last().unwrap();
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, PROP_DEREG_TOPIC);
+        let t1: u64 = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t1, asset_id);
+        let (emitted_asset_id, emitted_exec_time): (u64, u64) = data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_asset_id, asset_id);
+        assert_eq!(emitted_exec_time, expected_execution_time);
     }
 }
