@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and hash-based maintenance evidence attachments to the lifecycle contract.
 
 ### Added
+- `analytics`: logistic regression models now carry a convergence report with the number of epochs run, final loss, and last loss change (closes [#2033](https://github.com/TwinTrustMainstay/Mainstay/issues/2033))
+- `ContractError` (`engineer-bond`) variant `ReasonTooLong` (14) (closes [#2044](https://github.com/TwinTrustMainstay/Mainstay/issues/2044))
 - `lending`: `record_lien` now emits a `lien_cr` event with `asset_id` and `loan_id` (closes [#2007](https://github.com/TwinTrustMainstay/Mainstay/issues/2007))
 - `lending`: `release_lien` now emits a `lien_rl` event with `asset_id` and `loan_id` (closes [#2007](https://github.com/TwinTrustMainstay/Mainstay/issues/2007))
 - `lending`: `set_market_oracle` now emits an `oracl_set` event with the new oracle address (closes [#2008](https://github.com/TwinTrustMainstay/Mainstay/issues/2008))
@@ -61,6 +63,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Lifecycle contract now emits events for score-anomaly creation (`ANOMALY`), anomaly investigation-status transitions (`ANOM_STS`), and peer-group registration (`PEER_GRP`), so operators can alert on new anomalies and peer-group benchmark changes (closes [#1998](https://github.com/TwinTrustMainstay/Mainstay/issues/1998), [#1999](https://github.com/TwinTrustMainstay/Mainstay/issues/1999))
 
 ### Fixed
+- `analytics`: logistic regression training now stops early when the loss change falls below the configured tolerance, instead of always running the full epoch budget (closes [#2033](https://github.com/TwinTrustMainstay/Mainstay/issues/2033))
+- `engineer-bond`: `open_dispute` now rejects reasons longer than 256 bytes so a single dispute cannot write an unbounded string to storage or the event log (closes [#2044](https://github.com/TwinTrustMainstay/Mainstay/issues/2044))
 - Engineer bonds (#1962, #1963, #1964): `slash` is refused while a dispute is
   open. Disputes lapse after a 30-day deadline so a bond cannot be locked
   forever. `open_dispute` and `record_performance` reject engineers with no
