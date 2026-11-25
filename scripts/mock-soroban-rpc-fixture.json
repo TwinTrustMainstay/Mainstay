@@ -9,5 +9,16 @@
   },
   "getLedgerEntries": {
     "entries": []
+  },
+  "getEvents": {
+    "events": [],
+    "latestLedger": 42
+  },
+  "simulateRpcError": {
+    "error": {
+      "code": -32603,
+      "message": "simulated transient RPC failure"
+    },
+    "failOnCall": 1
   }
 }

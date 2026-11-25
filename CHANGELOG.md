@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and hash-based maintenance evidence attachments to the lifecycle contract.
 
 ### Added
-- Production unwrap paths in marketplace, bridge, lending, and engineer-registry now return typed contract errors or safely handle missing indexed values (closes [#2011](https://github.com/TwinTrustMainstay/Mainstay/issues/2011))
+- `lending`: `set_asset_registry_contract` and `set_lifecycle_contract` now emit events with the old and new contract addresses (closes [#2010](https://github.com/TwinTrustMainstay/Mainstay/issues/2010))
 - `lending`: `record_lien` now emits a `lien_cr` event with `asset_id` and `loan_id` (closes [#2007](https://github.com/TwinTrustMainstay/Mainstay/issues/2007))
 - `lending`: `release_lien` now emits a `lien_rl` event with `asset_id` and `loan_id` (closes [#2007](https://github.com/TwinTrustMainstay/Mainstay/issues/2007))
 - `lending`: `set_market_oracle` now emits an `oracl_set` event with the new oracle address (closes [#2008](https://github.com/TwinTrustMainstay/Mainstay/issues/2008))
