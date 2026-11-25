@@ -12,6 +12,7 @@
 #   CONTRACT_ASSET_REGISTRY     - Asset Registry contract ID
 #   CONTRACT_ENGINEER_REGISTRY  - Engineer Registry contract ID
 #   CONTRACT_LIFECYCLE          - Lifecycle contract ID
+#   CONTRACT_INSURANCE_POOL     - Insurance Pool contract ID (optional)
 #   STELLAR_NETWORK             - Stellar network
 #   STELLAR_RPC_URL             - Stellar RPC endpoint
 #   EXPORTER_PORT               - HTTP port (default: 9600)
@@ -136,6 +137,18 @@ history_len_from_view() {
     printf '%s\n' "$(( (${#raw} - ${#without}) / 10 ))"
 }
 
+# Extract a numeric field from JSON-like contract output (e.g. PoolStats).
+# Handles both unquoted numbers ("reserved":100) and quoted i128 strings ("reserved":"100").
+extract_json_int() {
+    local raw="$1"
+    local field="$2"
+    if [[ "$raw" =~ \"${field}\"[[:space:]]*:[[:space:]]*\"?(-?[0-9]+)\"? ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    else
+        echo "0"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Collect metrics from chain
 # ---------------------------------------------------------------------------
@@ -222,7 +235,46 @@ EOF
         avg_score=$((score_sum / scored_assets))
     fi
 
+    # --- Insurance Pool metrics ---
+    local insurance_reserved=0
+    local insurance_free=0
+    local insurance_open_claims=0
+
+    if [[ -n "${CONTRACT_INSURANCE_POOL:-}" ]]; then
+        local pool_stats
+        if pool_stats="$(invoke_read "$CONTRACT_INSURANCE_POOL" get_stats)"; then
+            local pool_total_assets claims_filed claims_paid claims_rejected
+            pool_total_assets="$(extract_json_int "$pool_stats" total_assets)"
+            insurance_reserved="$(extract_json_int "$pool_stats" reserved)"
+            claims_filed="$(extract_json_int "$pool_stats" claims_filed)"
+            claims_paid="$(extract_json_int "$pool_stats" claims_paid)"
+            claims_rejected="$(extract_json_int "$pool_stats" claims_rejected)"
+
+            insurance_free=$((pool_total_assets - insurance_reserved))
+            if (( insurance_free < 0 )); then
+                insurance_free=0
+            fi
+
+            insurance_open_claims=$((claims_filed - claims_paid - claims_rejected))
+            if (( insurance_open_claims < 0 )); then
+                insurance_open_claims=0
+            fi
+        fi
+    fi
+
     cat >> "$tmp_file" <<EOF
+
+# HELP mainstay_insurance_reserved_capital Insurance pool capital reserved for pending claims.
+# TYPE mainstay_insurance_reserved_capital gauge
+mainstay_insurance_reserved_capital $insurance_reserved
+
+# HELP mainstay_insurance_free_capital Unencumbered insurance pool capital available for new coverage or withdrawals.
+# TYPE mainstay_insurance_free_capital gauge
+mainstay_insurance_free_capital $insurance_free
+
+# HELP mainstay_insurance_open_claims_count Number of open (pending) insurance claims.
+# TYPE mainstay_insurance_open_claims_count gauge
+mainstay_insurance_open_claims_count $insurance_open_claims
 
 # HELP mainstay_maintenance_records_total Total maintenance records across all assets.
 # TYPE mainstay_maintenance_records_total gauge
