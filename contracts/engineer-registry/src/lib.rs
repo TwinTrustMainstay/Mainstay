@@ -1964,6 +1964,10 @@ impl EngineerRegistry {
         record.service_regions = regions;
         env.storage().persistent().set(&engineer_key(&engineer), &record);
         extend_persistent_ttl(&env, &engineer_key(&engineer));
+        env.events().publish(
+            (symbol_short!("SVC_AREA"), engineer.clone()),
+            (engineer.clone(), record.service_regions.clone()),
+        );
     }
 
     pub fn get_engineers_for_region(env: Env, region: Region) -> Vec<Address> {
