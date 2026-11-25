@@ -188,7 +188,6 @@ name = "asset-registry"
 version = "0.1.0"
 dependencies = [
  "engineer-registry",
- "lifecycle",
  "shared",
  "soroban-sdk",
 ]
