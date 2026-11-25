@@ -1,0 +1,9 @@
+{
+  "asset_id": 1,
+  "owner": "ORIGINAL-OWNER-SECRET",
+  "serial_number": "PRODUCTION-SERIAL-SECRET",
+  "metadata": "CONFIDENTIAL_PRODUCTION_LOCATION_SECRET",
+  "lender": "PRODUCTION-LENDER-SECRET",
+  "loan_id": "PRODUCTION-LOAN-ID-SECRET",
+  "asset_type": "generator"
+}

@@ -12,6 +12,20 @@ permissions:
   contents: read
 
 jobs:
+  backup-sanitizer:
+    name: Backup Sanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y jq
+
+      - name: Test backup sanitizer
+        run: bash scripts/tests/test-sanitize-backup.sh
+
   test:
     name: Test Workspace
     runs-on: ubuntu-latest

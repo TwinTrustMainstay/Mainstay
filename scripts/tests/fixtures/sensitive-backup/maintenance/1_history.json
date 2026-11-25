@@ -1,0 +1,8 @@
+[
+  {
+    "asset_id": 1,
+    "engineer": "PRODUCTION-ENGINEER-SECRET",
+    "task_type": "inspection",
+    "notes": "CONFIDENTIAL_MAINTENANCE_NOTES_SECRET"
+  }
+]
