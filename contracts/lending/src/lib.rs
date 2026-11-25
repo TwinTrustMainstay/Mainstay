@@ -1165,7 +1165,10 @@ impl LendingContract {
         }
 
         if let Some(idx) = found_index {
-            let vouch = vouches.get(idx).unwrap();
+            let vouch = match vouches.get(idx) {
+                Some(vouch) => vouch,
+                None => panic_with_error!(&env, ContractError::VouchWithdrawNotAllowed),
+            };
             let stake = vouch.stake;
 
             vouches.remove(idx);
@@ -1932,10 +1935,10 @@ impl LendingContract {
                 .storage()
                 .persistent()
                 .get(&insurance_payout_key(asset_id, index));
-            if payout.is_none() {
-                break;
+            match payout {
+                Some(payout) => payouts.push_back(payout),
+                None => break,
             }
-            payouts.push_back(payout.unwrap());
             index += 1;
         }
 

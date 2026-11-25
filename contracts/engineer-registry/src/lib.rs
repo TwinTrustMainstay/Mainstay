@@ -2057,7 +2057,10 @@ impl EngineerRegistry {
             .get(&key)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::OnCallScheduleNotFound));
         for i in 0..schedules.len() {
-            let mut schedule = schedules.get(i).unwrap();
+            let mut schedule = match schedules.get(i) {
+                Some(schedule) => schedule,
+                None => panic_with_error!(&env, ContractError::OnCallScheduleNotFound),
+            };
             if schedule.schedule_id == schedule_id && schedule.engineer == engineer {
                 schedule.active = false;
                 schedules.set(i, schedule);
@@ -2219,7 +2222,10 @@ impl EngineerRegistry {
             .get(&key)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::WorkAssignmentNotFound));
         for i in 0..assignments.len() {
-            let mut assignment = assignments.get(i).unwrap();
+            let mut assignment = match assignments.get(i) {
+                Some(assignment) => assignment,
+                None => panic_with_error!(&env, ContractError::WorkAssignmentNotFound),
+            };
             if assignment.assignment_id == assignment_id {
                 assignment.status = status;
                 assignments.set(i, assignment);

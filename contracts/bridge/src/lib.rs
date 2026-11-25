@@ -470,8 +470,12 @@ impl Bridge {
         }
         for i in 0..count {
             for j in (i + 1)..count {
-                if relayers.get(i).unwrap() == relayers.get(j).unwrap() {
-                    panic_with_error!(&env, ContractError::InvalidRelayerSet);
+                match (relayers.get(i), relayers.get(j)) {
+                    (Some(left), Some(right)) if left == right => {
+                        panic_with_error!(&env, ContractError::InvalidRelayerSet);
+                    }
+                    (Some(_), Some(_)) => {}
+                    _ => panic_with_error!(&env, ContractError::InvalidRelayerSet),
                 }
             }
         }
