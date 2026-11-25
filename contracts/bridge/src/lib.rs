@@ -90,10 +90,19 @@ pub enum ContractError {
     InsufficientApprovals = 30,
     /// The token is not on the allowlist for this chain.
     TokenNotAllowed = 31,
+    /// An input (destination address or swap preimage) exceeds the maximum allowed byte length.
+    InputTooLong = 32,
 }
 
 /// Maximum number of relayers in the set.
 const MAX_RELAYERS: u32 = 20;
+
+/// Maximum allowed byte length for a destination address across all chains.
+/// Per-chain `address_len` must be in `1..=MAX_DEST_ADDRESS_LEN`.
+pub const MAX_DEST_ADDRESS_LEN: u32 = 128;
+
+/// Maximum allowed byte length for an atomic swap preimage.
+pub const MAX_PREIMAGE_LEN: u32 = 128;
 
 /// Allowlist scope used by atomic swaps. Swaps have no destination chain, so
 /// they use this reserved scope. Chain ID 0 cannot be registered.
@@ -133,7 +142,7 @@ pub struct ChainConfig {
     /// threshold after this window can no longer be attested and may be expired (#1921).
     pub attestation_window_secs: u64,
     /// Exact length in bytes of a valid destination address on this chain.
-    /// Must be > 0. Addresses must also be ASCII alphanumeric.
+    /// Must be in `1..=MAX_DEST_ADDRESS_LEN`. Addresses must also be ASCII alphanumeric.
     pub address_len: u32,
 }
 
@@ -225,16 +234,20 @@ fn validate_chain_config(env: &Env, cfg: &ChainConfig) {
         || cfg.alert_threshold > cfg.window_cap
         || cfg.attestation_window_secs == 0
         || cfg.address_len == 0
+        || cfg.address_len > MAX_DEST_ADDRESS_LEN
     {
         panic_with_error!(env, ContractError::InvalidConfig);
     }
 }
 
-/// Reject destination addresses that are empty, have the wrong length for the
-/// destination chain, or contain non-alphanumeric bytes.
+/// Reject destination addresses that are empty, exceed `MAX_DEST_ADDRESS_LEN`,
+/// have the wrong length for the destination chain, or contain non-alphanumeric bytes.
 fn validate_dest_address(env: &Env, cfg: &ChainConfig, dest_address: &Bytes) {
     if dest_address.is_empty() {
         panic_with_error!(env, ContractError::InvalidDestination);
+    }
+    if dest_address.len() > MAX_DEST_ADDRESS_LEN {
+        panic_with_error!(env, ContractError::InputTooLong);
     }
     if dest_address.len() != cfg.address_len {
         panic_with_error!(env, ContractError::InvalidDestinationAddress);
@@ -596,6 +609,7 @@ impl Bridge {
     /// - [`ContractError::ChainNotFound`] / [`ContractError::ChainDisabled`] for an unusable destination
     /// - [`ContractError::AmountOutOfRange`] if `amount` is outside the chain's limits
     /// - [`ContractError::InvalidDestination`] if `dest_address` is empty
+    /// - [`ContractError::InputTooLong`] if `dest_address` exceeds [`MAX_DEST_ADDRESS_LEN`]
     /// - [`ContractError::TokenNotAllowed`] if `token` is not allowlisted for `dest_chain`
     /// - [`ContractError::InvalidDestinationAddress`] if `dest_address` has the wrong length or encoding for `dest_chain`
     pub fn bridge_out(
@@ -917,11 +931,15 @@ impl Bridge {
     /// Funds go to the swap's recipient. Anyone holding the preimage may submit the claim.
     ///
     /// # Panics
+    /// - [`ContractError::InputTooLong`] if `preimage` exceeds [`MAX_PREIMAGE_LEN`]
     /// - [`ContractError::SwapNotFound`] if the swap does not exist
     /// - [`ContractError::SwapNotOpen`] if the swap was already claimed or refunded
     /// - [`ContractError::SwapExpired`] if the timelock has passed
     /// - [`ContractError::InvalidPreimage`] if the preimage does not match the hashlock
     pub fn claim_swap(env: Env, swap_id: u64, preimage: Bytes) {
+        if preimage.len() > MAX_PREIMAGE_LEN {
+            panic_with_error!(&env, ContractError::InputTooLong);
+        }
         let key = DataKey::Swap(swap_id);
         let mut swap: Swap = env
             .storage()
