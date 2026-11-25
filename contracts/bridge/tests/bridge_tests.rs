@@ -1351,11 +1351,17 @@ fn test_swap_scope_cannot_be_registered_as_chain() {
 }
 
 #[test]
-fn test_chain_config_rejects_address_len_above_max() {
+fn test_add_chain_rejects_address_len_above_max() {
     let ctx = setup();
-    let mut cfg = eth_config(&ctx.env);
-    cfg.address_len = MAX_DEST_ADDRESS_LEN + 1;
-    let res = ctx.client.try_add_chain(&ctx.admin, &2, &cfg);
+
+    let mut at_max = eth_config(&ctx.env);
+    at_max.address_len = MAX_DEST_ADDRESS_LEN;
+    ctx.client.add_chain(&ctx.admin, &2, &at_max);
+    assert_eq!(ctx.client.get_chain(&2).address_len, MAX_DEST_ADDRESS_LEN);
+
+    let mut over_max = eth_config(&ctx.env);
+    over_max.address_len = MAX_DEST_ADDRESS_LEN + 1;
+    let res = ctx.client.try_add_chain(&ctx.admin, &3, &over_max);
     assert!(is_contract_error(res, ContractError::InvalidConfig));
 }
 
@@ -1376,8 +1382,9 @@ fn test_bridge_out_dest_address_max_length_boundary() {
             .bridge_out(&user, &ctx.token, &100, &2, &at_max),
         1
     );
+    assert_eq!(balance(&ctx, &user), 400);
 
-    let over_max = Bytes::from_slice(&ctx.env, &[b'a'; (MAX_DEST_ADDRESS_LEN + 1) as usize]);
+    let over_max = Bytes::from_slice(&ctx.env, &[b'a'; MAX_DEST_ADDRESS_LEN as usize + 1]);
     let res = ctx
         .client
         .try_bridge_out(&user, &ctx.token, &100, &2, &over_max);
@@ -1389,15 +1396,16 @@ fn test_bridge_out_dest_address_max_length_boundary() {
 fn test_claim_swap_preimage_max_length_boundary() {
     let ctx = setup();
 
-    let at_max = Bytes::from_slice(&ctx.env, &[b's'; MAX_PREIMAGE_LEN as usize]);
-    let (id_ok, _, recipient) = open_swap(&ctx, &at_max, 1_000);
+    let at_max = Bytes::from_slice(&ctx.env, &[b'k'; MAX_PREIMAGE_LEN as usize]);
+    let (id_ok, _, recipient_ok) = open_swap(&ctx, &at_max, 1_000);
     ctx.client.claim_swap(&id_ok, &at_max);
+    assert_eq!(balance(&ctx, &recipient_ok), 200);
     assert_eq!(ctx.client.get_swap(&id_ok).status, SwapStatus::Claimed);
-    assert_eq!(balance(&ctx, &recipient), 100);
 
-    let over_max = Bytes::from_slice(&ctx.env, &[b's'; (MAX_PREIMAGE_LEN + 1) as usize]);
-    let (id_over, _, _) = open_swap(&ctx, &over_max, 1_000);
+    let over_max = Bytes::from_slice(&ctx.env, &[b'k'; MAX_PREIMAGE_LEN as usize + 1]);
+    let (id_over, _, recipient_over) = open_swap(&ctx, &over_max, 1_000);
     let res = ctx.client.try_claim_swap(&id_over, &over_max);
     assert!(is_contract_error(res, ContractError::InputTooLong));
+    assert_eq!(balance(&ctx, &recipient_over), 0);
     assert_eq!(ctx.client.get_swap(&id_over).status, SwapStatus::Open);
 }

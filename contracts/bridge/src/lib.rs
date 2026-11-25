@@ -90,19 +90,19 @@ pub enum ContractError {
     InsufficientApprovals = 30,
     /// The token is not on the allowlist for this chain.
     TokenNotAllowed = 31,
-    /// An input (destination address or swap preimage) exceeds the maximum allowed byte length.
+    /// Input byte length exceeds the contract-level maximum (`dest_address` or `preimage`).
     InputTooLong = 32,
 }
 
 /// Maximum number of relayers in the set.
 const MAX_RELAYERS: u32 = 20;
 
-/// Maximum allowed byte length for a destination address across all chains.
-/// Per-chain `address_len` must be in `1..=MAX_DEST_ADDRESS_LEN`.
+/// Contract-level maximum length in bytes for a destination address.
+/// Per-chain `ChainConfig::address_len` must not exceed this bound.
 pub const MAX_DEST_ADDRESS_LEN: u32 = 128;
 
-/// Maximum allowed byte length for an atomic swap preimage.
-pub const MAX_PREIMAGE_LEN: u32 = 128;
+/// Contract-level maximum length in bytes for an atomic swap preimage.
+pub const MAX_PREIMAGE_LEN: u32 = 64;
 
 /// Allowlist scope used by atomic swaps. Swaps have no destination chain, so
 /// they use this reserved scope. Chain ID 0 cannot be registered.
@@ -483,8 +483,12 @@ impl Bridge {
         }
         for i in 0..count {
             for j in (i + 1)..count {
-                if relayers.get(i).unwrap() == relayers.get(j).unwrap() {
-                    panic_with_error!(&env, ContractError::InvalidRelayerSet);
+                match (relayers.get(i), relayers.get(j)) {
+                    (Some(left), Some(right)) if left == right => {
+                        panic_with_error!(&env, ContractError::InvalidRelayerSet);
+                    }
+                    (Some(_), Some(_)) => {}
+                    _ => panic_with_error!(&env, ContractError::InvalidRelayerSet),
                 }
             }
         }
@@ -609,7 +613,7 @@ impl Bridge {
     /// - [`ContractError::ChainNotFound`] / [`ContractError::ChainDisabled`] for an unusable destination
     /// - [`ContractError::AmountOutOfRange`] if `amount` is outside the chain's limits
     /// - [`ContractError::InvalidDestination`] if `dest_address` is empty
-    /// - [`ContractError::InputTooLong`] if `dest_address` exceeds [`MAX_DEST_ADDRESS_LEN`]
+    /// - [`ContractError::InputTooLong`] if `dest_address` exceeds `MAX_DEST_ADDRESS_LEN`
     /// - [`ContractError::TokenNotAllowed`] if `token` is not allowlisted for `dest_chain`
     /// - [`ContractError::InvalidDestinationAddress`] if `dest_address` has the wrong length or encoding for `dest_chain`
     pub fn bridge_out(
@@ -931,7 +935,7 @@ impl Bridge {
     /// Funds go to the swap's recipient. Anyone holding the preimage may submit the claim.
     ///
     /// # Panics
-    /// - [`ContractError::InputTooLong`] if `preimage` exceeds [`MAX_PREIMAGE_LEN`]
+    /// - [`ContractError::InputTooLong`] if `preimage` exceeds `MAX_PREIMAGE_LEN`
     /// - [`ContractError::SwapNotFound`] if the swap does not exist
     /// - [`ContractError::SwapNotOpen`] if the swap was already claimed or refunded
     /// - [`ContractError::SwapExpired`] if the timelock has passed
