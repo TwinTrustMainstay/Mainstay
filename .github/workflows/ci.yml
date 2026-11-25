@@ -68,6 +68,19 @@ jobs:
       - name: Validate every environment in environments.toml
         run: python3 -m scripts.ops.config validate --env all
 
+  deployment-dry-run:
+    name: Deployment dry-run test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Exercise testnet deployment with mocked RPC
+        run: python3 scripts/test_deploy_dry_run.py
+
   shellcheck:
     name: Shellcheck scripts
     runs-on: ubuntu-latest
