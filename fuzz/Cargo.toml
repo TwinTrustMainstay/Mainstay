@@ -29,6 +29,9 @@ path = "../contracts/zk-privacy"
 [dependencies.timestamping]
 path = "../contracts/timestamping"
 
+[dependencies.marketplace]
+path = "../contracts/marketplace"
+
 [dependencies.ed25519-dalek]
 version = "2.2.0"
 
@@ -46,6 +49,13 @@ bench = false
 [[bin]]
 name = "attestation_message_fuzz"
 path = "fuzz_targets/attestation_message_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "marketplace_commit_reveal_fuzz"
+path = "fuzz_targets/marketplace_commit_reveal_fuzz.rs"
 test = false
 doc = false
 bench = false
