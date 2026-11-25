@@ -607,7 +607,7 @@ impl EngineerRegistry {
 
         // Emit engineer registration event
         env.events().publish(
-            (symbol_short!("reg_eng"),),
+            (REG_ENG_TOPIC,),
             (
                 engineer.clone(),
                 credential_hash.clone(),
@@ -1970,6 +1970,10 @@ impl EngineerRegistry {
         record.service_regions = regions;
         env.storage().persistent().set(&engineer_key(&engineer), &record);
         extend_persistent_ttl(&env, &engineer_key(&engineer));
+        env.events().publish(
+            (symbol_short!("SVC_AREA"), engineer.clone()),
+            (engineer.clone(), record.service_regions.clone()),
+        );
     }
 
     pub fn get_engineers_for_region(env: Env, region: Region) -> Vec<Address> {
@@ -2059,7 +2063,10 @@ impl EngineerRegistry {
             .get(&key)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::OnCallScheduleNotFound));
         for i in 0..schedules.len() {
-            let mut schedule = schedules.get(i).unwrap();
+            let mut schedule = match schedules.get(i) {
+                Some(schedule) => schedule,
+                None => panic_with_error!(&env, ContractError::OnCallScheduleNotFound),
+            };
             if schedule.schedule_id == schedule_id && schedule.engineer == engineer {
                 schedule.active = false;
                 schedules.set(i, schedule);
@@ -2221,7 +2228,10 @@ impl EngineerRegistry {
             .get(&key)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::WorkAssignmentNotFound));
         for i in 0..assignments.len() {
-            let mut assignment = assignments.get(i).unwrap();
+            let mut assignment = match assignments.get(i) {
+                Some(assignment) => assignment,
+                None => panic_with_error!(&env, ContractError::WorkAssignmentNotFound),
+            };
             if assignment.assignment_id == assignment_id {
                 assignment.status = status;
                 assignments.set(i, assignment);
@@ -2618,12 +2628,12 @@ mod tests {
         let issued_at = env.ledger().timestamp();
         client.register_engineer(&engineer, &hash, &issuer, &validity_period, &None);
 
-        // ISS_ADD event fires first, reg_eng is the second event
+        // ISS_ADD event fires first, REG_ENG is the second event
         let events = env.events().all();
         let (_, topics, data) = events.last().unwrap();
 
         use soroban_sdk::TryIntoVal;
-        let reg_topic = symbol_short!("reg_eng");
+        let reg_topic = symbol_short!("REG_ENG");
         let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
         assert_eq!(t0, reg_topic);
 
