@@ -103,6 +103,9 @@ jobs:
           printf '  %s\n' "${files[@]}"
           shellcheck "${files[@]}"
 
+      - name: Run network config shell tests
+        run: bash scripts/test-load-network-config.sh
+
       - name: Compile benchmark targets
         run: cargo check --workspace --benches
 
