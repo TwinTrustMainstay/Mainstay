@@ -277,6 +277,40 @@ fn lowest_price_wins_open_auction() {
 }
 
 #[test]
+fn monitoring_views_report_auction_count_status_and_bids() {
+    let env = Env::default();
+    let ctx = setup(&env);
+
+    assert_eq!(ctx.client.get_auction_count(), 0);
+
+    let unawarded = ctx
+        .client
+        .create_auction(&ctx.admin, &open_params(&ctx, WinnerCriterion::LowestPrice));
+    let awarded = ctx
+        .client
+        .create_auction(&ctx.admin, &open_params(&ctx, WinnerCriterion::LowestPrice));
+    let bidder = engineer(&ctx, CredentialStatus::Valid, 0);
+    ctx.client.place_bid(&bidder, &awarded, &2_000);
+
+    assert_eq!(ctx.client.get_auction_count(), 2);
+    assert_eq!(ctx.client.get_bid_count(&unawarded), 0);
+    assert_eq!(ctx.client.get_bid_count(&awarded), 1);
+
+    at(&env, BID_END + 1);
+    ctx.client.finalize_auction(&unawarded);
+    ctx.client.finalize_auction(&awarded);
+
+    assert_eq!(
+        ctx.client.get_auction_status(&unawarded),
+        AuctionStatus::Unawarded as u32
+    );
+    assert_eq!(
+        ctx.client.get_auction_status(&awarded),
+        AuctionStatus::Awarded as u32
+    );
+}
+
+#[test]
 fn highest_reputation_wins_open_auction_regardless_of_price() {
     let env = Env::default();
     let ctx = setup(&env);
