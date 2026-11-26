@@ -11,8 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and hash-based maintenance evidence attachments to the lifecycle contract.
 
 ### Added
-- `analytics`: logistic regression models now carry a convergence report with the number of epochs run, final loss, and last loss change (closes [#2033](https://github.com/TwinTrustMainstay/Mainstay/issues/2033))
-- `ContractError` (`engineer-bond`) variant `ReasonTooLong` (14) (closes [#2044](https://github.com/TwinTrustMainstay/Mainstay/issues/2044))
+- `lending`: `set_asset_registry_contract` and `set_lifecycle_contract` now emit events with the old and new contract addresses (closes [#2010](https://github.com/TwinTrustMainstay/Mainstay/issues/2010))
 - `lending`: `record_lien` now emits a `lien_cr` event with `asset_id` and `loan_id` (closes [#2007](https://github.com/TwinTrustMainstay/Mainstay/issues/2007))
 - `lending`: `release_lien` now emits a `lien_rl` event with `asset_id` and `loan_id` (closes [#2007](https://github.com/TwinTrustMainstay/Mainstay/issues/2007))
 - `lending`: `set_market_oracle` now emits an `oracl_set` event with the new oracle address (closes [#2008](https://github.com/TwinTrustMainstay/Mainstay/issues/2008))

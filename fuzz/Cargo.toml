@@ -23,6 +23,9 @@ path = "../contracts/engineer-registry"
 [dependencies.bridge]
 path = "../contracts/bridge"
 
+[dependencies.insurance-pool]
+path = "../contracts/insurance-pool"
+
 [dependencies.zk-privacy]
 path = "../contracts/zk-privacy"
 
@@ -46,6 +49,13 @@ bench = false
 [[bin]]
 name = "attestation_message_fuzz"
 path = "fuzz_targets/attestation_message_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "insurance_pool_share_premium_fuzz"
+path = "fuzz_targets/insurance_pool_share_premium_fuzz.rs"
 test = false
 doc = false
 bench = false
