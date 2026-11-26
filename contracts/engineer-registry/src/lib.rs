@@ -256,6 +256,7 @@ const ENGINEER_COUNT: Symbol = symbol_short!("ENG_CNT");
 #[allow(dead_code)]
 const REG_ENG_TOPIC: Symbol = symbol_short!("REG_ENG");
 const REVOKE_TOPIC: Symbol = symbol_short!("REV_CRED");
+const REVOKE_PROPOSED_TOPIC: Symbol = symbol_short!("PROP_RVK");
 const SUSPEND_TOPIC: Symbol = symbol_short!("SUSP_ENG");
 #[allow(dead_code)]
 const UNSUSPEND_TOPIC: Symbol = symbol_short!("UNSUSP_E");
@@ -465,14 +466,19 @@ impl EngineerRegistry {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
         record.issuer.require_auth();
         let key = revoke_timelock_key(&engineer);
+        let proposed_at = env.ledger().timestamp();
         env.storage().persistent().set(
             &key,
             &TimelockProposal {
-                proposed_at: env.ledger().timestamp(),
+                proposed_at,
                 executed: false,
             },
         );
         extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (REVOKE_PROPOSED_TOPIC, engineer.clone()),
+            (record.issuer.clone(), engineer, proposed_at),
+        );
     }
 
     /// Execute a pending engineer credential revocation after its timelock has expired.
@@ -602,7 +608,7 @@ impl EngineerRegistry {
 
         // Emit engineer registration event
         env.events().publish(
-            (symbol_short!("reg_eng"),),
+            (REG_ENG_TOPIC,),
             (
                 engineer.clone(),
                 credential_hash.clone(),
@@ -1965,6 +1971,10 @@ impl EngineerRegistry {
         record.service_regions = regions;
         env.storage().persistent().set(&engineer_key(&engineer), &record);
         extend_persistent_ttl(&env, &engineer_key(&engineer));
+        env.events().publish(
+            (symbol_short!("SVC_AREA"), engineer.clone()),
+            (engineer.clone(), record.service_regions.clone()),
+        );
     }
 
     pub fn get_engineers_for_region(env: Env, region: Region) -> Vec<Address> {
@@ -2054,7 +2064,10 @@ impl EngineerRegistry {
             .get(&key)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::OnCallScheduleNotFound));
         for i in 0..schedules.len() {
-            let mut schedule = schedules.get(i).unwrap();
+            let mut schedule = match schedules.get(i) {
+                Some(schedule) => schedule,
+                None => panic_with_error!(&env, ContractError::OnCallScheduleNotFound),
+            };
             if schedule.schedule_id == schedule_id && schedule.engineer == engineer {
                 schedule.active = false;
                 schedules.set(i, schedule);
@@ -2220,7 +2233,10 @@ impl EngineerRegistry {
             .get(&key)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::WorkAssignmentNotFound));
         for i in 0..assignments.len() {
-            let mut assignment = assignments.get(i).unwrap();
+            let mut assignment = match assignments.get(i) {
+                Some(assignment) => assignment,
+                None => panic_with_error!(&env, ContractError::WorkAssignmentNotFound),
+            };
             if assignment.assignment_id == assignment_id {
                 assignment.status = status;
                 assignments.set(i, assignment);
@@ -2617,12 +2633,12 @@ mod tests {
         let issued_at = env.ledger().timestamp();
         client.register_engineer(&engineer, &hash, &issuer, &validity_period, &None);
 
-        // ISS_ADD event fires first, reg_eng is the second event
+        // ISS_ADD event fires first, REG_ENG is the second event
         let events = env.events().all();
         let (_, topics, data) = events.last().unwrap();
 
         use soroban_sdk::TryIntoVal;
-        let reg_topic = symbol_short!("reg_eng");
+        let reg_topic = symbol_short!("REG_ENG");
         let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
         assert_eq!(t0, reg_topic);
 
@@ -2674,38 +2690,35 @@ mod tests {
     }
 
     #[test]
-    fn test_set_availability_emits_event() {
+    fn test_propose_revoke_credential_emits_event() {
         let env = Env::default();
         env.mock_all_auths();
-        let (client, _admin) = setup(&env);
+        let (client, admin) = setup(&env);
 
         let engineer = Address::generate(&env);
-        let starts_at = 1_000u64;
-        let ends_at = 2_000u64;
-        let max_assignments = 3u32;
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
 
-        client.set_availability(&engineer, &starts_at, &ends_at, &max_assignments);
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+
+        let proposed_at = env.ledger().timestamp();
+        client.propose_revoke_credential(&engineer);
 
         let events = env.events().all();
         let (_, topics, data) = events.last().unwrap();
 
         use soroban_sdk::TryIntoVal;
-        let topic: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
-        assert_eq!(topic, AVAILABILITY_SET_TOPIC);
-        let emitted_engineer: Address =
-            topics.get(1).unwrap().try_into_val(&env).unwrap();
-        assert_eq!(emitted_engineer, engineer);
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, REVOKE_PROPOSED_TOPIC);
+        let t1: Address = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t1, engineer);
 
-        let (emitted_engineer, emitted_starts, emitted_ends, emitted_max): (
-            Address,
-            u64,
-            u64,
-            u32,
-        ) = data.try_into_val(&env).unwrap();
+        let (emitted_issuer, emitted_engineer, emitted_timestamp): (Address, Address, u64) =
+            data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_issuer, issuer);
         assert_eq!(emitted_engineer, engineer);
-        assert_eq!(emitted_starts, starts_at);
-        assert_eq!(emitted_ends, ends_at);
-        assert_eq!(emitted_max, max_assignments);
+        assert_eq!(emitted_timestamp, proposed_at);
     }
 
     #[test]

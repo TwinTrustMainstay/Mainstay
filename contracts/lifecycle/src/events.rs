@@ -71,3 +71,9 @@ pub(crate) const EVENT_EXT_SCR: Symbol = symbol_short!("EXT_SCR");
 
 /// Emitted when a degradation curve is registered or updated for an asset category via `register_degradation_curve`.
 pub(crate) const EVENT_DEG_CRV: Symbol = symbol_short!("DEG_CRV");
+
+/// Emitted when a task is assigned to an engineer via `assign_task`.
+pub(crate) const EVENT_TASK_ASSIGN: Symbol = symbol_short!("TASK_ASG");
+
+/// Emitted on every status transition via `update_assignment_status`.
+pub(crate) const EVENT_ASSIGN_STS: Symbol = symbol_short!("ASG_STS");

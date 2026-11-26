@@ -2,7 +2,7 @@
 
 use shared::error::SharedContractError;
 use shared::extend_persistent_ttl;
-use shared::{TTL_THRESHOLD, TTL_TARGET};
+use shared::{TTL_TARGET, TTL_THRESHOLD};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
     Address, Env, Symbol, Vec,
@@ -110,8 +110,17 @@ pub enum ContractError {
 /// Syndicate action symbol used when a restructure must be approved by the syndicate.
 const RESTRUCTURE_ACTION: Symbol = symbol_short!("RESTRUCT");
 
-fn syndicate_vote_key(loan_id: u64, action: &Symbol, lender: &Address) -> (Symbol, u64, Symbol, Address) {
-    (symbol_short!("SVOTE"), loan_id, action.clone(), lender.clone())
+fn syndicate_vote_key(
+    loan_id: u64,
+    action: &Symbol,
+    lender: &Address,
+) -> (Symbol, u64, Symbol, Address) {
+    (
+        symbol_short!("SVOTE"),
+        loan_id,
+        action.clone(),
+        lender.clone(),
+    )
 }
 
 /// Counts the approving votes cast for `action` on `loan_id` by the syndicate's lenders.
@@ -348,6 +357,8 @@ const ORACLE_SET: Symbol = symbol_short!("oracl_set");
 const MARKET_UPDATED: Symbol = symbol_short!("mkt_upd");
 const TREASURY_SLASHED: Symbol = symbol_short!("trsry_sl");
 const LTV_SET: Symbol = symbol_short!("ltv_set");
+const LIFECYCLE_SET: Symbol = symbol_short!("life_set");
+const ASSET_REGISTRY_SET: Symbol = symbol_short!("asrg_set");
 
 fn loan_key(borrower: &Address) -> (soroban_sdk::Symbol, Address) {
     (symbol_short!("LOAN"), borrower.clone())
@@ -372,7 +383,10 @@ fn get_loan_status(env: &Env, loan_id: u64) -> Option<LoanStatus> {
         return Some(status);
     }
 
-    let borrower: Address = env.storage().persistent().get(&loan_borrower_key(loan_id))?;
+    let borrower: Address = env
+        .storage()
+        .persistent()
+        .get(&loan_borrower_key(loan_id))?;
     let loan: Loan = env.storage().persistent().get(&loan_key(&borrower))?;
     (loan.id == loan_id).then_some(loan.status)
 }
@@ -575,16 +589,12 @@ fn get_loan_duration(env: &Env) -> u64 {
 
 /// Retrieve the configured lifecycle contract address, if any.
 fn get_lifecycle_addr(env: &Env) -> Option<Address> {
-    env.storage()
-        .persistent()
-        .get(&symbol_short!("LIFECYCLE"))
+    env.storage().persistent().get(&symbol_short!("LIFECYCLE"))
 }
 
 /// Retrieve the configured asset registry contract address, if any.
 fn get_asset_registry_addr(env: &Env) -> Option<Address> {
-    env.storage()
-        .persistent()
-        .get(&symbol_short!("ASSETREG"))
+    env.storage().persistent().get(&symbol_short!("ASSETREG"))
 }
 
 // ── Inline cross-contract client: Lifecycle ────────────────────────────────
@@ -636,7 +646,13 @@ impl LendingContract {
     /// of the deployment transaction can race to call `initialize` first,
     /// setting themselves as admin (#625). Call this in the same transaction as
     /// contract deployment to eliminate the front-run window entirely.
-    pub fn initialize(env: Env, deployer: Address, admin: Address, token: Address, _slash_bps: u32) {
+    pub fn initialize(
+        env: Env,
+        deployer: Address,
+        admin: Address,
+        token: Address,
+        _slash_bps: u32,
+    ) {
         // #625: Require the deployer's signature to prevent front-running.
         deployer.require_auth();
 
@@ -734,11 +750,9 @@ impl LendingContract {
                     // expose the Asset and check: if max loan cap < requested amount → reject.
                     // For now treat `amount` as the declared value (self-reported by the borrower).
                     let _ = asset; // asset available for future declared_value lookup
-                    // max_loan_cap = amount * score * max_ltv_bps / (100 * 10_000)
-                    let max_loan_cap = amount
-                        .saturating_mul(score)
-                        .saturating_mul(max_ltv_bps)
-                        / (100 * 10_000);
+                                   // max_loan_cap = amount * score * max_ltv_bps / (100 * 10_000)
+                    let max_loan_cap =
+                        amount.saturating_mul(score).saturating_mul(max_ltv_bps) / (100 * 10_000);
                     if amount > max_loan_cap {
                         panic_with_error!(&env, ContractError::LtvExceeded);
                     }
@@ -755,9 +769,15 @@ impl LendingContract {
         }
 
         let deadline = env.ledger().timestamp() + get_loan_duration(&env);
-        let loan_id_counter: u64 = env.storage().persistent().get(&symbol_short!("L_COUNT")).unwrap_or(0);
+        let loan_id_counter: u64 = env
+            .storage()
+            .persistent()
+            .get(&symbol_short!("L_COUNT"))
+            .unwrap_or(0);
         let new_loan_id = loan_id_counter + 1;
-        env.storage().persistent().set(&symbol_short!("L_COUNT"), &new_loan_id);
+        env.storage()
+            .persistent()
+            .set(&symbol_short!("L_COUNT"), &new_loan_id);
         env.storage()
             .persistent()
             .set(&loan_borrower_key(new_loan_id), &borrower);
@@ -868,7 +888,9 @@ impl LendingContract {
             .repayment_count
             .checked_add(1)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::StakeSummationOverflow));
-        env.storage().persistent().set(&borrower_key_val, &borrower_record);
+        env.storage()
+            .persistent()
+            .set(&borrower_key_val, &borrower_record);
         extend_persistent_ttl(&env, &borrower_key_val);
 
         // #632: Distribute yield to vouchers from collected repayment.
@@ -1013,10 +1035,15 @@ impl LendingContract {
         set_loan_status(&env, loan.id, LoanStatus::Defaulted);
 
         let default_time = env.ledger().timestamp();
-        env.storage().persistent().set(&(symbol_short!("DEF_TIME"), borrower.clone()), &default_time);
-        env.storage()
-            .persistent()
-            .extend_ttl(&(symbol_short!("DEF_TIME"), borrower.clone()), TTL_THRESHOLD, TTL_TARGET);
+        env.storage().persistent().set(
+            &(symbol_short!("DEF_TIME"), borrower.clone()),
+            &default_time,
+        );
+        env.storage().persistent().extend_ttl(
+            &(symbol_short!("DEF_TIME"), borrower.clone()),
+            TTL_THRESHOLD,
+            TTL_TARGET,
+        );
 
         let borrower_key_val = borrower_key(&borrower);
         if let Some(mut borrower_record) = env
@@ -1138,7 +1165,10 @@ impl LendingContract {
         }
 
         if let Some(idx) = found_index {
-            let vouch = vouches.get(idx).unwrap();
+            let vouch = match vouches.get(idx) {
+                Some(vouch) => vouch,
+                None => panic_with_error!(&env, ContractError::VouchWithdrawNotAllowed),
+            };
             let stake = vouch.stake;
 
             vouches.remove(idx);
@@ -1179,12 +1209,7 @@ impl LendingContract {
     ///
     /// This is a pure view calculation: it does not read or write contract
     /// storage and leaves score/oracle policy to the caller.
-    pub fn get_collateral_value(
-        _env: Env,
-        asset_base_value: u64,
-        score: u32,
-        ltv_bps: u32,
-    ) -> u64 {
+    pub fn get_collateral_value(_env: Env, asset_base_value: u64, score: u32, ltv_bps: u32) -> u64 {
         let score = u64::from(score.min(100));
         let ltv_bps = u64::from(ltv_bps.min(10_000));
         ((u128::from(asset_base_value) * u128::from(score) * u128::from(ltv_bps)) / 1_000_000)
@@ -1238,19 +1263,27 @@ impl LendingContract {
     /// Admin-only: configure the lifecycle contract address used for collateral checks (#1019, #1020).
     pub fn set_lifecycle_contract(env: Env, admin: Address, lifecycle_addr: Address) {
         require_admin(&env, &admin);
+        let old_lifecycle_addr: Option<Address> =
+            env.storage().persistent().get(&symbol_short!("LIFECYCLE"));
         env.storage()
             .persistent()
             .set(&symbol_short!("LIFECYCLE"), &lifecycle_addr);
         extend_persistent_ttl(&env, &symbol_short!("LIFECYCLE"));
+        env.events()
+            .publish((LIFECYCLE_SET,), (old_lifecycle_addr, lifecycle_addr));
     }
 
     /// Admin-only: configure the asset registry contract address used for LTV checks (#1020).
     pub fn set_asset_registry_contract(env: Env, admin: Address, registry_addr: Address) {
         require_admin(&env, &admin);
+        let old_registry_addr: Option<Address> =
+            env.storage().persistent().get(&symbol_short!("ASSETREG"));
         env.storage()
             .persistent()
             .set(&symbol_short!("ASSETREG"), &registry_addr);
         extend_persistent_ttl(&env, &symbol_short!("ASSETREG"));
+        env.events()
+            .publish((ASSET_REGISTRY_SET,), (old_registry_addr, registry_addr));
     }
 
     /// Admin-only: set the maximum LTV basis points in the stored config (#1020).
@@ -1271,8 +1304,7 @@ impl LendingContract {
             .persistent()
             .set(&BASE_MAX_LTV_KEY, &max_ltv_bps);
         extend_persistent_ttl(&env, &BASE_MAX_LTV_KEY);
-        env.events()
-            .publish((LTV_SET,), (old_ltv_bps, max_ltv_bps));
+        env.events().publish((LTV_SET,), (old_ltv_bps, max_ltv_bps));
     }
 
     /// Returns the credit score for a borrower based on their repayment/default history.
@@ -1282,7 +1314,10 @@ impl LendingContract {
     pub fn get_credit_score(env: Env, borrower: Address) -> u32 {
         let borrower_key_val = borrower_key(&borrower);
         let borrower_record: Option<Borrower> = env.storage().persistent().get(&borrower_key_val);
-        let repayment_count = borrower_record.as_ref().map(|b| b.repayment_count).unwrap_or(0);
+        let repayment_count = borrower_record
+            .as_ref()
+            .map(|b| b.repayment_count)
+            .unwrap_or(0);
         let default_count = borrower_record.map(|b| b.default_count).unwrap_or(0);
 
         let total = repayment_count + default_count;
@@ -1294,16 +1329,12 @@ impl LendingContract {
 
     /// Returns the configured lifecycle contract address, if any.
     pub fn get_lifecycle_contract(env: Env) -> Option<Address> {
-        env.storage()
-            .persistent()
-            .get(&symbol_short!("LIFECYCLE"))
+        env.storage().persistent().get(&symbol_short!("LIFECYCLE"))
     }
 
     /// Returns the configured asset registry contract address, if any.
     pub fn get_asset_registry_contract(env: Env) -> Option<Address> {
-        env.storage()
-            .persistent()
-            .get(&symbol_short!("ASSETREG"))
+        env.storage().persistent().get(&symbol_short!("ASSETREG"))
     }
 
     /// Record a lien on an asset. Only the contract admin may call this.
@@ -1354,21 +1385,14 @@ impl LendingContract {
         env.storage()
             .persistent()
             .extend_ttl(&la_key, TTL_THRESHOLD, TTL_TARGET);
-        env.events()
-            .publish((LIEN_CREATED,), (asset_id, loan_id));
+        env.events().publish((LIEN_CREATED,), (asset_id, loan_id));
     }
 
     /// Release a lien only after its loan has been repaid or defaulted.
     ///
     /// Panics with [`ContractError::LienNotFound`] if no matching lien exists
     /// for the given asset, lender, and loan_id.
-    pub fn release_lien(
-        env: Env,
-        admin: Address,
-        asset_id: u64,
-        lender: Address,
-        loan_id: u64,
-    ) {
+    pub fn release_lien(env: Env, admin: Address, asset_id: u64, lender: Address, loan_id: u64) {
         require_admin(&env, &admin);
 
         let key = liens_key(asset_id);
@@ -1410,8 +1434,7 @@ impl LendingContract {
                 {
                     env.storage().persistent().remove(&loan_asset_key(loan_id));
                 }
-                env.events()
-                    .publish((LIEN_RELEASED,), (asset_id, loan_id));
+                env.events().publish((LIEN_RELEASED,), (asset_id, loan_id));
             }
             None => panic_with_error!(&env, ContractError::LienNotFound),
         }
@@ -1434,8 +1457,7 @@ impl LendingContract {
             .persistent()
             .set(&MARKET_ORACLE_KEY, &oracle_addr);
         extend_persistent_ttl(&env, &MARKET_ORACLE_KEY);
-        env.events()
-            .publish((ORACLE_SET,), (oracle_addr.clone(),));
+        env.events().publish((ORACLE_SET,), (oracle_addr.clone(),));
     }
 
     /// Adjust LTV based on current market conditions (volatility).
@@ -1452,19 +1474,16 @@ impl LendingContract {
 
         let mut config = get_config(&env);
         let original_ltv = config.max_ltv_bps;
-        let base_ltv: u32 = if let Some(base_ltv) = env
-            .storage()
-            .persistent()
-            .get(&BASE_MAX_LTV_KEY)
-        {
-            base_ltv
-        } else {
-            env.storage()
-                .persistent()
-                .set(&BASE_MAX_LTV_KEY, &original_ltv);
-            extend_persistent_ttl(&env, &BASE_MAX_LTV_KEY);
-            original_ltv
-        };
+        let base_ltv: u32 =
+            if let Some(base_ltv) = env.storage().persistent().get(&BASE_MAX_LTV_KEY) {
+                base_ltv
+            } else {
+                env.storage()
+                    .persistent()
+                    .set(&BASE_MAX_LTV_KEY, &original_ltv);
+                extend_persistent_ttl(&env, &BASE_MAX_LTV_KEY);
+                original_ltv
+            };
 
         // Reduce LTV when volatility exceeds 3000 bps
         if volatility > 3000 {
@@ -1501,13 +1520,21 @@ impl LendingContract {
         extend_persistent_ttl(&env, &symbol_short!("LTV_CNT"));
 
         // Emit event
-        env.events().publish((LTV_ADJUSTED,), (original_ltv, config.max_ltv_bps, volatility));
+        env.events().publish(
+            (LTV_ADJUSTED,),
+            (original_ltv, config.max_ltv_bps, volatility),
+        );
 
         config.max_ltv_bps
     }
 
     /// Update market conditions (volatility data from oracle).
-    pub fn update_market_conditions(env: Env, admin: Address, volatility: u32, price_change_bps: i32) {
+    pub fn update_market_conditions(
+        env: Env,
+        admin: Address,
+        volatility: u32,
+        price_change_bps: i32,
+    ) {
         require_admin(&env, &admin);
 
         let market = MarketCondition {
@@ -1516,7 +1543,9 @@ impl LendingContract {
             price_change_bps,
         };
 
-        env.storage().persistent().set(&MARKET_CONDITION_KEY, &market);
+        env.storage()
+            .persistent()
+            .set(&MARKET_CONDITION_KEY, &market);
         extend_persistent_ttl(&env, &MARKET_CONDITION_KEY);
         env.events()
             .publish((MARKET_UPDATED,), (volatility, price_change_bps));
@@ -1551,7 +1580,8 @@ impl LendingContract {
             if share == 0 {
                 panic_with_error!(&env, ContractError::ZeroSyndicateShare);
             }
-            total_shares = total_shares.checked_add(share)
+            total_shares = total_shares
+                .checked_add(share)
                 .unwrap_or_else(|| panic_with_error!(&env, ContractError::StakeSummationOverflow));
         }
 
@@ -1568,10 +1598,13 @@ impl LendingContract {
             created_at: env.ledger().timestamp(),
         };
 
-        env.storage().persistent().set(&syndicate_key(loan_id), &syndicate);
+        env.storage()
+            .persistent()
+            .set(&syndicate_key(loan_id), &syndicate);
         extend_persistent_ttl(&env, &syndicate_key(loan_id));
 
-        env.events().publish((SYNDICATE_CREATED,), (loan_id, quorum_required));
+        env.events()
+            .publish((SYNDICATE_CREATED,), (loan_id, quorum_required));
     }
 
     /// Cast a vote in a syndicate for a specific action.
@@ -1675,10 +1708,15 @@ impl LendingContract {
             proposed_at: env.ledger().timestamp(),
         };
 
-        env.storage().persistent().set(&restructure_key(loan_id), &proposal);
+        env.storage()
+            .persistent()
+            .set(&restructure_key(loan_id), &proposal);
         extend_persistent_ttl(&env, &restructure_key(loan_id));
 
-        env.events().publish((RESTRUCTURE_PROPOSED,), (loan_id, new_deadline, reduced_payment_amount));
+        env.events().publish(
+            (RESTRUCTURE_PROPOSED,),
+            (loan_id, new_deadline, reduced_payment_amount),
+        );
     }
 
     /// Accept a loan restructure proposal.
@@ -1716,7 +1754,11 @@ impl LendingContract {
 
         // Check restructuring limits (max 3 restructures per borrower)
         let borrower_count_key = restructure_count_key(&proposal.borrower);
-        let count: u32 = env.storage().persistent().get(&borrower_count_key).unwrap_or(0);
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&borrower_count_key)
+            .unwrap_or(0);
         if count >= 3 {
             panic_with_error!(&env, ContractError::RestructureLimitExceeded);
         }
@@ -1736,20 +1778,27 @@ impl LendingContract {
         }
         loan.amount = proposal.reduced_payment_amount;
         loan.deadline = proposal.new_deadline;
-        env.storage().persistent().set(&loan_key(&proposal.borrower), &loan);
+        env.storage()
+            .persistent()
+            .set(&loan_key(&proposal.borrower), &loan);
         extend_persistent_ttl(&env, &loan_key(&proposal.borrower));
 
         // Increment restructure count
-        env.storage().persistent().set(&borrower_count_key, &(count + 1));
+        env.storage()
+            .persistent()
+            .set(&borrower_count_key, &(count + 1));
         extend_persistent_ttl(&env, &borrower_count_key);
 
         // Mark the proposal as accepted in the same logical write so it cannot be replayed.
         let mut accepted = proposal.clone();
         accepted.status = 1;
-        env.storage().persistent().set(&restructure_key(loan_id), &accepted);
+        env.storage()
+            .persistent()
+            .set(&restructure_key(loan_id), &accepted);
         extend_persistent_ttl(&env, &restructure_key(loan_id));
 
-        env.events().publish((RESTRUCTURE_ACCEPTED,), (loan_id, proposal.new_deadline));
+        env.events()
+            .publish((RESTRUCTURE_ACCEPTED,), (loan_id, proposal.new_deadline));
     }
 
     /// Get restructure proposal details.
@@ -1800,7 +1849,10 @@ impl LendingContract {
         env.storage().persistent().set(&lender_key, &lender);
         extend_persistent_ttl(&env, &lender_key);
 
-        env.events().publish((INSURANCE_REGISTERED,), (asset_id, policy_id, coverage_amount));
+        env.events().publish(
+            (INSURANCE_REGISTERED,),
+            (asset_id, policy_id, coverage_amount),
+        );
     }
 
     /// Claim insurance for asset loss (lender-only).
@@ -1837,11 +1889,7 @@ impl LendingContract {
             if tok.balance(&env.current_contract_address()) < payout as i128 {
                 panic_with_error!(&env, ContractError::InsufficientFunds);
             }
-            tok.transfer(
-                &env.current_contract_address(),
-                &lender,
-                &(payout as i128),
-            );
+            tok.transfer(&env.current_contract_address(), &lender, &(payout as i128));
         }
 
         let payout_record = InsurancePayout {
@@ -1852,12 +1900,22 @@ impl LendingContract {
         };
 
         // Store payout history
-        let payout_index: u64 = env.storage().persistent().get(&symbol_short!("INS_IDX")).unwrap_or(0);
-        env.storage().persistent().set(&insurance_payout_key(asset_id, payout_index), &payout_record);
+        let payout_index: u64 = env
+            .storage()
+            .persistent()
+            .get(&symbol_short!("INS_IDX"))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &insurance_payout_key(asset_id, payout_index),
+            &payout_record,
+        );
         extend_persistent_ttl(&env, &insurance_payout_key(asset_id, payout_index));
-        env.storage().persistent().set(&symbol_short!("INS_IDX"), &(payout_index + 1));
+        env.storage()
+            .persistent()
+            .set(&symbol_short!("INS_IDX"), &(payout_index + 1));
 
-        env.events().publish((INSURANCE_CLAIMED,), (asset_id, loss_amount, payout));
+        env.events()
+            .publish((INSURANCE_CLAIMED,), (asset_id, loss_amount, payout));
 
         payout
     }
@@ -1873,12 +1931,14 @@ impl LendingContract {
         let mut index = 0u64;
 
         loop {
-            let payout: Option<InsurancePayout> = env.storage().persistent()
+            let payout: Option<InsurancePayout> = env
+                .storage()
+                .persistent()
                 .get(&insurance_payout_key(asset_id, index));
-            if payout.is_none() {
-                break;
+            match payout {
+                Some(payout) => payouts.push_back(payout),
+                None => break,
             }
-            payouts.push_back(payout.unwrap());
             index += 1;
         }
 
@@ -1890,6 +1950,7 @@ impl LendingContract {
 mod tests {
     use super::*;
     use soroban_sdk::testutils::{Address as _, Events, Ledger};
+    use soroban_sdk::{Symbol, TryFromVal};
 
     #[test]
     fn test_is_initialized() {
@@ -2394,10 +2455,12 @@ mod tests {
 
         client.record_lien(&admin, &asset_id, &lender1, &42, &1000);
 
-        let creation_ttl = env.as_contract(&contract_id, || {
-            env.storage().persistent().get_ttl(&key)
-        });
-        assert!(creation_ttl >= TTL_TARGET, "lien TTL must be extended on creation");
+        let creation_ttl =
+            env.as_contract(&contract_id, || env.storage().persistent().get_ttl(&key));
+        assert!(
+            creation_ttl >= TTL_TARGET,
+            "lien TTL must be extended on creation"
+        );
 
         env.ledger().with_mut(|ledger| {
             ledger.sequence_number += TTL_TARGET - TTL_THRESHOLD + 1;
@@ -2405,10 +2468,11 @@ mod tests {
         let lender2 = Address::generate(&env);
         client.record_lien(&admin, &asset_id, &lender2, &43, &2000);
 
-        let update_ttl = env.as_contract(&contract_id, || {
-            env.storage().persistent().get_ttl(&key)
-        });
-        assert!(update_ttl >= TTL_TARGET, "lien TTL must be extended on update");
+        let update_ttl = env.as_contract(&contract_id, || env.storage().persistent().get_ttl(&key));
+        assert!(
+            update_ttl >= TTL_TARGET,
+            "lien TTL must be extended on update"
+        );
     }
 
     #[test]
@@ -2717,8 +2781,12 @@ mod tests {
         struct MockLifecycleLow;
         #[contractimpl]
         impl MockLifecycleLow {
-            pub fn is_collateral_eligible(_env: Env, _asset_id: u64) -> bool { true }
-            pub fn get_collateral_score(_env: Env, _asset_id: u64) -> u32 { 50u32 }
+            pub fn is_collateral_eligible(_env: Env, _asset_id: u64) -> bool {
+                true
+            }
+            pub fn get_collateral_score(_env: Env, _asset_id: u64) -> u32 {
+                50u32
+            }
         }
         let lifecycle_id = env.register(MockLifecycleLow, ());
 
@@ -2739,10 +2807,7 @@ mod tests {
         //   max_loan_cap = amount * 50 * 5000 / (100 * 10_000) = amount * 0.25
         // So any non-zero amount exceeds the cap (amount > amount * 0.25).
         let result = client.try_request_loan(&borrower, &10_000, &1u64);
-        assert!(
-            result.is_err(),
-            "Loan exceeding LTV cap must be rejected"
-        );
+        assert!(result.is_err(), "Loan exceeding LTV cap must be rejected");
     }
 
     /// #1020: When LTV enforcement is disabled (max_ltv_bps = 0),
@@ -2841,9 +2906,7 @@ mod tests {
         assert!(client
             .try_register_collateral_insurance(&lender, &8, &456, &0)
             .is_err());
-        assert!(client
-            .try_claim_insurance(&other_lender, &7, &100)
-            .is_err());
+        assert!(client.try_claim_insurance(&other_lender, &7, &100).is_err());
         assert_eq!(client.get_insurance(&7), Some(insurance));
         assert_eq!(client.claim_insurance(&lender, &7, &100), 100);
     }
@@ -3038,5 +3101,71 @@ mod tests {
             }
         });
         assert!(found, "set_max_ltv_bps must emit ltv_set event");
+    }
+
+    // ── issue #2010: lending contract dependency events ───────────────────
+
+    #[test]
+    fn test_set_lifecycle_contract_emits_old_and_new_addresses() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (contract_id, admin, _) = setup_contract(&env);
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let old_lifecycle = Address::generate(&env);
+        let new_lifecycle = Address::generate(&env);
+        client.set_lifecycle_contract(&admin, &old_lifecycle);
+        client.set_lifecycle_contract(&admin, &new_lifecycle);
+
+        let events = env.events().all();
+        let found = events.iter().any(|(event_contract, topics, data)| {
+            if event_contract != contract_id {
+                return false;
+            }
+            let topic_ok = topics.len() == 1
+                && Symbol::try_from_val(&env, &topics.get(0).unwrap())
+                    == Ok(symbol_short!("life_set"));
+            let payload_ok = <(Option<Address>, Address)>::try_from_val(&env, &data)
+                .map(|(old, new)| old == Some(old_lifecycle.clone()) && new == new_lifecycle)
+                .unwrap_or(false);
+            topic_ok && payload_ok
+        });
+        assert!(
+            found,
+            "set_lifecycle_contract must emit life_set with the old and new addresses"
+        );
+    }
+
+    #[test]
+    fn test_set_asset_registry_contract_emits_old_and_new_addresses() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let (contract_id, admin, _) = setup_contract(&env);
+        let client = LendingContractClient::new(&env, &contract_id);
+
+        let old_registry = Address::generate(&env);
+        let new_registry = Address::generate(&env);
+        client.set_asset_registry_contract(&admin, &old_registry);
+        client.set_asset_registry_contract(&admin, &new_registry);
+
+        let events = env.events().all();
+        let found = events.iter().any(|(event_contract, topics, data)| {
+            if event_contract != contract_id {
+                return false;
+            }
+            let topic_ok = topics.len() == 1
+                && Symbol::try_from_val(&env, &topics.get(0).unwrap())
+                    == Ok(symbol_short!("asrg_set"));
+            let payload_ok = <(Option<Address>, Address)>::try_from_val(&env, &data)
+                .map(|(old, new)| old == Some(old_registry.clone()) && new == new_registry)
+                .unwrap_or(false);
+            topic_ok && payload_ok
+        });
+        assert!(
+            found,
+            "set_asset_registry_contract must emit asrg_set with the old and new addresses"
+        );
     }
 }

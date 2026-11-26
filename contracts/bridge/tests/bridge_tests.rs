@@ -1,6 +1,9 @@
 //! Tests for the cross-chain bridge contract (#1743, #1744).
 
-use bridge::{Bridge, BridgeClient, ChainConfig, ContractError, ReleaseParams, SwapStatus, SWAP_SCOPE};
+use bridge::{
+    Bridge, BridgeClient, ChainConfig, ContractError, ReleaseParams, SwapStatus,
+    MAX_DEST_ADDRESS_LEN, MAX_PREIMAGE_LEN, SWAP_SCOPE,
+};
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger},
     symbol_short,
@@ -1345,4 +1348,64 @@ fn test_swap_scope_cannot_be_registered_as_chain() {
         .client
         .try_add_chain(&ctx.admin, &SWAP_SCOPE, &eth_config(&ctx.env))
         .is_err());
+}
+
+#[test]
+fn test_add_chain_rejects_address_len_above_max() {
+    let ctx = setup();
+
+    let mut at_max = eth_config(&ctx.env);
+    at_max.address_len = MAX_DEST_ADDRESS_LEN;
+    ctx.client.add_chain(&ctx.admin, &2, &at_max);
+    assert_eq!(ctx.client.get_chain(&2).address_len, MAX_DEST_ADDRESS_LEN);
+
+    let mut over_max = eth_config(&ctx.env);
+    over_max.address_len = MAX_DEST_ADDRESS_LEN + 1;
+    let res = ctx.client.try_add_chain(&ctx.admin, &3, &over_max);
+    assert!(is_contract_error(res, ContractError::InvalidConfig));
+}
+
+#[test]
+fn test_bridge_out_dest_address_max_length_boundary() {
+    let ctx = setup();
+    let mut cfg = eth_config(&ctx.env);
+    cfg.address_len = MAX_DEST_ADDRESS_LEN;
+    ctx.client.add_chain(&ctx.admin, &2, &cfg);
+    ctx.client.set_token_allowed(&ctx.admin, &2, &ctx.token, &true);
+
+    let user = Address::generate(&ctx.env);
+    mint(&ctx, &user, 500);
+
+    let at_max = Bytes::from_slice(&ctx.env, &[b'a'; MAX_DEST_ADDRESS_LEN as usize]);
+    assert_eq!(
+        ctx.client
+            .bridge_out(&user, &ctx.token, &100, &2, &at_max),
+        1
+    );
+    assert_eq!(balance(&ctx, &user), 400);
+
+    let over_max = Bytes::from_slice(&ctx.env, &[b'a'; MAX_DEST_ADDRESS_LEN as usize + 1]);
+    let res = ctx
+        .client
+        .try_bridge_out(&user, &ctx.token, &100, &2, &over_max);
+    assert!(is_contract_error(res, ContractError::InputTooLong));
+    assert_eq!(balance(&ctx, &user), 400);
+}
+
+#[test]
+fn test_claim_swap_preimage_max_length_boundary() {
+    let ctx = setup();
+
+    let at_max = Bytes::from_slice(&ctx.env, &[b'k'; MAX_PREIMAGE_LEN as usize]);
+    let (id_ok, _, recipient_ok) = open_swap(&ctx, &at_max, 1_000);
+    ctx.client.claim_swap(&id_ok, &at_max);
+    assert_eq!(balance(&ctx, &recipient_ok), 200);
+    assert_eq!(ctx.client.get_swap(&id_ok).status, SwapStatus::Claimed);
+
+    let over_max = Bytes::from_slice(&ctx.env, &[b'k'; MAX_PREIMAGE_LEN as usize + 1]);
+    let (id_over, _, recipient_over) = open_swap(&ctx, &over_max, 1_000);
+    let res = ctx.client.try_claim_swap(&id_over, &over_max);
+    assert!(is_contract_error(res, ContractError::InputTooLong));
+    assert_eq!(balance(&ctx, &recipient_over), 0);
+    assert_eq!(ctx.client.get_swap(&id_over).status, SwapStatus::Open);
 }

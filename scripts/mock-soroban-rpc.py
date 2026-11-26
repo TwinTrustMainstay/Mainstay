@@ -5,6 +5,8 @@ import argparse
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import threading
+
 
 
 DEFAULT_RESPONSES = {
@@ -16,6 +18,8 @@ DEFAULT_RESPONSES = {
     },
 }
 
+
+FAILURE_LOCK = threading.Lock()
 
 def load_responses(path):
     if path is None:
