@@ -2073,6 +2073,10 @@ impl EngineerRegistry {
                 schedules.set(i, schedule);
                 env.storage().persistent().set(&key, &schedules);
                 extend_persistent_ttl(&env, &key);
+                env.events().publish(
+                    (symbol_short!("CNCL_CALL"), engineer),
+                    (schedule_id, region),
+                );
                 return;
             }
         }
@@ -6673,3 +6677,43 @@ mod tests {
         );
     }
 }
+
+    #[test]
+    fn test_cancel_on_call_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+
+        // Add an on-call schedule
+        let schedule_id = client.add_on_call(&engineer, &Region::NorthAmerica, &100, &200);
+
+        // Cancel the on-call schedule
+        client.cancel_on_call(&engineer, &Region::NorthAmerica, &schedule_id);
+
+        // Verify the event was emitted
+        use soroban_sdk::TryIntoVal;
+        let events = env.events().all();
+        
+        // Find the CNCL_CALL event (should be the last event)
+        let (_, topics, data) = events.last().unwrap();
+        
+        let topic0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        let topic1: Address = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        
+        assert_eq!(topic0, symbol_short!("CNCL_CALL"));
+        assert_eq!(topic1, engineer);
+        
+        // Verify event data contains schedule_id and region
+        let event_schedule_id: u64 = data.get(0).unwrap().try_into_val(&env).unwrap();
+        let event_region: Region = data.get(1).unwrap().try_into_val(&env).unwrap();
+        
+        assert_eq!(event_schedule_id, schedule_id);
+        assert_eq!(event_region, Region::NorthAmerica);
+    }
