@@ -62,6 +62,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Lifecycle contract now emits events for score-anomaly creation (`ANOMALY`), anomaly investigation-status transitions (`ANOM_STS`), and peer-group registration (`PEER_GRP`), so operators can alert on new anomalies and peer-group benchmark changes (closes [#1998](https://github.com/TwinTrustMainstay/Mainstay/issues/1998), [#1999](https://github.com/TwinTrustMainstay/Mainstay/issues/1999))
 
 ### Fixed
+- `analytics`: logistic regression training now stops early when the loss change falls below the configured tolerance, instead of always running the full epoch budget (closes [#2033](https://github.com/TwinTrustMainstay/Mainstay/issues/2033))
+- `engineer-bond`: `open_dispute` now rejects reasons longer than 256 bytes so a single dispute cannot write an unbounded string to storage or the event log (closes [#2044](https://github.com/TwinTrustMainstay/Mainstay/issues/2044))
 - Engineer bonds (#1962, #1963, #1964): `slash` is refused while a dispute is
   open. Disputes lapse after a 30-day deadline so a bond cannot be locked
   forever. `open_dispute` and `record_performance` reject engineers with no
