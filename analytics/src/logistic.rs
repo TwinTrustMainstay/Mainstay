@@ -1,4 +1,6 @@
 //! Standardised logistic regression trained by deterministic batch gradient descent.
+//! Training stops early once the loss change falls below [`TrainConfig::tolerance`], and the
+//! model reports whether it converged.
 
 /// Errors raised when a model cannot be trained on the supplied data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7,10 +9,23 @@ pub enum TrainError {
     Empty,
     /// Feature rows have inconsistent lengths, or the row and label counts differ.
     DimensionMismatch,
-    /// A feature value is NaN or infinite.
+    /// A feature value or the computed loss is NaN or infinite.
     NonFinite,
     /// All labels are identical, so there is nothing to discriminate.
     SingleClass,
+}
+
+/// Optimisation state reported alongside a trained model.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ConvergenceReport {
+    /// Whether training stopped because the loss change fell below the tolerance.
+    pub converged: bool,
+    /// Number of gradient-descent epochs completed.
+    pub epochs: usize,
+    /// Objective value after the last completed epoch.
+    pub final_loss: f64,
+    /// Absolute change in the objective over the last epoch.
+    pub loss_change: f64,
 }
 
 /// Hyper-parameters for training. The defaults are tuned for the small,
@@ -21,11 +36,13 @@ pub struct TrainConfig {
     pub learning_rate: f64,
     /// L2 regularisation strength applied to the weights (not the bias).
     pub l2: f64,
+    /// Stop training when the absolute loss change between epochs is below this value.
+    pub tolerance: f64,
 }
 
 impl Default for TrainConfig {
     fn default() -> Self {
-        Self { epochs: 500, learning_rate: 0.1, l2: 1e-3 }
+        Self { epochs: 500, learning_rate: 0.1, l2: 1e-3, tolerance: 1e-4 }
     }
 }
 
@@ -37,10 +54,16 @@ pub struct LogisticModel {
     scales: Vec<f64>,
     weights: Vec<f64>,
     bias: f64,
+    /// Optimisation state captured when training stopped.
+    pub convergence: ConvergenceReport,
 }
 
 impl LogisticModel {
     /// Train on rows `xs` (one feature vector per sample) and boolean labels `ys`.
+    ///
+    /// Training stops when the loss change falls below `cfg.tolerance` or the `cfg.epochs`
+    /// budget is exhausted. The returned model reports which happened in
+    /// [`LogisticModel::convergence`].
     pub fn train(xs: &[Vec<f64>], ys: &[bool], cfg: TrainConfig) -> Result<Self, TrainError> {
         if xs.is_empty() {
             return Err(TrainError::Empty);
@@ -81,7 +104,16 @@ impl LogisticModel {
 
         let mut weights = vec![0.0; d];
         let mut bias = 0.0;
-        for _ in 0..cfg.epochs {
+        let mut previous_loss = loss(&zs, ys, &weights, bias, cfg.l2);
+        if !previous_loss.is_finite() {
+            return Err(TrainError::NonFinite);
+        }
+        let mut final_loss = previous_loss;
+        let mut loss_change = 0.0;
+        let mut completed_epochs = 0;
+        let mut converged = false;
+
+        for epoch in 1..=cfg.epochs {
             let mut grad_w = vec![0.0; d];
             let mut grad_b = 0.0;
             for (z, &y) in zs.iter().zip(ys) {
@@ -96,9 +128,27 @@ impl LogisticModel {
                 *w -= cfg.learning_rate * (g / n + cfg.l2 * *w);
             }
             bias -= cfg.learning_rate * grad_b / n;
+
+            final_loss = loss(&zs, ys, &weights, bias, cfg.l2);
+            if !final_loss.is_finite() {
+                return Err(TrainError::NonFinite);
+            }
+            loss_change = (previous_loss - final_loss).abs();
+            completed_epochs = epoch;
+            if loss_change < cfg.tolerance {
+                converged = true;
+                break;
+            }
+            previous_loss = final_loss;
         }
 
-        Ok(Self { means, scales, weights, bias })
+        let convergence = ConvergenceReport {
+            converged,
+            epochs: completed_epochs,
+            final_loss,
+            loss_change,
+        };
+        Ok(Self { means, scales, weights, bias, convergence })
     }
 
     /// Probability that the positive class applies. `None` if `x` has the wrong length
@@ -119,6 +169,34 @@ impl LogisticModel {
     pub fn feature_count(&self) -> usize {
         self.weights.len()
     }
+
+    /// Optimisation state captured when training stopped.
+    pub fn convergence(&self) -> ConvergenceReport {
+        self.convergence
+    }
+
+    /// Whether training stopped because the loss settled below the tolerance.
+    pub fn is_converged(&self) -> bool {
+        self.convergence.converged
+    }
+}
+
+fn loss(zs: &[Vec<f64>], ys: &[bool], weights: &[f64], bias: f64, l2: f64) -> f64 {
+    let data_loss = zs
+        .iter()
+        .zip(ys)
+        .map(|(z, &y)| {
+            let logit = dot(weights, z) + bias;
+            softplus(logit) - if y { logit } else { 0.0 }
+        })
+        .sum::<f64>()
+        / zs.len() as f64;
+    let reg = 0.5 * l2 * weights.iter().map(|w| w * w).sum::<f64>();
+    data_loss + reg
+}
+
+fn softplus(z: f64) -> f64 {
+    if z > 40.0 { z } else { (1.0 + z.exp()).ln() }
 }
 
 fn sigmoid(z: f64) -> f64 {
@@ -138,6 +216,72 @@ mod tests {
         let xs: Vec<Vec<f64>> = (0..40).map(|i| vec![i as f64, (i % 7) as f64]).collect();
         let ys: Vec<bool> = xs.iter().map(|x| x[0] >= 20.0).collect();
         (xs, ys)
+    }
+
+    fn non_separable() -> (Vec<Vec<f64>>, Vec<bool>) {
+        let xs: Vec<Vec<f64>> = (0..40).map(|i| vec![i as f64]).collect();
+        let ys: Vec<bool> = (0..40).map(|i| i % 4 < 2).collect();
+        (xs, ys)
+    }
+
+    #[test]
+    fn separable_data_converges_before_the_epoch_budget() {
+        let (xs, ys) = separable();
+        let cfg = TrainConfig::default();
+        let m = LogisticModel::train(&xs, &ys, cfg).unwrap();
+        let report = m.convergence();
+
+        assert!(m.is_converged());
+        assert_eq!(m.convergence(), report);
+        assert!(report.converged);
+        assert!(report.epochs > 0 && report.epochs < cfg.epochs);
+        assert!(report.loss_change < cfg.tolerance);
+        assert!(report.final_loss.is_finite());
+
+        let correct = xs
+            .iter()
+            .zip(&ys)
+            .filter(|(x, &y)| (m.predict_proba(x).unwrap() >= 0.5) == y)
+            .count();
+        assert!(correct as f64 / xs.len() as f64 >= 0.95, "accuracy too low: {correct}");
+    }
+
+    #[test]
+    fn non_separable_data_reports_both_convergence_states() {
+        let (xs, ys) = non_separable();
+        let short_cfg = TrainConfig { epochs: 1, ..TrainConfig::default() };
+        let short_model = LogisticModel::train(&xs, &ys, short_cfg).unwrap();
+        let short_report = short_model.convergence();
+
+        assert!(!short_model.is_converged());
+        assert!(!short_report.converged);
+        assert_eq!(short_report.epochs, short_cfg.epochs);
+        assert!(short_report.loss_change >= short_cfg.tolerance);
+
+        let cfg = TrainConfig::default();
+        let m = LogisticModel::train(&xs, &ys, cfg).unwrap();
+        let report = m.convergence();
+
+        assert!(m.is_converged());
+        assert!(report.epochs > 0 && report.epochs < cfg.epochs);
+        assert!(report.loss_change < cfg.tolerance);
+        assert!(report.final_loss.is_finite());
+        assert!(xs
+            .iter()
+            .all(|x| m.predict_proba(x).unwrap().is_finite()));
+    }
+
+    #[test]
+    fn zero_epoch_budget_reports_an_unconverged_model() {
+        let (xs, ys) = separable();
+        let cfg = TrainConfig { epochs: 0, ..TrainConfig::default() };
+        let m = LogisticModel::train(&xs, &ys, cfg).unwrap();
+
+        let report = m.convergence();
+        assert!(!report.converged);
+        assert_eq!(report.epochs, 0);
+        assert_eq!(report.loss_change, 0.0);
+        assert!((report.final_loss - (2.0f64).ln()).abs() < 1e-12);
     }
 
     #[test]

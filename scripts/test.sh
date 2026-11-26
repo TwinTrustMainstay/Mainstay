@@ -13,4 +13,11 @@ fi
 
 echo "Running Mainstay tests (workspace) from $ROOT ..."
 cargo test --workspace "$@"
+
+# Event streaming resume-from-state test (stream-events.sh)
+if [[ -f "$ROOT/scripts/stream-events.sh" ]]; then
+  echo "Running stream-events.sh resume test ..."
+  bash "$ROOT/scripts/test-stream-events.sh"
+fi
+
 echo "All tests passed."

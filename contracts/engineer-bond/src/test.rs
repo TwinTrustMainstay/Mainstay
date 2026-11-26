@@ -2,7 +2,7 @@
 
 use crate::{
     DisputeOutcome, EngineerBond, EngineerBondClient, EventKind, DISPUTE_TIMEOUT_SECS, MAX_HISTORY,
-    RECOVERY_STREAK,
+    MAX_REASON_LEN, RECOVERY_STREAK,
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
@@ -644,6 +644,35 @@ fn open_dispute_rejects_empty_reason() {
         &ctx.admin,
         &eng,
         &String::from_str(&env, ""),
+        &test_evidence(&env),
+    );
+}
+
+#[test]
+fn open_dispute_accepts_reason_at_max_length() {
+    let env = Env::default();
+    let ctx = setup(&env, 0);
+    let eng = funded_engineer(&ctx, 1_000);
+    ctx.client.post_bond(&eng, &500);
+    let reason = String::from_str(&env, &"r".repeat(MAX_REASON_LEN as usize));
+    let id = ctx
+        .client
+        .open_dispute(&ctx.admin, &eng, &reason, &test_evidence(&env));
+
+    assert_eq!(ctx.client.get_dispute(&eng, &id).reason, reason);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #14)")]
+fn open_dispute_rejects_reason_over_max_length() {
+    let env = Env::default();
+    let ctx = setup(&env, 0);
+    let eng = funded_engineer(&ctx, 1_000);
+    ctx.client.post_bond(&eng, &500);
+    ctx.client.open_dispute(
+        &ctx.admin,
+        &eng,
+        &String::from_str(&env, &"r".repeat(MAX_REASON_LEN as usize + 1)),
         &test_evidence(&env),
     );
 }

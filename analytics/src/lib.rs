@@ -6,7 +6,8 @@
 //! deterministic so that the same history always produces the same weights.
 //!
 //! Modules:
-//! - [`logistic`]: standardised logistic regression trained with batch gradient descent.
+//! - [`logistic`]: standardised logistic regression trained with batch gradient descent and
+//!   early stopping; models report their convergence state.
 //! - [`failure`]: failure-risk prediction for an asset from its maintenance history.
 //! - [`schedule`]: optimal service-interval recommendation from predicted risk and cost.
 //! - [`ranking`]: engineer performance ranking from historical job outcomes.
@@ -20,4 +21,4 @@ pub mod ranking;
 pub mod schedule;
 pub mod serving;
 
-pub use logistic::{LogisticModel, TrainConfig, TrainError};
+pub use logistic::{ConvergenceReport, LogisticModel, TrainConfig, TrainError};

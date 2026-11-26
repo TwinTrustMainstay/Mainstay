@@ -256,6 +256,7 @@ const ENGINEER_COUNT: Symbol = symbol_short!("ENG_CNT");
 #[allow(dead_code)]
 const REG_ENG_TOPIC: Symbol = symbol_short!("REG_ENG");
 const REVOKE_TOPIC: Symbol = symbol_short!("REV_CRED");
+const REVOKE_PROPOSED_TOPIC: Symbol = symbol_short!("PROP_RVK");
 const SUSPEND_TOPIC: Symbol = symbol_short!("SUSP_ENG");
 #[allow(dead_code)]
 const UNSUSPEND_TOPIC: Symbol = symbol_short!("UNSUSP_E");
@@ -280,6 +281,7 @@ const CE_REQUIREMENT_KEY: Symbol = symbol_short!("CE_REQ");
 const ON_CALL_KEY: Symbol = symbol_short!("ON_CALL");
 const NEXT_ON_CALL_ID_KEY: Symbol = symbol_short!("NXT_OC");
 const AVAILABILITY_KEY: Symbol = symbol_short!("AVAIL");
+const AVAILABILITY_SET_TOPIC: Symbol = symbol_short!("AVAIL_SET");
 const WORKLOAD_KEY: Symbol = symbol_short!("WORK");
 const NEXT_ASSIGNMENT_ID_KEY: Symbol = symbol_short!("NXT_ASG");
 /// Default reputation decay interval: 90 days in seconds (#1315)
@@ -464,14 +466,19 @@ impl EngineerRegistry {
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::EngineerNotFound));
         record.issuer.require_auth();
         let key = revoke_timelock_key(&engineer);
+        let proposed_at = env.ledger().timestamp();
         env.storage().persistent().set(
             &key,
             &TimelockProposal {
-                proposed_at: env.ledger().timestamp(),
+                proposed_at,
                 executed: false,
             },
         );
         extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (REVOKE_PROPOSED_TOPIC, engineer.clone()),
+            (record.issuer.clone(), engineer, proposed_at),
+        );
     }
 
     /// Execute a pending engineer credential revocation after its timelock has expired.
@@ -601,7 +608,7 @@ impl EngineerRegistry {
 
         // Emit engineer registration event
         env.events().publish(
-            (symbol_short!("reg_eng"),),
+            (REG_ENG_TOPIC,),
             (
                 engineer.clone(),
                 credential_hash.clone(),
@@ -1964,6 +1971,10 @@ impl EngineerRegistry {
         record.service_regions = regions;
         env.storage().persistent().set(&engineer_key(&engineer), &record);
         extend_persistent_ttl(&env, &engineer_key(&engineer));
+        env.events().publish(
+            (symbol_short!("SVC_AREA"), engineer.clone()),
+            (engineer.clone(), record.service_regions.clone()),
+        );
     }
 
     pub fn get_engineers_for_region(env: Env, region: Region) -> Vec<Address> {
@@ -2053,12 +2064,19 @@ impl EngineerRegistry {
             .get(&key)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::OnCallScheduleNotFound));
         for i in 0..schedules.len() {
-            let mut schedule = schedules.get(i).unwrap();
+            let mut schedule = match schedules.get(i) {
+                Some(schedule) => schedule,
+                None => panic_with_error!(&env, ContractError::OnCallScheduleNotFound),
+            };
             if schedule.schedule_id == schedule_id && schedule.engineer == engineer {
                 schedule.active = false;
                 schedules.set(i, schedule);
                 env.storage().persistent().set(&key, &schedules);
                 extend_persistent_ttl(&env, &key);
+                env.events().publish(
+                    (symbol_short!("CNCL_CALL"), engineer),
+                    (schedule_id, region),
+                );
                 return;
             }
         }
@@ -2110,7 +2128,7 @@ impl EngineerRegistry {
         if ends_at <= starts_at || max_assignments == 0 {
             panic_with_error!(&env, ContractError::InvalidWorkWindow);
         }
-        let key = (AVAILABILITY_KEY, engineer);
+        let key = (AVAILABILITY_KEY, engineer.clone());
         env.storage().persistent().set(
             &key,
             &AvailabilityWindow {
@@ -2120,6 +2138,10 @@ impl EngineerRegistry {
             },
         );
         extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (AVAILABILITY_SET_TOPIC, engineer.clone()),
+            (engineer, starts_at, ends_at, max_assignments),
+        );
     }
 
     /// Assign work only when the engineer has declared availability and
@@ -2215,7 +2237,10 @@ impl EngineerRegistry {
             .get(&key)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::WorkAssignmentNotFound));
         for i in 0..assignments.len() {
-            let mut assignment = assignments.get(i).unwrap();
+            let mut assignment = match assignments.get(i) {
+                Some(assignment) => assignment,
+                None => panic_with_error!(&env, ContractError::WorkAssignmentNotFound),
+            };
             if assignment.assignment_id == assignment_id {
                 assignment.status = status;
                 assignments.set(i, assignment);
@@ -2612,12 +2637,12 @@ mod tests {
         let issued_at = env.ledger().timestamp();
         client.register_engineer(&engineer, &hash, &issuer, &validity_period, &None);
 
-        // ISS_ADD event fires first, reg_eng is the second event
+        // ISS_ADD event fires first, REG_ENG is the second event
         let events = env.events().all();
         let (_, topics, data) = events.last().unwrap();
 
         use soroban_sdk::TryIntoVal;
-        let reg_topic = symbol_short!("reg_eng");
+        let reg_topic = symbol_short!("REG_ENG");
         let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
         assert_eq!(t0, reg_topic);
 
@@ -2666,6 +2691,38 @@ mod tests {
         assert_eq!(emitted_hash, hash);
         assert_eq!(emitted_revoked_by, issuer);
         assert_eq!(emitted_timestamp, revoked_at);
+    }
+
+    #[test]
+    fn test_propose_revoke_credential_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+
+        let proposed_at = env.ledger().timestamp();
+        client.propose_revoke_credential(&engineer);
+
+        let events = env.events().all();
+        let (_, topics, data) = events.last().unwrap();
+
+        use soroban_sdk::TryIntoVal;
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t0, REVOKE_PROPOSED_TOPIC);
+        let t1: Address = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        assert_eq!(t1, engineer);
+
+        let (emitted_issuer, emitted_engineer, emitted_timestamp): (Address, Address, u64) =
+            data.try_into_val(&env).unwrap();
+        assert_eq!(emitted_issuer, issuer);
+        assert_eq!(emitted_engineer, engineer);
+        assert_eq!(emitted_timestamp, proposed_at);
     }
 
     #[test]
@@ -6620,3 +6677,43 @@ mod tests {
         );
     }
 }
+
+    #[test]
+    fn test_cancel_on_call_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, admin) = setup(&env);
+
+        let engineer = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+
+        client.add_trusted_issuer(&admin, &issuer);
+        client.register_engineer(&engineer, &hash, &issuer, &31_536_000, &None);
+
+        // Add an on-call schedule
+        let schedule_id = client.add_on_call(&engineer, &Region::NorthAmerica, &100, &200);
+
+        // Cancel the on-call schedule
+        client.cancel_on_call(&engineer, &Region::NorthAmerica, &schedule_id);
+
+        // Verify the event was emitted
+        use soroban_sdk::TryIntoVal;
+        let events = env.events().all();
+        
+        // Find the CNCL_CALL event (should be the last event)
+        let (_, topics, data) = events.last().unwrap();
+        
+        let topic0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        let topic1: Address = topics.get(1).unwrap().try_into_val(&env).unwrap();
+        
+        assert_eq!(topic0, symbol_short!("CNCL_CALL"));
+        assert_eq!(topic1, engineer);
+        
+        // Verify event data contains schedule_id and region
+        let event_schedule_id: u64 = data.get(0).unwrap().try_into_val(&env).unwrap();
+        let event_region: Region = data.get(1).unwrap().try_into_val(&env).unwrap();
+        
+        assert_eq!(event_schedule_id, schedule_id);
+        assert_eq!(event_region, Region::NorthAmerica);
+    }

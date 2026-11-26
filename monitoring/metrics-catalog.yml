@@ -86,6 +86,29 @@ metrics:
     source: scripts/monitoring/prometheus-exporter.sh
     description: Days since last service per asset (-1 if never serviced).
 
+  - name: mainstay_auctions_total
+    type: gauge
+    unit: auctions
+    labels: [status]
+    retention: raw
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Auctions by lifecycle status (open, unawarded, awarded, disputed, resolved).
+
+  - name: mainstay_auction_bids_total
+    type: gauge
+    unit: bids
+    retention: raw
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Valid bids across all auctions (bid volume; sealed bids count once revealed).
+
+  - name: mainstay_auction_disputes_total
+    type: gauge
+    unit: auctions
+    labels: [state]
+    retention: raw
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Auction disputes by state (open or resolved).
+
   - name: mainstay_metrics_collection_seconds
     type: gauge
     unit: unix_seconds
@@ -93,9 +116,37 @@ metrics:
     source: scripts/monitoring/prometheus-exporter.sh
     description: Timestamp of the last successful collection.
 
+  - name: mainstay_chain_read_errors_total
+    type: gauge
+    unit: errors
+    retention: raw
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Number of chain reads that failed during the last collection.
+
   - name: mainstay_exporter_up
     type: gauge
     unit: boolean
     retention: raw
     source: scripts/monitoring/prometheus-exporter.sh
     description: Exporter liveness (1 = up).
+
+  - name: mainstay_insurance_reserved_capital
+    type: gauge
+    unit: tokens
+    retention: raw
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Insurance pool capital reserved for pending claims.
+
+  - name: mainstay_insurance_free_capital
+    type: gauge
+    unit: tokens
+    retention: raw
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Unencumbered insurance pool capital available for new coverage or withdrawals.
+
+  - name: mainstay_insurance_open_claims_count
+    type: gauge
+    unit: claims
+    retention: raw
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Number of open (pending) insurance claims.

@@ -118,6 +118,10 @@ Run the deployment script:
 ./scripts/deploy_testnet.sh
 ```
 
+The offline deployment-flow test can be run with
+`python3 scripts/test_deploy_dry_run.py`. It uses a local mocked Soroban RPC
+endpoint and stubbed CLI/HTTP commands, so it does not contact testnet.
+
 The script performs the full testnet deployment in one pass:
 
 1. **Deployer key setup** — generates the `deployer` identity if it does not exist.

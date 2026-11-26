@@ -88,6 +88,8 @@ pub enum ContractError {
     InvalidDepositConfig = 26,
     /// The forfeited deposit pool can only be claimed after the reveal window.
     ForfeitWindowOpen = 27,
+    /// An auction's internally indexed bid data is inconsistent.
+    InvalidAuctionState = 28,
 }
 
 /// Credential status as reported by the engineer registry. Variants must match
@@ -580,8 +582,9 @@ impl Marketplace {
         if len < 2 {
             return None;
         }
-        let prev = history.get(len - 2).unwrap();
-        let curr = history.get(len - 1).unwrap();
+        let (Some(prev), Some(curr)) = (history.get(len - 2), history.get(len - 1)) else {
+            return None;
+        };
         pricing::elasticity_bps(&prev, &curr)
     }
 
@@ -862,9 +865,12 @@ impl Marketplace {
             // in commit order so that ties resolve to the earliest commitment.
             for engineer in committers.iter() {
                 if let Some(idx) = auction::find_bid(&bids, &engineer) {
-                    let bid = bids.get(idx).unwrap();
-                    if is_credentialed(&env, &bid.engineer) {
-                        eligible.push_back(bid);
+                    if let Some(bid) = bids.get(idx) {
+                        if is_credentialed(&env, &bid.engineer) {
+                            eligible.push_back(bid);
+                        }
+                    } else {
+                        panic_with_error!(&env, ContractError::InvalidAuctionState);
                     }
                 }
             }
@@ -884,10 +890,13 @@ impl Marketplace {
 
         match select_winner(&eligible, auction.criterion) {
             Some(idx) => {
-                let bid = eligible.get(idx).unwrap();
-                auction.status = AuctionStatus::Awarded;
-                auction.winner = Some(bid.engineer.clone());
-                auction.winning_price = bid.price;
+                if let Some(bid) = eligible.get(idx) {
+                    auction.status = AuctionStatus::Awarded;
+                    auction.winner = Some(bid.engineer.clone());
+                    auction.winning_price = bid.price;
+                } else {
+                    panic_with_error!(&env, ContractError::InvalidAuctionState);
+                }
             }
             None => {
                 auction.status = AuctionStatus::Unawarded;
@@ -972,7 +981,10 @@ impl Marketplace {
         let bids = load_bids(&env, auction_id);
         let idx = auction::find_bid(&bids, &final_winner)
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::NotABidder));
-        let bid = bids.get(idx).unwrap();
+        let bid = match bids.get(idx) {
+            Some(bid) => bid,
+            None => panic_with_error!(&env, ContractError::NotABidder),
+        };
         // A dispute is upheld when the award changes hands. Naming the original
         // winner again upholds the award, so the disputer's bond is forfeited.
         let upheld = auction.winner.as_ref() != Some(&final_winner);
@@ -1011,6 +1023,33 @@ impl Marketplace {
     /// contains only revealed bids.
     pub fn get_bids(env: Env, auction_id: u64) -> Vec<Bid> {
         load_bids(&env, auction_id)
+    }
+
+    /// Number of auctions created so far. Auction ids run from 1 to this value.
+    pub fn get_auction_count(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::NextAuctionId)
+            .unwrap_or(1u64)
+            .saturating_sub(1)
+    }
+
+    /// Status of an auction as its [`AuctionStatus`] discriminant:
+    /// `0` open, `1` unawarded, `2` awarded, `3` disputed, `4` resolved.
+    ///
+    /// The numeric form keeps off-chain monitoring scripts from having to parse
+    /// the contracttype enum.
+    ///
+    /// # Panics
+    /// - [`ContractError::AuctionNotFound`] if the auction does not exist
+    pub fn get_auction_status(env: Env, auction_id: u64) -> u32 {
+        load_auction(&env, auction_id).status as u32
+    }
+
+    /// Number of valid bids recorded for an auction. For sealed auctions this
+    /// counts revealed bids only.
+    pub fn get_bid_count(env: Env, auction_id: u64) -> u32 {
+        load_bids(&env, auction_id).len()
     }
 }
 
