@@ -123,6 +123,15 @@ jobs:
       - name: Compile benchmark targets
         run: cargo check --workspace --benches
 
+  fuzz-targets:
+    name: Fuzz targets check (#2030, #2031)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check fuzz targets
+        run: cargo check --manifest-path fuzz/Cargo.toml
+
   terraform:
     name: Validate Terraform
     runs-on: ubuntu-latest

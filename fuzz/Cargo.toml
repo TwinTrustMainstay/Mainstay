@@ -32,6 +32,9 @@ path = "../contracts/zk-privacy"
 [dependencies.timestamping]
 path = "../contracts/timestamping"
 
+[dependencies.marketplace]
+path = "../contracts/marketplace"
+
 [dependencies.ed25519-dalek]
 version = "2.2.0"
 
