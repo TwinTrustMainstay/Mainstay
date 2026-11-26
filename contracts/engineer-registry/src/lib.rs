@@ -281,6 +281,7 @@ const CE_REQUIREMENT_KEY: Symbol = symbol_short!("CE_REQ");
 const ON_CALL_KEY: Symbol = symbol_short!("ON_CALL");
 const NEXT_ON_CALL_ID_KEY: Symbol = symbol_short!("NXT_OC");
 const AVAILABILITY_KEY: Symbol = symbol_short!("AVAIL");
+const AVAILABILITY_SET_TOPIC: Symbol = symbol_short!("AVAIL_SET");
 const WORKLOAD_KEY: Symbol = symbol_short!("WORK");
 const NEXT_ASSIGNMENT_ID_KEY: Symbol = symbol_short!("NXT_ASG");
 /// Default reputation decay interval: 90 days in seconds (#1315)
@@ -2123,7 +2124,7 @@ impl EngineerRegistry {
         if ends_at <= starts_at || max_assignments == 0 {
             panic_with_error!(&env, ContractError::InvalidWorkWindow);
         }
-        let key = (AVAILABILITY_KEY, engineer);
+        let key = (AVAILABILITY_KEY, engineer.clone());
         env.storage().persistent().set(
             &key,
             &AvailabilityWindow {
@@ -2133,6 +2134,10 @@ impl EngineerRegistry {
             },
         );
         extend_persistent_ttl(&env, &key);
+        env.events().publish(
+            (AVAILABILITY_SET_TOPIC, engineer.clone()),
+            (engineer, starts_at, ends_at, max_assignments),
+        );
     }
 
     /// Assign work only when the engineer has declared availability and
