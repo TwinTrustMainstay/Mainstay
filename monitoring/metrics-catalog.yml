@@ -129,3 +129,24 @@ metrics:
     retention: raw
     source: scripts/monitoring/prometheus-exporter.sh
     description: Exporter liveness (1 = up).
+
+  - name: mainstay_insurance_reserved_capital
+    type: gauge
+    unit: tokens
+    retention: raw
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Insurance pool capital reserved for pending claims.
+
+  - name: mainstay_insurance_free_capital
+    type: gauge
+    unit: tokens
+    retention: raw
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Unencumbered insurance pool capital available for new coverage or withdrawals.
+
+  - name: mainstay_insurance_open_claims_count
+    type: gauge
+    unit: claims
+    retention: raw
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Number of open (pending) insurance claims.

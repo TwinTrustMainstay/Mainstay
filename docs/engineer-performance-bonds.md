@@ -16,13 +16,15 @@ Contract token, typically native XLM.
 | Treasury | Address receiving slashed funds | Admin at `initialize` |
 | Recovery streak | `RECOVERY_STREAK` = 3 good jobs | Contract constant |
 | History cap | `MAX_HISTORY` = 50 events per engineer | Contract constant |
+| Dispute reason cap | `MAX_REASON_LEN` = 256 bytes | Contract constant |
 
 - **Bonding**: an engineer calls `post_bond`. Tokens move into the contract. The engineer is
   bonded once the balance is at or above `min_bond` and no dispute is open.
 - **Good performance**: `record_performance(good = true)` extends the good-job streak.
 - **Poor performance**: `record_performance(good = false)` resets the streak to zero.
 - **Dispute**: `open_dispute` freezes withdrawals and makes the engineer not bonded.
-  `resolve_dispute` lifts the freeze without penalty.
+  The reason must be non-empty and at most 256 bytes. `resolve_dispute` lifts the freeze
+  without penalty.
 - **Slashing**: `slash` moves part of the bond to the treasury. It also resets the streak.
 - **Recovery**: after any slash, the engineer must reach `RECOVERY_STREAK` consecutive good
   jobs before withdrawing. Good performance is what restores withdrawal rights.

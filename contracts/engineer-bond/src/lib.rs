@@ -36,6 +36,9 @@ pub const DISPUTE_TIMEOUT_SECS: u64 = 30 * 24 * 60 * 60;
 /// is counted in [`EngineerBond::get_history_dropped`], so the loss is never silent.
 pub const MAX_HISTORY: u32 = 50;
 
+/// Maximum length in bytes of a dispute reason.
+pub const MAX_REASON_LEN: u32 = 256;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -66,6 +69,8 @@ pub enum ContractError {
     BondNotFound = 12,
     /// Dispute reason must not be empty; an empty reason cannot be audited.
     EmptyReason = 13,
+    /// Dispute reason exceeds [`MAX_REASON_LEN`] bytes.
+    ReasonTooLong = 14,
 }
 
 /// Outcome recorded when a dispute is resolved.
@@ -297,7 +302,8 @@ impl EngineerBond {
     ///
     /// Blocks withdrawal until it is resolved or lapses after [`DISPUTE_TIMEOUT_SECS`]. The
     /// reason, evidence hash and acting admin are stored with the dispute and emitted. The
-    /// engineer must already have a bond.
+    /// reason must be non-empty and at most [`MAX_REASON_LEN`] bytes. The engineer must already
+    /// have a bond.
     pub fn open_dispute(
         env: Env,
         admin: Address,
@@ -308,6 +314,9 @@ impl EngineerBond {
         require_stored_admin(&env, &admin);
         if reason.is_empty() {
             panic_with_error!(&env, ContractError::EmptyReason);
+        }
+        if reason.len() > MAX_REASON_LEN {
+            panic_with_error!(&env, ContractError::ReasonTooLong);
         }
         let mut bond = load_existing_bond(&env, &engineer);
         if bond.dispute_open {

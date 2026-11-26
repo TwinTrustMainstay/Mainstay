@@ -565,6 +565,12 @@ fn awarded_auction_can_be_disputed_and_admin_can_resolve() {
     assert_eq!(token_client.balance(&other), 0);
     assert_eq!(token_client.balance(&ctx.client.address), 500);
 
+    // Resolving for an address that never placed a bid must use a typed error.
+    assert_eq!(
+        ctx.client.try_resolve_dispute(&ctx.admin, &id, &outsider),
+        Err(Ok(contract_err(ContractError::NotABidder)))
+    );
+
     // Naming a different winner upholds the dispute: bond is refunded.
     ctx.client.resolve_dispute(&ctx.admin, &id, &other);
     let auction = ctx.client.get_auction(&id);
