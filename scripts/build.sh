@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 source ~/.cargo/env 2>/dev/null || true
 
