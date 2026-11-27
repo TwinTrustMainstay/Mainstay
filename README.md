@@ -35,6 +35,8 @@ This makes Mainstay:
 - **Life-Cycle Contracts**: Soroban contracts that track full asset maintenance history
 - **Collateral Scoring**: On-chain health score derived from verified maintenance completeness
 - **DeFi Integration**: Assets with verified records usable as collateral for Stellar-based lending protocols
+- **Cross-Chain Bridge**: Soroban bridge with per-chain transfer limits, token allowlists, relayer-attested inbound releases, and hashed-timelock atomic swaps
+- **Maintenance Marketplace**: Dynamic maintenance pricing and open or sealed-bid auctions with credential-checked engineers and dispute handling
 
 ## 🛠️ Quick Start
 
@@ -210,6 +212,18 @@ get_last_service(asset_id) -> Option<MaintenanceRecord>
 get_collateral_score(asset_id) -> u32
 is_collateral_eligible(asset_id) -> bool
 ```
+
+### Bridge (`contracts/bridge`)
+
+The Stellar/Soroban side of the cross-chain bridge registers destination chains, applies per-chain amount and address constraints, and restricts transfers to configured tokens. `bridge_out` locks tokens and emits a destination-chain nonce for relayers. Inbound `attest_release` calls require an M-of-N relayer threshold and sufficient source-chain confirmations before releasing tokens; replay protection and rolling outflow caps are enforced. The contract also supports hash-time-locked swaps through `create_swap`, `claim_swap`, and `refund_swap`. The EVM-side bridge is not included in this crate.
+
+Source: [Bridge contract](contracts/bridge/src/lib.rs) · [Bridge tests](contracts/bridge/tests/bridge_tests.rs)
+
+### Marketplace (`contracts/marketplace`)
+
+The marketplace records supply and demand to calculate bounded dynamic maintenance prices, retains a bounded price history, and exposes a demand-elasticity estimate. Admin-created open and sealed commit/reveal auctions accept bids from engineers with valid or grace-period credentials. Auctions select winners by lowest price or highest reputation; awarded bids can be disputed within the configured window.
+
+Source: [Marketplace contract](contracts/marketplace/src/lib.rs) · [Auction design](docs/marketplace-auctions.md)
 
 ## 🧪 Testing
 

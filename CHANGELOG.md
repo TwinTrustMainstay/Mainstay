@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Bridge and Marketplace contracts
+- Added the `bridge` contract (`contracts/bridge`): chain registration and per-chain transfer/address constraints, token allowlists, outbound token locking with destination nonces, M-of-N relayer-attested inbound releases with confirmation and replay checks, rolling outflow limits, and hash-time-locked atomic swaps (`create_swap`, `claim_swap`, and `refund_swap`).
+- The `marketplace` contract (`contracts/marketplace`) is also documented in this release's Added entries below: dynamic maintenance pricing, price history and elasticity, open and sealed-bid auctions, credential-gated bidding, winner selection, and dispute handling.
+
 - Added invoice cost reconciliation, task grouping, maintenance dispute resolution,
   and hash-based maintenance evidence attachments to the lifecycle contract.
 
