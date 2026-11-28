@@ -346,7 +346,7 @@ EOF
             # Token addresses are alphanumeric Stellar identifiers, safe as labels.
             [[ -z "$token" ]] && continue
             volume="$(invoke_read_number "$CONTRACT_BRIDGE" get_outbound_volume --token "$token")"
-            printf 'mainstay_bridge_outbound_volume_total{token="%s"} %s\\n' "$token" "$volume" >> "$tmp_file"
+            printf 'mainstay_bridge_outbound_volume_total{token="%s"} %s\n' "$token" "$volume" >> "$tmp_file"
         done
     fi
 
