@@ -314,6 +314,42 @@ mainstay_scored_assets_count $scored_assets
 mainstay_chain_read_errors_total $CHAIN_READ_ERRORS
 EOF
 
+    # --- Bridge metrics ---
+    # The bridge contract exposes aggregate counters so the exporter does not
+    # need to enumerate persistent release or swap keys.
+    local bridge_pending_releases=0
+    local bridge_open_swaps=0
+    if [[ -n "${CONTRACT_BRIDGE:-}" ]]; then
+        bridge_pending_releases="$(invoke_read_number "$CONTRACT_BRIDGE" get_pending_release_count)"
+        bridge_open_swaps="$(invoke_read_number "$CONTRACT_BRIDGE" get_open_swap_count)"
+    fi
+
+    cat >> "$tmp_file" <<EOF
+
+# HELP mainstay_bridge_pending_releases Releases with at least one attestation that have not executed or expired.
+# TYPE mainstay_bridge_pending_releases gauge
+mainstay_bridge_pending_releases $bridge_pending_releases
+
+# HELP mainstay_bridge_open_swaps Swaps whose current status is Open.
+# TYPE mainstay_bridge_open_swaps gauge
+mainstay_bridge_open_swaps $bridge_open_swaps
+
+# HELP mainstay_bridge_outbound_volume_total Cumulative outbound bridge amount in each token's smallest units.
+# TYPE mainstay_bridge_outbound_volume_total counter
+EOF
+
+    if [[ -n "${CONTRACT_BRIDGE:-}" && -n "${BRIDGE_TOKEN_ADDRESSES:-}" ]]; then
+        local -a bridge_tokens=()
+        local token volume
+        IFS=',' read -r -a bridge_tokens <<< "$BRIDGE_TOKEN_ADDRESSES"
+        for token in "${bridge_tokens[@]}"; do
+            # Token addresses are alphanumeric Stellar identifiers, safe as labels.
+            [[ -z "$token" ]] && continue
+            volume="$(invoke_read_number "$CONTRACT_BRIDGE" get_outbound_volume --token "$token")"
+            printf 'mainstay_bridge_outbound_volume_total{token="%s"} %s\\n' "$token" "$volume" >> "$tmp_file"
+        done
+    fi
+
     # --- Marketplace auction metrics ---
     # Skipped when no marketplace is configured so that deployments without
     # auctions do not report misleading zeroed series.
