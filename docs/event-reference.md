@@ -14,10 +14,11 @@ This reference guide provides a comprehensive overview of all smart contract eve
 4. [Lifecycle Contract Events](#lifecycle-contract-events)
 5. [Lending Contract Events](#lending-contract-events)
 6. [Bridge Contract Events](#bridge-contract-events)
-7. [Parsing Event Data](#parsing-event-data)
+7. [Insurance Pool Contract Events](#insurance-pool-contract-events)
+8. [Parsing Event Data](#parsing-event-data)
    - [TypeScript Parsing Example](#typescript-parsing-example)
    - [Rust Event Parsing Example](#rust-event-parsing-example)
-8. [Subscription & Indexing Strategies](#subscription--indexing-strategies)
+9. [Subscription & Indexing Strategies](#subscription--indexing-strategies)
 
 ---
 
@@ -301,6 +302,37 @@ Emitted by `contracts/bridge`. Topic is the first element; payload is the tuple 
 | `BR_CH_ENB` | `(admin, chain_id, enabled)` | Chain enabled or disabled |
 
 ---
+
+## Insurance Pool Contract Events
+
+The `InsurancePool` contract manages capital providers, coverage policies, and claim settlement. Each event uses the event name as its sole topic; the payload types below follow the contract's Soroban Rust definitions.
+
+### 1. `ins_pay` — Insurance Claim Paid
+
+Emitted after an admin approves a pending claim and the pool transfers the payout to the claimant. A partial payment still emits this event with the amount actually paid; any unpaid remainder is emitted separately as `ins_shrt`.
+
+- **Topics**: `(Symbol("ins_pay"))`
+- **Data**: `(claim_id: u64, payout: i128)`
+- **Emission Conditions**: Emitted by `settle_claim` when `approve = true`, after the claim and pool statistics are updated. `payout` is the actual transfer amount and may be less than the requested claim amount.
+- **Use Cases**: Reconcile claim payouts, update claimant balances, and calculate insurance loss ratios.
+
+### 2. `ins_rej` — Insurance Claim Rejected
+
+Emitted when an admin rejects a pending claim. The claim reservation is released and the rejected-claim counter is incremented.
+
+- **Topics**: `(Symbol("ins_rej"))`
+- **Data**: `claim_id: u64` (a scalar, not a tuple)
+- **Emission Conditions**: Emitted by `settle_claim` when `approve = false`, after the claim status and pool statistics are saved.
+- **Use Cases**: Track rejected claims, audit settlement decisions, and reconcile released reservations.
+
+### 3. `ins_wdr` — Insurance Capital Withdrawn
+
+Emitted after a provider's shares are burned and the provider receives their pro-rata withdrawal from unreserved pool assets.
+
+- **Topics**: `(Symbol("ins_wdr"))`
+- **Data**: `(provider: Address, amount: i128, shares: i128)`
+- **Emission Conditions**: Emitted by `withdraw_capital` after the provider's share balance and pool totals are updated and the token transfer succeeds.
+- **Use Cases**: Reconcile capital outflows, track provider withdrawals, and update pool liquidity analytics.
 
 ## Parsing Event Data
 
