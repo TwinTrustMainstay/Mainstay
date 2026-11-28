@@ -152,6 +152,7 @@ fn test_bridge_out_locks_tokens_and_increments_nonce() {
     assert_eq!(n1, 1);
     assert_eq!(n2, 2);
     assert_eq!(ctx.client.get_outbound_nonce(&ETH), 2);
+    assert_eq!(ctx.client.get_outbound_volume(&ctx.token), 150);
     assert_eq!(balance(&ctx, &user), 350);
     assert_eq!(balance(&ctx, &ctx.client.address), 150);
 }
@@ -297,11 +298,13 @@ fn test_release_executes_only_at_threshold() {
     let pending = ctx.client.get_release(&ETH, &1).unwrap();
     assert_eq!(pending.approvals.len(), 1);
     assert!(!pending.executed);
+    assert_eq!(ctx.client.get_pending_release_count(), 1);
     assert_eq!(balance(&ctx, &recipient), 0);
 
     attest(&ctx, &ctx.relayers[1], 1, &recipient, 300);
     let pending = ctx.client.get_release(&ETH, &1).unwrap();
     assert!(pending.executed);
+    assert_eq!(ctx.client.get_pending_release_count(), 0);
     assert_eq!(balance(&ctx, &recipient), 300);
 }
 
@@ -537,11 +540,13 @@ fn test_swap_claim_with_correct_preimage_pays_recipient() {
     let preimage = Bytes::from_slice(&ctx.env, b"secret");
     let (id, sender, recipient) = open_swap(&ctx, &preimage, 1_000);
 
+    assert_eq!(ctx.client.get_open_swap_count(), 1);
     assert_eq!(balance(&ctx, &sender), 300);
     ctx.client.claim_swap(&id, &preimage);
 
     assert_eq!(balance(&ctx, &recipient), 200);
     assert_eq!(ctx.client.get_swap(&id).status, SwapStatus::Claimed);
+    assert_eq!(ctx.client.get_open_swap_count(), 0);
 }
 
 #[test]
@@ -572,6 +577,7 @@ fn test_swap_refund_only_after_expiry() {
     let preimage = Bytes::from_slice(&ctx.env, b"secret");
     let (id, sender, _) = open_swap(&ctx, &preimage, 1_000);
 
+    assert_eq!(ctx.client.get_open_swap_count(), 1);
     assert!(ctx.client.try_refund_swap(&id).is_err());
 
     ctx.env.ledger().set_timestamp(1_000);
@@ -579,6 +585,7 @@ fn test_swap_refund_only_after_expiry() {
 
     assert_eq!(balance(&ctx, &sender), 500);
     assert_eq!(ctx.client.get_swap(&id).status, SwapStatus::Refunded);
+    assert_eq!(ctx.client.get_open_swap_count(), 0);
     // A refunded swap can no longer be claimed
     assert!(ctx.client.try_claim_swap(&id, &preimage).is_err());
 }
@@ -887,6 +894,7 @@ fn test_expire_release_only_after_window_then_removes_it() {
     set_time(&ctx, 1_601);
     ctx.client.expire_release(&ETH, &9);
     assert!(ctx.client.get_release(&ETH, &9).is_none());
+    assert_eq!(ctx.client.get_pending_release_count(), 0);
 }
 
 #[test]
