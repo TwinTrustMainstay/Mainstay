@@ -286,22 +286,39 @@ Emitted when a defaulted loan is slashed by admin after missing deadline.
 
 ## Bridge Contract Events
 
-Emitted by `contracts/bridge`. Topic is the first element; payload is the tuple below. The full event set is also documented in [cross-chain-bridge.md](cross-chain-bridge.md#events).
+The Bridge contract emits the events below from `contracts/bridge`. Every event has exactly one topic: its symbol. The remaining values are the event data tuple, in the order shown. Soroban integer values retain their declared widths; token amounts are signed `i128` values in the token's smallest units.
 
-| Topic | Payload | Emitted when |
+| Event | Data payload (ordered fields and Soroban types) | Emission condition |
 |---|---|---|
-| `BR_OUT` | `(dest_chain, nonce, sender, token, amount, dest_address)` | `bridge_out` locks tokens |
-| `BR_REL` | `(source_chain, nonce, recipient, token, amount, approvers)` | A release reaches the attestation threshold and pays out. `approvers` is the `Vec<Address>` of relayers that attested, in attestation order |
-| `BR_ALERT` | `(source_chain, window_outflow, window_cap)` | Window outflow crosses `alert_threshold` |
-| `BR_SWP_N` | `(swap_id, sender, hashlock, expiry, amount)` | `create_swap` opens a swap |
-| `BR_SWP_C` | `(swap_id, preimage)` | `claim_swap` succeeds |
-| `BR_SWP_R` | `(swap_id, sender, token, amount)` | An expired, unclaimed swap was refunded to `sender` |
-| `BR_PAUSE` / `BR_RESUME` | `(admin)` | Bridge paused or resumed by `admin` |
-| `BR_RELAYS` | `(admin, threshold, relayers)` | Relayer set and threshold replaced |
-| `BR_CH_ADD` / `BR_CH_UPD` | `(admin, chain_id, config)` | Chain registered or its constraints replaced |
-| `BR_CH_ENB` | `(admin, chain_id, enabled)` | Chain enabled or disabled |
+| `BR_OUT` | `(dest_chain: u32, nonce: u64, sender: Address, token: Address, amount: i128, dest_address: Bytes)` | `bridge_out` succeeds after validating the destination chain, token allowlist, amount and destination address, transferring the tokens into bridge custody, and incrementing that destination chain's nonce. |
+| `BR_REL` | `(source_chain: u32, nonce: u64, recipient: Address, token: Address, amount: i128, approvers: Vec<Address>)` | A release receives enough distinct relayer attestations, satisfies the chain's minimum source confirmations and rolling outflow cap, and the bridge transfers the escrowed tokens to the recipient. `approvers` preserves attestation order. |
+| `BR_ALERT` | `(source_chain: u32, window_outflow: i128, window_cap: i128)` | A successful inbound release causes the rolling outflow total to cross the configured alert threshold for that source chain. It is emitted only on the below-to-at/above threshold transition within the active window. |
+| `BR_SWP_N` | `(swap_id: u64, sender: Address, hashlock: BytesN<32>, expiry: u64, amount: i128)` | `create_swap` succeeds after validating the swap parameters and locking the offered tokens in the bridge. |
+| `BR_SWP_C` | `(swap_id: u64, preimage: Bytes)` | `claim_swap` receives a preimage whose SHA-256 hash matches the stored hashlock before expiry, marks the swap claimed, and transfers the tokens to the recipient. |
+| `BR_SWP_R` | `(swap_id: u64, sender: Address, token: Address, amount: i128)` | `refund_swap` succeeds after expiry for a still-open swap, marks it refunded, and returns the escrowed tokens to the sender. |
+| `BR_PAUSE` | `(admin: Address)` | The authorized admin calls `pause`; new bridge-out, release-attestation, and swap-creation operations are blocked. |
+| `BR_RESUME` | `(admin: Address)` | The authorized admin calls `unpause` to resume operations. |
+| `BR_RELAYS` | `(admin: Address, threshold: u32, relayers: Vec<Address>)` | The authorized admin successfully replaces the relayer set and required attestation threshold after validating uniqueness, size, and threshold bounds. |
+| `BR_CH_ADD` | `(admin: Address, chain_id: u32, config: ChainConfig)` | The authorized admin registers a new non-reserved chain ID with a valid configuration. |
+| `BR_CH_UPD` | `(admin: Address, chain_id: u32, config: ChainConfig)` | The authorized admin updates the configuration of an already registered chain. |
+| `BR_CH_ENB` | `(admin: Address, chain_id: u32, enabled: bool)` | The authorized admin enables or disables a registered chain. |
 
----
+### Bridge `ChainConfig` payload type
+
+The `config` field in `BR_CH_ADD` and `BR_CH_UPD` is the contract's `ChainConfig` struct:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `name` | `Symbol` | Short chain label used by dashboards |
+| `enabled` | `bool` | Whether transfers to/from the chain are enabled |
+| `min_amount`, `max_amount` | `i128` | Inclusive transfer amount bounds |
+| `required_confirmations` | `u32` | Minimum source-chain confirmations required from relayers |
+| `window_secs` | `u64` | Rolling outflow window duration in seconds |
+| `window_cap`, `alert_threshold` | `i128` | Maximum outflow and alert threshold for the window |
+| `attestation_window_secs` | `u64` | Time allowed for a release to reach its attestation threshold |
+| `address_len` | `u32` | Required destination-address byte length |
+
+**Indexer guidance:** use the event symbol as the event discriminator and decode the data tuple according to the exact event row above. Do not expect `chain_id`, `nonce`, or `swap_id` to be additional topics; they are data fields for these Bridge events. Treat `BR_ALERT` as an alert signal rather than a release event, and use `BR_REL` as the authoritative successful-release notification.
 
 ## Insurance Pool Contract Events
 
