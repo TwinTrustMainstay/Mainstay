@@ -212,6 +212,9 @@ pub enum DataKey {
     Admin,
     Paused,
     NextSwapId,
+    PendingReleaseCount,
+    OpenSwapCount,
+    OutboundVolume(Address),
     Relayers,
     Threshold,
     Chain(u32),
@@ -355,6 +358,8 @@ fn execute_release(
     }
     account_window_outflow(env, source_chain, cfg, pending.amount);
     pending.executed = true;
+    let pending_count: u64 = env.storage().instance().get(&DataKey::PendingReleaseCount).unwrap_or(0);
+    env.storage().instance().set(&DataKey::PendingReleaseCount, &pending_count.saturating_sub(1));
     token::Client::new(env, &pending.token).transfer(
         &env.current_contract_address(),
         &pending.recipient,
@@ -448,6 +453,23 @@ impl Bridge {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::NextSwapId, &0u64);
+        env.storage().instance().set(&DataKey::PendingReleaseCount, &0u64);
+        env.storage().instance().set(&DataKey::OpenSwapCount, &0u64);
+    }
+
+    /// Current number of releases with at least one attestation that have not executed or expired.
+    pub fn get_pending_release_count(env: Env) -> u64 {
+        env.storage().instance().get(&DataKey::PendingReleaseCount).unwrap_or(0)
+    }
+
+    /// Current number of swaps whose status is `Open`.
+    pub fn get_open_swap_count(env: Env) -> u64 {
+        env.storage().instance().get(&DataKey::OpenSwapCount).unwrap_or(0)
+    }
+
+    /// Cumulative amount sent outbound for `token`, in that token's smallest units.
+    pub fn get_outbound_volume(env: Env, token: Address) -> i128 {
+        env.storage().persistent().get(&DataKey::OutboundVolume(token)).unwrap_or(0)
     }
 
     /// Pause new transfers (`bridge_out`, `attest_release`, `create_swap`).
@@ -647,6 +669,10 @@ impl Bridge {
         let nonce: u64 = env.storage().persistent().get(&nonce_key).unwrap_or(0) + 1;
         env.storage().persistent().set(&nonce_key, &nonce);
         bump(&env, &nonce_key);
+        let volume_key = DataKey::OutboundVolume(token.clone());
+        let volume: i128 = env.storage().persistent().get(&volume_key).unwrap_or(0);
+        env.storage().persistent().set(&volume_key, &volume.saturating_add(amount));
+        bump(&env, &volume_key);
 
         env.events().publish(
             (symbol_short!("BR_OUT"),),
@@ -714,6 +740,10 @@ impl Bridge {
         ensure_amount_in_range(&env, &cfg, amount);
 
         let key = DataKey::Pending(source_chain, nonce);
+        if !env.storage().persistent().has(&key) {
+            let count: u64 = env.storage().instance().get(&DataKey::PendingReleaseCount).unwrap_or(0);
+            env.storage().instance().set(&DataKey::PendingReleaseCount, &count.saturating_add(1));
+        }
         let mut pending: PendingRelease =
             match env.storage().persistent().get::<_, PendingRelease>(&key) {
                 Some(existing) => {
@@ -842,6 +872,8 @@ impl Bridge {
             panic_with_error!(&env, ContractError::ReleaseNotExpired);
         }
         env.storage().persistent().remove(&key);
+        let count: u64 = env.storage().instance().get(&DataKey::PendingReleaseCount).unwrap_or(0);
+        env.storage().instance().set(&DataKey::PendingReleaseCount, &count.saturating_sub(1));
     }
 
     /// Current rolling outflow window for a source chain. Returns zeroed state if none.
@@ -923,6 +955,8 @@ impl Bridge {
         let key = DataKey::Swap(id);
         env.storage().persistent().set(&key, &swap);
         bump_swap_entry(&env, &key, expiry);
+        let open_swaps: u64 = env.storage().instance().get(&DataKey::OpenSwapCount).unwrap_or(0);
+        env.storage().instance().set(&DataKey::OpenSwapCount, &open_swaps.saturating_add(1));
 
         env.events().publish(
             (symbol_short!("BR_SWP_N"),),
@@ -963,6 +997,8 @@ impl Bridge {
 
         swap.status = SwapStatus::Claimed;
         env.storage().persistent().set(&key, &swap);
+        let open_swaps: u64 = env.storage().instance().get(&DataKey::OpenSwapCount).unwrap_or(0);
+        env.storage().instance().set(&DataKey::OpenSwapCount, &open_swaps.saturating_sub(1));
         bump_swap_entry(&env, &key, swap.expiry);
 
         token::Client::new(&env, &swap.token).transfer(
@@ -998,6 +1034,8 @@ impl Bridge {
 
         swap.status = SwapStatus::Refunded;
         env.storage().persistent().set(&key, &swap);
+        let open_swaps: u64 = env.storage().instance().get(&DataKey::OpenSwapCount).unwrap_or(0);
+        env.storage().instance().set(&DataKey::OpenSwapCount, &open_swaps.saturating_sub(1));
         bump_swap_entry(&env, &key, swap.expiry);
 
         token::Client::new(&env, &swap.token).transfer(
