@@ -150,3 +150,25 @@ metrics:
     retention: raw
     source: scripts/monitoring/prometheus-exporter.sh
     description: Number of open (pending) insurance claims.
+
+  - name: mainstay_bridge_pending_releases
+    type: gauge
+    unit: releases
+    retention: raw
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Releases with at least one attestation that have not executed or expired.
+
+  - name: mainstay_bridge_outbound_volume_total
+    type: counter
+    unit: token_base_units
+    labels: [token]
+    retention: daily
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Cumulative outbound bridge amount per token, in the token's smallest units.
+
+  - name: mainstay_bridge_open_swaps
+    type: gauge
+    unit: swaps
+    retention: raw
+    source: scripts/monitoring/prometheus-exporter.sh
+    description: Number of atomic swaps whose current status is Open.
